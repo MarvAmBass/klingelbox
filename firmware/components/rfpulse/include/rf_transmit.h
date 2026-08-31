@@ -39,9 +39,19 @@ void rf_transmit_release(void);
 bool rf_transmit_active(void);
 
 /*
- * Send `frame` `repeats` times with `gap_us` of idle between copies, blocking
- * until the last pulse has physically left the peripheral (so the caller may
- * immediately switch the radio back to RX without truncating the tail).
+ * Send `frame` `repeats` times with AT LEAST `gap_us` of idle between copies,
+ * blocking until the last pulse has physically left the peripheral (so the
+ * caller may immediately switch the radio back to RX without truncating the
+ * tail).
+ *
+ * `gap_us` is a minimum, not an addition. If the frame's own last pulse is at
+ * the idle level it already supplies part of that idle and only the shortfall
+ * is appended; and if that trailing idle dwarfs every other pulse in the frame
+ * it IS the protocol's framing gap, so the frame's period is emitted exactly as
+ * authored and nothing is appended at all. That keeps a frame which carries its
+ * own framing gap (a synthesized EV1527 word, or a capture that happened to
+ * include one) from going out with a period no real transmitter produces — see
+ * the "FRAMING GAP" note in rf_transmit.c.
  */
 esp_err_t rf_transmit_frame(const rf_frame_t *frame, uint8_t repeats, uint32_t gap_us);
 

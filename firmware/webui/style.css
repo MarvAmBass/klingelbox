@@ -35,6 +35,10 @@
   --warn-bg: #fbeedd;
   --bad: #bd3a27;
   --bad-bg: #fbe6e2;
+  /* The fourth node group. A signal node has both ports and belongs to neither
+     the source nor the sink family, so it needs a colour of its own rather than
+     borrowing one and reading as the wrong kind of node at a glance. */
+  --signal: #7a3fb8;
   --chip: #edf0f5;
   --shadow: 0 1px 2px rgba(20, 30, 50, .07), 0 6px 18px rgba(20, 30, 50, .05);
   --shadow-lift: 0 8px 34px rgba(15, 22, 38, .22);
@@ -62,6 +66,7 @@
     --warn-bg: #33240f;
     --bad: #e8705d;
     --bad-bg: #3a1d17;
+    --signal: #b98ae6;
     --chip: #232b36;
     --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 6px 18px rgba(0, 0, 0, .3);
     --shadow-lift: 0 8px 34px rgba(0, 0, 0, .6);
@@ -85,6 +90,7 @@
   --warn-bg: #33240f;
   --bad: #e8705d;
   --bad-bg: #3a1d17;
+  --signal: #b98ae6;
   --chip: #232b36;
   --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 6px 18px rgba(0, 0, 0, .3);
   --shadow-lift: 0 8px 34px rgba(0, 0, 0, .6);
@@ -115,6 +121,8 @@ code, .mono { font-family: var(--mono); font-size: .875em; }
 .muted { color: var(--muted); }
 .hidden { display: none !important; }
 .small { font-size: .8rem; }
+/* An inline validation line that must read as wrong without being a whole note. */
+.bad-text { color: var(--bad); }
 .nowrap { white-space: nowrap; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
 
@@ -161,9 +169,10 @@ code, .mono { font-family: var(--mono); font-size: .875em; }
 .tabs { display: none; }
 
 /* -------------------------------------------------------------- bottom nav --
-   Six destinations. At 360 px each cell is 60 px wide and 56 px tall, so every
-   target clears 44 px in both axes. The strip is still an overflow-x scroller
-   as a safety net for 280 px devices and for very large text settings. */
+   Three destinations — the graph is the product, so it is one tab and not a
+   family of them. At 360 px each cell is 120 px wide and 56 px tall, far past
+   44 px in both axes. The strip is still an overflow-x scroller as a safety
+   net for 280 px devices and for very large text settings. */
 .bottomnav {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
   display: flex;
@@ -394,7 +403,31 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 .meter.warn > i { background: var(--warn); }
 .meter.bad > i  { background: var(--bad); }
 
-/* ------------------------------------------------------------ learn screen -- */
+/* ------------------------------------------------- signal inside a node --
+   A signal is not a sibling of the node that uses it, it is part of it: the
+   editor shows the whole waveform detail INSIDE the node's own sheet, indented
+   behind an accent rule so it reads as belonging to the node above it. */
+.sigsec {
+  border-left: 3px solid var(--accent);
+  background: var(--sunk);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  padding: .6rem .7rem;
+  margin: .1rem 0 .8rem;
+}
+.sigsec > .empty { padding: 1rem .5rem; }
+.sigblock > .chiprow { margin-bottom: .4rem; }
+.sigblock .note { background: var(--panel); }
+
+/* ------------------------------------------------------------ learn flow --
+   Countdown, listening line and candidate, all inside a bottom sheet: the
+   countdown is a size smaller there than it was on the full screen it
+   replaces, so the candidate still fits above the fold on a 360 px phone. */
+.candidate {
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--sunk); padding: .7rem; margin: .6rem 0;
+}
+.candidate .panel-head { margin-bottom: .5rem; }
+.sheet .countdown { font-size: 2.1rem; }
 .countdown {
   font-family: var(--mono); font-size: 2.6rem; font-weight: 700; line-height: 1;
   text-align: center; padding: .5rem 0 .2rem; letter-spacing: -.02em;
@@ -413,6 +446,7 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 
 /* ------------------------------------------------------------- node graph -- */
 .nodecard { border-left: 4px solid var(--line); }
+.nodecard.g-signal { border-left-color: var(--signal); }
 .nodecard.g-source { border-left-color: var(--ok); }
 .nodecard.g-logic  { border-left-color: var(--warn); }
 .nodecard.g-sink   { border-left-color: var(--accent); }
@@ -435,11 +469,27 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 .linkchip.add { border-style: dashed; color: var(--accent); background: transparent; }
 .dangling { color: var(--bad); }
 
-.canvas-wrap { overflow: auto; background: var(--sunk); border: 1px solid var(--line);
-  border-radius: var(--r-sm); }
-.canvas { display: block; width: 100%; height: 26rem; touch-action: none; }
+/* The BACKGROUND belongs to the svg, not to this wrapper.
+   While the wrapper painted it, its background filled the whole panel width
+   while the svg inside was only VW px wide — so on a wide screen (or zoomed
+   out) the leftover strip looked exactly like canvas but no node could be
+   dropped there, because placement is clamped to the svg. Painting the svg
+   instead makes "looks like canvas" and "is canvas" the same region. */
+.canvas-wrap { overflow: auto; max-height: 32rem; overscroll-behavior: contain;
+  border: 1px solid var(--line); border-radius: var(--r-sm); }
+/* Sized in px by renderCanvas() and scrolled by .canvas-wrap: the graph is
+   drawn at true size rather than squeezed to fit, so dragging is 1:1 and
+   there are no letterboxed bands where a node cannot be placed. */
+.canvas { display: block; touch-action: none; background: var(--sunk); }
+/* Zoom / fit controls above the canvas. */
+.canvas-tools { justify-content: flex-end; gap: .4rem; margin-bottom: .4rem; align-items: center; }
+.canvas-tools .btn.small { min-width: 2.4rem; padding: .35rem .6rem; }
+.zoom-lbl { min-width: 3.2rem; text-align: center; }
+/* Grab cursor while panning the empty canvas. */
+.canvas.panning { cursor: grabbing; }
 .canvas .lnk { fill: none; stroke: var(--muted); stroke-width: 1.6; opacity: .8; }
 .canvas .nbox { fill: var(--panel); stroke: var(--line); stroke-width: 1.5; }
+.canvas .nbox.g-signal { stroke: var(--signal); }
 .canvas .nbox.g-source { stroke: var(--ok); }
 .canvas .nbox.g-logic  { stroke: var(--warn); }
 .canvas .nbox.g-sink   { stroke: var(--accent); }
@@ -448,6 +498,25 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 .canvas .ntype { fill: var(--muted); font-size: 9px;
   font-family: var(--mono); }
 .canvas g.node { cursor: pointer; }
+
+/* ---- node ports + link editing ----
+   The dot is small so it reads as a connector rather than a button; the hit
+   area over it is much larger, because a 5 px target is unusable with a
+   trackpad and impossible with a finger. */
+.canvas .port { fill: var(--panel); stroke-width: 2; }
+.canvas .port.in  { stroke: var(--muted); }
+.canvas .port.out { stroke: var(--accent); }
+.canvas g.node:hover .port.out { fill: var(--accent); }
+.canvas .port-grab { fill: transparent; cursor: crosshair; }
+
+/* Links are clickable to remove, so they need a fat invisible hit path — the
+   visible 1.6 px stroke is far too thin to hit reliably. */
+.canvas .lnk-hit { fill: none; stroke: transparent; stroke-width: 14; cursor: pointer; }
+.canvas .lnk-hit:hover + .lnk { stroke: var(--bad); opacity: 1; }
+.canvas .lnk { pointer-events: none; }
+.canvas .lnk.tmp { stroke: var(--accent); stroke-dasharray: 5 4; opacity: 1; }
+.canvas.linking { cursor: crosshair; }
+.canvas.linking g.node .nbox { stroke-dasharray: 4 3; }
 
 /* ---------------------------------------------------------- diagnostics -- */
 .diag { display: flex; flex-direction: column; gap: .5rem; }

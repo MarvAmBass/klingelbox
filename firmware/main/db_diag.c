@@ -87,6 +87,29 @@ const char *db_diag_help(db_diag_t state)
     return s_help[state];
 }
 
+const char *db_err_text(esp_err_t err)
+{
+    /* NVS has its own error space (ESP_ERR_NVS_BASE, 0x1100). Every code in it
+     * means one thing to a user: the write did not stick. Spelling them out
+     * individually would be a list of internal distinctions nobody can act on. */
+    if (err >= 0x1100 && err <= 0x11FF)
+        return "the device could not save it — its storage may be full or worn out";
+
+    switch (err) {
+    case ESP_OK:                   return "it worked";
+    case ESP_ERR_NOT_FOUND:        return "it no longer exists";
+    case ESP_ERR_INVALID_ARG:      return "the request was not valid";
+    case ESP_ERR_INVALID_SIZE:     return "the data was the wrong size";
+    case ESP_ERR_NO_MEM:           return "there is no room left for another one";
+    case ESP_ERR_INVALID_STATE:    return "the device is busy or not ready for that right now";
+    case ESP_ERR_TIMEOUT:          return "it took too long and was given up on";
+    case ESP_ERR_NOT_SUPPORTED:    return "this device does not support that";
+    case ESP_ERR_INVALID_RESPONSE: return "the other end replied with something unusable";
+    case ESP_ERR_NOT_FINISHED:     return "it did not run to completion";
+    default:                       return "the device could not complete it";
+    }
+}
+
 void db_diag_report(db_diag_t state, const char *fmt, ...)
 {
     if (state < 0 || state >= DB_DIAG__COUNT)

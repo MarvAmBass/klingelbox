@@ -6,12 +6,19 @@
  * this file is flashed into a SPIFFS image on a microcontroller, so every byte
  * is paid for once in flash and again on every page load over a softAP.
  *
- * Three ideas run through the whole file.
+ * Four ideas run through the whole file.
+ *
+ * 0. THE GRAPH IS THE PRODUCT. There are three screens -- Dashboard, Settings,
+ *    Diagnostics -- and the Dashboard is the node graph, with the live activity
+ *    feed under it. There is no Signals screen and no Learn screen: a signal is
+ *    learned, synthesized, inspected and rebound from inside the node that uses
+ *    it. The store itself outlives the graph (deleting a node never deletes a
+ *    recording), so the one destructive list lives under Settings.
  *
  * 1. MOBILE FIRST, LIST FIRST. The layout is authored for a 360 px phone. The
  *    node graph in particular is a LIST of cards whose links are tappable
  *    chips; the SVG canvas at >= 900 px is a second view of the same data and
- *    never the only way to do anything.
+ *    never the only way to do anything. Multi-step flows are bottom sheets.
  *
  * 2. THE API IS THE CONTRACT. Every request in here appears in docs/API.md.
  *    Nothing is invented, and every failure arrives as {"error": "..."} with a
@@ -63,6 +70,10 @@ function api(path, opts) {
       if (!res.ok) {
         var err = new Error((body && body.error) ? body.error : ("HTTP " + res.status));
         err.status = res.status;
+        /* Keep the whole envelope. Some 4xx bodies carry machine-readable
+           context next to the sentence (conflict_signal_id, for one), and a
+           caller that can act on it should not have to re-parse the prose. */
+        err.body = body || {};
         throw err;
       }
       return body || {};
@@ -133,9 +144,10 @@ var S = {
   config: null,
   ap: null,
   signals: null,          /* null = not loaded yet */
+  signalsErr: null,       /* last /api/signals failure, shown where signals are listed */
   graph: null,
   gpio: null,
-  learn: null,
+  learn: null,            /* only while a learn flow sheet is open */
   diag: null,
 
   events: [],
@@ -234,7 +246,10 @@ document.addEventListener("visibilitychange", function () {
    Sheets (bottom sheet on a phone, centred dialog from 600 px -- CSS decides)
    ====================================================================== */
 
-function openSheet(title, sub) {
+/* `onClose` runs however the sheet goes away -- the ✕, Escape, or a tap on the
+   scrim -- which is what lets a multi-step flow (learn, virtual signal) tear
+   down its poll and disarm the box when the user backs out. */
+function openSheet(title, sub, onClose) {
   var scrim = el("div", "scrim");
   var sheet = el("div", "sheet");
   sheet.setAttribute("role", "dialog");
@@ -252,9 +267,13 @@ function openSheet(title, sub) {
   add(scrim, sheet);
   document.body.appendChild(scrim);
 
+  var closed = false;
   function close() {
+    if (closed) return;
+    closed = true;
     scrim.remove();
     document.removeEventListener("keydown", onKey);
+    if (onClose) onClose();
   }
   function onKey(e) { if (e.key === "Escape") close(); }
   document.addEventListener("keydown", onKey);
@@ -385,31 +404,22 @@ function onTabEnter(name, resumed) {
   switch (name) {
     case "dashboard":
       buildDashboard();
-      poll("events", 2000, loadEvents);
-      poll("dashclock", 1000, tickDashClock);
-      if (!S.signals || !resumed) loadSignals();
-      break;
-    case "signals":
-      buildSignals();
-      loadSignals();
-      break;
-    case "learn":
-      buildLearn();
-      poll("learn", 1000, loadLearn);
-      if (!S.signals) loadSignals();
-      break;
-    case "automations":
-      buildAutomations();
       loadGraph();
-      if (!S.signals) loadSignals();
+      if (!S.signals || !resumed) loadSignals();
       if (S.has.gpio && !S.gpio) loadGpio();
       if (!S.config) loadConfig();
+      poll("events", 2000, loadEvents);
+      poll("dashclock", 1000, tickDashClock);
       break;
     case "settings":
       buildSettings();
       /* The release status is the one thing on this (build-once) tab that can
          change on its own; null when the firmware has no update check. */
       if (updateRefresh) updateRefresh();
+      /* The stored-signals maintenance list needs both: the store itself, and
+         the graph to say which nodes still use each entry. */
+      loadSignals();
+      if (!S.graph) loadGraph();
       break;
     case "diagnostics":
       buildDiagnostics();
@@ -464,13 +474,14 @@ function loadEvents() {
 function loadSignals() {
   return api("/api/signals").then(function (res) {
     S.signals = res.signals || [];
-    renderSignals();
-    renderQuickSignals();
+    S.signalsErr = null;
+    onSignalsChanged();
     return S.signals;
   }).catch(function (e) {
     if (S.signals === null) S.signals = [];
-    renderSignals(e);
-    return [];
+    S.signalsErr = e;
+    onSignalsChanged();
+    return S.signals;
   });
 }
 
@@ -501,15 +512,8 @@ function loadConfig() {
     .catch(function (e) { if (e.status === 404) S.has.config = false; return null; });
 }
 
-function loadLearn() {
-  return api("/api/learn").then(function (res) {
-    S.learn = res;
-    renderLearn();
-  }).catch(function (e) {
-    S.learn = null;
-    renderLearn(e);
-  });
-}
+/* /api/learn has no loader of its own any more: it is polled only for as long
+   as a learn flow sheet is open, from inside openLearnFlow(). */
 
 function loadDiagnostics() {
   return api("/api/diagnostics").then(function (res) {
@@ -592,8 +596,7 @@ function transmit(signalId, btn, msgNode, opts) {
     if (btn) { btn.textContent = old; btn.disabled = false; }
     if (e.status === 503 || e.status === 409) {
       S.txBlock = e.message || "The radio is unavailable, so nothing can be transmitted.";
-      renderQuickSignals();
-      renderSignals();
+      renderTxNote();
     }
     if (msgNode) setMsg(msgNode, e.message, "err");
   });
@@ -653,67 +656,1013 @@ function waveform(durations, firstLevel) {
 }
 
 /* ======================================================================
-   DASHBOARD
+   SIGNALS -- reached THROUGH nodes, never beside them
+
+   There is no Signals screen and no Learn screen any more. A signal is not a
+   thing you keep a list of; it is what a node listens for or transmits, so
+   everything a signal needs happens where the signal is used:
+
+     * a node that needs one is CREATED through the choice of that signal --
+       learn it off the air, pick one already stored, or synthesize a virtual
+       one -- in a single flow with a single confirmation,
+     * a node that HAS one shows it inline in its editor: decode, waveform,
+       pairing, transmit-to-test, rename, re-learn, swap.
+
+   THE STORE IS NOT THE GRAPH. A learned signal is a recording of a physical
+   remote; the graph is only wiring. Deleting a node, unlinking it or rebinding
+   it to a different signal therefore NEVER touches the store -- the waveform
+   stays, under its name, and can be picked again tomorrow. Rewiring must never
+   cost a walk to the front door with a remote in hand. Removing a signal for
+   good is a separate, deliberate act and lives in exactly one place:
+   Settings -> Stored signals (sectionSignals). Nothing in this file deletes a
+   signal as a side effect of graph editing.
    ====================================================================== */
 
-var dashEls = {};
+function signalById(id) {
+  var list = S.signals || [];
+  for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
+  return null;
+}
+function signalLabel(sig) {
+  if (!sig) return "signal";
+  return sig.name || ("Signal " + sig.id);
+}
+/* One line of identity: the decoder's sentence when there is one, otherwise the
+   honest "raw pulses" wording -- an undecoded signal is a supported state. */
+function signalIdent(sig) {
+  if (sig && sig.decoded && sig.decoded.text) return sig.decoded.text;
+  return "raw waveform, " + numOr(sig && sig.pulse_count, 0) + " pulses";
+}
+/* Which nodes point at a signal. Drives both the "used by" marks in the picker
+   and the delete guard: a signal another node still needs is not deletable. */
+function nodesUsingSignal(id, exceptNodeId) {
+  var out = [];
+  ((S.graph && S.graph.nodes) || []).forEach(function (n) {
+    if (exceptNodeId && n.id === exceptNodeId) return;
+    if (numOr(n.signal_id, 0) === id) out.push(n);
+  });
+  return out;
+}
+function usedByText(users) {
+  if (!users.length) return "Not used by any node";
+  return "Used by " + users.map(function (n) { return nodeName(n.id); }).join(", ");
+}
+
+/* Anything that re-reads /api/signals lands here: node summaries carry signal
+   names, an open picker is a live view of the same store, and so is the
+   maintenance list under Settings. */
+function onSignalsChanged() {
+  if (S.built.dashboard && S.graph) renderGraph();
+  if (pickerRefresh) pickerRefresh();
+  if (settingsSigRender) settingsSigRender();
+}
+
+/*
+ * The pairing panel of a SYNTHESIZED signal.
+ *
+ * Written after a real report of "the virtual signal is broken". It was not:
+ * a synthesized signal is a brand-new address, so no receiver on the band
+ * answers to it until one has been TAUGHT it, and the user's chime was paired
+ * to a different address entirely. The explanation existed only on the
+ * creation form, which is the one screen you are no longer looking at by the
+ * time you tap Transmit and nothing happens. It now sits in the node editor,
+ * which is exactly where someone goes when the chime stays silent.
+ *
+ * The order of the steps is the whole feature: the receiver has to be listening
+ * BEFORE the code goes out, and almost everyone tries it the other way round.
+ */
+var PAIR_REPEATS = 20;    /* ~20 x 36 ms ≈ 0.7 s: long enough that a receiver
+                             that just entered learning mode cannot miss it,
+                             short enough to stay an inline request like every
+                             other transmit. */
+var PAIR_GAP_US = 8000;
+
+function pairPanel(sig) {
+  var box = el("div", "note");
+  add(box, el("b", null, "Pair with a receiver"));
+
+  var steps = el("ol");
+  steps.style.margin = ".45rem 0 .55rem";
+  steps.style.paddingLeft = "1.25rem";
+
+  var s1 = el("li");
+  add(s1, el("span", null, "Put your receiver into "), el("b", null, "learning mode"),
+      el("span", null, " — usually hold its button until it beeps or its LED blinks."));
+  var s2 = el("li");
+  add(s2, el("span", null, "Tap "), el("b", null, "Pair now"),
+      el("span", null, " below within a few seconds."));
+  var s3 = el("li", null, "The receiver stores this code and rings for it from then on.");
+  add(steps, s1, s2, s3);
+  add(box, steps);
+
+  add(box, el("div", "small muted",
+    "This code is new — nothing responds to it until a receiver has learned it. " +
+    "That is expected."));
+
+  var msg = el("div", "formmsg");
+  var row = el("div", "formfoot");
+  var b = el("button", "btn primary", "🔗 Pair now");
+  b.type = "button";
+  b.disabled = !txAvailable();
+  if (!txAvailable()) b.title = S.txBlock;
+  b.addEventListener("click", function () {
+    transmit(sig.id, b, msg, {
+      body: { repeats: PAIR_REPEATS, gap_us: PAIR_GAP_US },
+      sending: "Pairing…",
+      sent: "Sent ✓",
+      ok: "Code sent " + PAIR_REPEATS + " times. If the receiver was in learning mode it " +
+          "has stored it — test it with Transmit below. If not, put it back into learning " +
+          "mode and tap Pair now again."
+    });
+  });
+  add(row, b, msg);
+  add(box, row);
+  return box;
+}
+
+/* ----------------------------------------------------------------------
+   signalBlock -- the whole of the old Signals detail view, as a fragment
+   dropped inline into the editor of the node that uses the signal.
+
+   There is deliberately no delete here: this block is reached while editing
+   wiring, and wiring must not be able to destroy a recording. See the section
+   header, and Settings -> Stored signals for the one place that can.
+
+   opts:
+     .node       the node this signal belongs to, when there is one
+     .onChanged  fn(what, value) -- "renamed"
+   ---------------------------------------------------------------------- */
+function signalBlock(sig, opts) {
+  opts = opts || {};
+  var box = el("div", "sigblock");
+
+  /* identity */
+  var chips = el("div", "chiprow");
+  if (sig.decoded && sig.decoded.text) add(chips, el("span", "chip accent mono", sig.decoded.text));
+  else add(chips, el("span", "chip warn", "Unknown protocol — stored as raw pulses"));
+  if (sig.origin) add(chips, el("span", "chip", sig.origin));
+  if (typeof sig.seen_count === "number") add(chips, el("span", "chip", "seen " + sig.seen_count + "x"));
+  add(box, chips);
+
+  if (!sig.decoded) {
+    add(box, el("div", "note",
+      "No decoder claimed this waveform. That is a fully supported state: the exact pulse " +
+      "timings are stored and replay works normally. Only the human-readable identity is missing."));
+  }
+
+  /* Above every other control, because it is the answer to the question a
+     user has already formed by the time they get here.
+
+     This used to fork on the node's direction: pairing teaches a RECEIVER a
+     code, which only a transmit sink could do, so on a listen-only node the
+     panel was replaced by a paragraph explaining that pairing lived elsewhere.
+     A Signal node can send, so the panel simply applies -- and the paragraph it
+     replaced no longer describes anything. */
+  if (sig.origin === "synthesized") add(box, pairPanel(sig));
+
+  /* confidence meter */
+  if (typeof sig.confidence === "number") {
+    var cwrap = el("div");
+    cwrap.style.margin = ".7rem 0";
+    var crow = el("div", "row");
+    crow.style.justifyContent = "space-between";
+    add(crow, el("span", "small muted", "Decode confidence"));
+    add(crow, el("span", "small mono", sig.confidence + "%"));
+    add(cwrap, crow);
+    var m = el("div", "meter " + (sig.confidence >= 65 ? "ok" : sig.confidence >= 45 ? "warn" : "bad"));
+    var fill = el("i");
+    fill.style.width = Math.max(2, Math.min(100, sig.confidence)) + "%";
+    add(m, fill);
+    add(cwrap, m);
+    add(cwrap, el("div", "hint",
+      "Measured on this bench: real presses score 67-92%, band noise 24-48%."));
+    add(box, cwrap);
+  }
+
+  /* facts */
+  var kv = el("dl", "kv");
+  function kvAdd(k, v) { if (v === null || v === undefined || v === "") return; add(kv, el("dt", null, k)); add(kv, el("dd", "mono", String(v))); }
+  kvAdd("Id", sig.id);
+  kvAdd("Fingerprint", sig.fingerprint);
+  kvAdd("Base pulse", typeof sig.base_us === "number" ? sig.base_us + " us" : null);
+  kvAdd("Pulses", sig.pulse_count);
+  kvAdd("RSSI", typeof sig.rssi_dbm === "number" ? sig.rssi_dbm + " dBm" : null);
+  kvAdd("Seen", typeof sig.seen_count === "number" ? sig.seen_count + " times" : null);
+  kvAdd("Last seen", typeof sig.last_seen_s === "number" ? agoText(sig.last_seen_s) : null);
+  kvAdd("Created", fmtEpoch(sig.created_at) || null);
+  if (sig.decoded) {
+    kvAdd("Protocol", sig.decoded.protocol);
+    kvAdd("Address", typeof sig.decoded.id === "number"
+      ? sig.decoded.id + " (0x" + sig.decoded.id.toString(16).toUpperCase() + ")" : null);
+    kvAdd("Button", sig.decoded.button);
+  }
+  add(box, kv);
+
+  /* waveform */
+  var wf = waveform(sig.durations_us, sig.first_level);
+  if (wf) {
+    var wh = el("div", "field");
+    add(wh, el("span", null, "Pulse train"));
+    add(wh, wf);
+    add(wh, el("span", "hint",
+      "High = carrier on, low = carrier off. This is what gets replayed, verbatim, on transmit."));
+    /* Why a virtual signal does not look like a captured one. Read as a bug
+       otherwise -- and it has been. */
+    if (sig.origin === "synthesized") {
+      add(wh, el("span", "hint",
+        "A synthesized frame ends with the ~9 ms sync gap the protocol puts between words, " +
+        "so it has one pulse more than the same code captured off the air (50 vs 49). A " +
+        "capture can never contain that gap: it is longer than the 8 ms idle threshold, so it " +
+        "is exactly what ENDS the recording. Repeated on air the two are the same waveform."));
+    }
+    add(box, wh);
+  }
+
+  /* rename */
+  var nameIn = inputEl("text", sig.name || "", { maxlength: "40" });
+  add(box, field("Signal name", nameIn,
+    "Shown in the activity feed, on the node card and in the picker."));
+
+  var msg = el("div", "formmsg");
+  var foot = el("div", "formfoot");
+
+  var txb = el("button", "btn primary", "📡 Transmit");
+  txb.type = "button";
+  txb.disabled = !txAvailable();
+  if (!txAvailable()) txb.title = S.txBlock;
+  txb.addEventListener("click", function () { transmit(sig.id, txb, msg); });
+
+  var save = el("button", "btn", "Save name");
+  save.type = "button";
+  save.addEventListener("click", function () {
+    var n = trimOf(nameIn);
+    if (!n) { setMsg(msg, "A name cannot be empty.", "err"); return; }
+    save.disabled = true;
+    setMsg(msg, "Saving…");
+    postJSON("/api/signals/" + sig.id, { name: n }).then(function () {
+      save.disabled = false;
+      sig.name = n;
+      setMsg(msg, "Renamed.", "ok");
+      loadSignals();
+      if (S.graph) loadGraph();
+      if (opts.onChanged) opts.onChanged("renamed", n);
+    }).catch(function (e) { save.disabled = false; setMsg(msg, e.message, "err"); });
+  });
+
+  add(foot, txb, save, msg);
+  add(box, foot);
+
+  /* Suppressed in Settings -> Stored signals, where the note would point at the
+     very sheet you are reading and Delete is right underneath it anyway. */
+  if (opts.storeNote !== false) {
+    var others = nodesUsingSignal(sig.id, opts.node ? opts.node.id : 0);
+    add(box, el("div", "note",
+      "This recording belongs to the box, not to this node. Deleting the node, unlinking it or " +
+      "pointing it at a different signal leaves it in the store under its name — you never have " +
+      "to walk to the door and learn a button twice." +
+      (others.length ? " " + usedByText(others) + " as well." : "") +
+      " To remove it for good: Settings → Stored signals."));
+  }
+  return box;
+}
+
+/* ----------------------------------------------------------------------
+   The signal picker -- choose which stored waveform a node uses.
+
+   Purely constructive: it picks, and it offers the two ways of getting a
+   signal that is not in the list yet. It cannot delete anything, because it
+   is reached while wiring and wiring must never destroy a recording (see the
+   section header). "Used by" is shown only because it helps you choose.
+
+   opts:
+     .title        wording for the calling context
+     .onPick       fn(signal)
+     .node         the node being configured
+     .onLearn      optional fn() -- offered as "learn one instead"
+     .onVirtual    optional fn() -- offered as "create one instead"
+   ---------------------------------------------------------------------- */
+var pickerRefresh = null;   /* set while a picker sheet is open */
+
+function openSignalPicker(opts) {
+  opts = opts || {};
+  var sh = openSheet(opts.title || "Choose a signal",
+    "Everything this box has stored. Signals already used by a node are marked — you can " +
+    "still pick one, two nodes may share a signal.",
+    function () { pickerRefresh = null; });
+
+  var listWrap = el("div");
+  add(sh.body, listWrap);
+
+  function alts(where) {
+    if (!opts.onLearn && !opts.onVirtual) return;
+    var row = el("div", "btnrow");
+    row.style.marginTop = ".7rem";
+    if (opts.onLearn) {
+      var lb = el("button", "btn", "🎓 Learn a new button");
+      lb.type = "button";
+      lb.addEventListener("click", function () { sh.close(); opts.onLearn(); });
+      add(row, lb);
+    }
+    if (opts.onVirtual) {
+      var vb = el("button", "btn", "✨ Configure by hand");
+      vb.type = "button";
+      vb.addEventListener("click", function () { sh.close(); opts.onVirtual(); });
+      add(row, vb);
+    }
+    add(where, row);
+  }
+
+  function render() {
+    clear(listWrap);
+    if (S.signalsErr) {
+      add(listWrap, el("div", "note bad",
+        "Could not read the signal store: " + S.signalsErr.message));
+    }
+
+    var list = S.signals || [];
+    if (!list.length) {
+      add(listWrap, el("div", "empty", "No signals stored yet."));
+      alts(listWrap);
+      return;
+    }
+
+    var ul = el("ul", "list");
+    list.forEach(function (sig) {
+      var users = nodesUsingSignal(sig.id, 0);
+      var li = el("li");
+      var b = el("button", "listitem"); b.type = "button";
+      add(b, el("span", "li-ico", sig.origin === "synthesized" ? "✨" : "📥"));
+      var main = el("div", "li-main");
+      add(main, el("div", "li-title", signalLabel(sig)));
+      var subParts = [signalIdent(sig)];
+      if (typeof sig.base_us === "number") subParts.push(sig.base_us + " us base");
+      add(main, el("div", "li-sub", subParts.join("  ·  ")));
+      add(main, el("div", "li-sub", users.length ? usedByText(users) : "Not used by any node"));
+      add(b, main);
+      var meta = el("div", "li-meta");
+      if (typeof sig.seen_count === "number") add(meta, el("div", null, sig.seen_count + "x"));
+      if (typeof sig.last_seen_s === "number") add(meta, el("div", null, agoText(sig.last_seen_s)));
+      add(b, meta);
+      b.addEventListener("click", function () { sh.close(); opts.onPick(sig); });
+      add(li, b);
+      add(ul, li);
+    });
+    add(listWrap, ul);
+    alts(listWrap);
+  }
+
+  pickerRefresh = render;
+  render();
+  /* Cheap and worth it: the store may have changed since this tab was entered. */
+  loadSignals();
+  return sh;
+}
+
+/* ----------------------------------------------------------------------
+   Learn, as a flow rather than a screen.
+
+   Everything the old Learn tab said is here: the countdown, the "the receiver
+   is always listening" explanation, the admission thresholds with the bench
+   numbers, the candidate with its confidence, repeats and RSSI, and the name
+   field. It resolves with the created signal, so the caller can bind it to a
+   node in the same breath -- one flow, one confirmation.
+
+   On a phone this is a bottom sheet: countdown and candidate sit at the top,
+   the explanation is collapsed underneath so the sheet still fits a 360 px
+   screen without scrolling past the thing you are waiting for.
+   ---------------------------------------------------------------------- */
+function openLearnFlow(opts) {
+  opts = opts || {};
+  return new Promise(function (resolve) {
+    var done = false;
+    var armed = false;
+
+    var sh = openSheet(opts.title || "Learn a button",
+      opts.sub || "Arm the receiver, then press the button on your remote a few times.",
+      function () {
+        stopPoll("learn");
+        if (done) return;
+        done = true;
+        /* Closing the sheet must not leave the box armed behind your back. */
+        if (armed) postJSON("/api/learn/cancel", {}).catch(function () { /* ignore */ });
+        resolve(null);
+      });
+
+    function finish(sig) {
+      if (done) return;
+      done = true;
+      stopPoll("learn");
+      sh.close();
+      resolve(sig || null);
+    }
+
+    var count = el("div", "countdown idle", "—");
+    var state = el("div", "listening");
+    add(sh.body, count, state);
+
+    var candPanel = el("div", "candidate hidden");
+    add(sh.body, candPanel);
+
+    var timeoutSel = selectEl([
+      { value: 30, label: "30 seconds" },
+      { value: 60, label: "1 minute" },
+      { value: 120, label: "2 minutes" },
+      { value: 300, label: "5 minutes" }
+    ], 60);
+    add(sh.body, field("Stay armed for", timeoutSel,
+      "Learn mode always expires on its own, so the box never sits armed forever."));
+
+    var msg = el("div", "formmsg");
+    var ctl = el("div", "btnrow");
+    var armBtn = el("button", "btn primary", "Arm learn mode");
+    armBtn.type = "button";
+    var cancelBtn = el("button", "btn", "Cancel");
+    cancelBtn.type = "button";
+    add(ctl, armBtn, cancelBtn);
+    add(sh.body, ctl, msg);
+
+    armBtn.addEventListener("click", function () {
+      armBtn.disabled = true;
+      setMsg(msg, "Arming…");
+      postJSON("/api/learn/arm", { timeout_s: intOf(timeoutSel, 60) }).then(function () {
+        armed = true;
+        setMsg(msg, "Armed. Press your remote button now — several times.", "ok");
+        poll("learn", 1000, tick);
+      }).catch(function (e) {
+        setMsg(msg, e.message, "err");
+      }).then(function () { armBtn.disabled = false; });
+    });
+    cancelBtn.addEventListener("click", function () {
+      cancelBtn.disabled = true;
+      postJSON("/api/learn/cancel", {}).then(function () { armed = false; return tick(); })
+        .catch(function (e) { setMsg(msg, e.message, "err"); })
+        .then(function () { cancelBtn.disabled = false; });
+    });
+
+    if (opts.note) add(sh.body, el("div", "note", opts.note));
+
+    /* The single most misunderstood part of the box, kept verbatim from the
+       screen this flow replaces -- collapsed, because it is read once. */
+    var ep = section("What learn mode actually does", null, false);
+    add(ep.bodyEl, el("p", "small",
+      "The receiver is ALWAYS listening. It has to be: a button you already registered must " +
+      "ring the moment it is pressed, so there is no on-demand receive mode to switch on."));
+    add(ep.bodyEl, el("p", "small",
+      "Learn mode changes exactly one thing — the fate of a signal the box does NOT recognise. " +
+      "Normally such a signal is dropped with one line in the activity feed. While armed, it is " +
+      "offered to you here for registration instead. Signals you already know behave identically " +
+      "either way."));
+    add(ep.bodyEl, el("div", "note",
+      "A candidate must repeat at least twice and decode with at least 65% confidence before it " +
+      "is offered. Both thresholds come from bench measurements: a real remote always sends " +
+      "several copies (67-92% confidence), while band noise scores 24-48% and rarely repeats. " +
+      "Without those filters the box would happily register the amplifier's own noise as a doorbell."));
+    add(sh.body, ep);
+
+    function tick() {
+      return api("/api/learn").then(function (res) {
+        S.learn = res;
+        render(res, null);
+      }).catch(function (e) {
+        S.learn = null;
+        render(null, e);
+      });
+    }
+
+    function render(L, err) {
+      if (err) {
+        count.textContent = "—";
+        count.className = "countdown idle";
+        clear(state);
+        add(state, el("span", null, "Learn mode is not available: " + err.message));
+        armBtn.disabled = true;
+        cancelBtn.disabled = true;
+        candPanel.classList.add("hidden");
+        stopPoll("learn");
+        return;
+      }
+      var active = !!(L && L.active);
+      armed = active;
+      armBtn.classList.toggle("hidden", active);
+      cancelBtn.classList.toggle("hidden", !active);
+
+      if (active) {
+        var rem = numOr(L.remaining_s, 0);
+        count.textContent = Math.floor(rem / 60) + ":" + ("0" + (rem % 60)).slice(-2);
+        count.className = "countdown";
+        clear(state);
+        add(state, el("span", "pulse"), el("span", null,
+          L.candidate ? "Candidate captured — review it below." : "Armed — press your remote button"));
+      } else {
+        count.textContent = "—";
+        count.className = "countdown idle";
+        clear(state);
+        add(state, el("span", null,
+          "Not armed. The receiver is still listening — known buttons work as usual."));
+        /* Deliberately NOT re-scheduling the poll from here: poll() fires its
+           function immediately, so calling it from inside a render that was
+           itself triggered by that poll would recurse. */
+      }
+      renderCandidate(L && L.candidate);
+    }
+
+    function renderCandidate(c) {
+      if (!c) { candPanel.classList.add("hidden"); clear(candPanel); return; }
+      /* Do not rebuild while the user is typing the name. */
+      if (candPanel.dataset.fp === (c.fingerprint || "") &&
+          $(".cand-name", candPanel) === document.activeElement) return;
+      candPanel.dataset.fp = c.fingerprint || "";
+      candPanel.classList.remove("hidden");
+      clear(candPanel);
+
+      var h = el("div", "panel-head");
+      add(h, el("h2", null, "New button detected"));
+      add(h, el("p", null, "Give it a name and accept it, or ignore it and press a different button."));
+      add(candPanel, h);
+
+      var chips = el("div", "chiprow");
+      if (c.decoded && c.decoded.text) add(chips, el("span", "chip accent mono", c.decoded.text));
+      else add(chips, el("span", "chip warn", "Unknown protocol — will be stored as raw pulses"));
+      if (typeof c.repeats === "number") add(chips, el("span", "chip ok", c.repeats + " repeats"));
+      if (typeof c.rssi_dbm === "number") {
+        add(chips, el("span", "chip " + (c.rssi_dbm > -60 ? "ok" : "warn"), c.rssi_dbm + " dBm"));
+      }
+      add(candPanel, chips);
+
+      if (typeof c.confidence === "number") {
+        var m = el("div", "meter " + (c.confidence >= 65 ? "ok" : "warn"));
+        var f = el("i");
+        f.style.width = Math.max(2, Math.min(100, c.confidence)) + "%";
+        add(m, f);
+        var cwrap = el("div");
+        cwrap.style.margin = ".6rem 0";
+        var r = el("div", "row");
+        r.style.justifyContent = "space-between";
+        add(r, el("span", "small muted", "Confidence"), el("span", "small mono", c.confidence + "%"));
+        add(cwrap, r, m);
+        add(candPanel, cwrap);
+      }
+
+      var kv = el("dl", "kv");
+      if (typeof c.base_us === "number") { add(kv, el("dt", null, "Base pulse")); add(kv, el("dd", "mono", c.base_us + " us")); }
+      if (typeof c.pulse_count === "number") { add(kv, el("dt", null, "Pulses")); add(kv, el("dd", "mono", String(c.pulse_count))); }
+      if (c.fingerprint) { add(kv, el("dt", null, "Fingerprint")); add(kv, el("dd", "mono", c.fingerprint)); }
+      add(candPanel, kv);
+
+      var nameIn = inputEl("text", "", { maxlength: "40", placeholder: "e.g. Front door" });
+      nameIn.className = "cand-name";
+      add(candPanel, field("Name this button", nameIn,
+        "Shown in the activity feed and on the node that uses it."));
+
+      var cmsg = el("div", "formmsg");
+      var foot = el("div", "formfoot");
+      var acc = el("button", "btn primary", opts.acceptLabel || "Accept and use it");
+      acc.type = "button";
+      acc.addEventListener("click", function () {
+        var n = trimOf(nameIn);
+        if (!n) { setMsg(cmsg, "Give the button a name first.", "err"); nameIn.focus(); return; }
+        acc.disabled = true;
+        setMsg(cmsg, "Saving…");
+        postJSON("/api/learn/accept", { name: n }).then(function (created) {
+          armed = false;
+          return loadSignals().then(function (list) {
+            var made = (created && created.id) ? (signalById(created.id) || created)
+                                               : list[list.length - 1];
+            finish(made || null);
+          });
+        }).catch(function (e) {
+          acc.disabled = false;
+          setMsg(cmsg, e.message, "err");
+        });
+      });
+      add(foot, acc, cmsg);
+      add(candPanel, foot);
+      if (!nameIn.value) setTimeout(function () { nameIn.focus(); }, 40);
+    }
+
+    poll("learn", 1000, tick);
+    /* Straight into listening: someone who opened this flow has already said
+       they want to learn a button, and should not have to say it twice. */
+    if (opts.autoArm !== false) setTimeout(function () { armBtn.click(); }, 60);
+  });
+}
+
+/* ----------------------------------------------------------------------
+   Creating a virtual signal, as a flow. Same copy as the old Signals screen
+   carried, because it is the copy that explains why the thing exists at all.
+   Resolves with the created signal.
+   ---------------------------------------------------------------------- */
+/* An EV1527 address is 20 bits and is SHOWN as hex everywhere in this UI
+   ("EV1527 id=0xA685A btn=0x8"), so it must be accepted as hex too. Rules:
+     "0xA685A" / "A685A"  -> hex   (any string containing a-f is unambiguous)
+     "681562"             -> decimal (plain digits read as the human wrote them)
+     ""                   -> blank; the firmware draws a random address
+   Anything else is rejected with a sentence rather than silently clamped -- a
+   quietly truncated address produces a signal that simply never matches. */
+var ID20_MAX = 0xFFFFF;
+
+function parseId20(raw) {
+  var t = (raw || "").trim().replace(/\s+/g, "");
+  if (!t) return { ok: true, blank: true, value: 0 };
+  var v = NaN;
+  if (/^0x[0-9a-f]+$/i.test(t)) v = parseInt(t.slice(2), 16);
+  else if (/^[0-9]+$/.test(t)) v = parseInt(t, 10);
+  else if (/^[0-9a-f]+$/i.test(t)) v = parseInt(t, 16);
+  else return { ok: false, msg: "Use hex (0xA685A or A685A) or plain digits — nothing else." };
+  if (!isFinite(v) || v < 0) return { ok: false, msg: "That is not a number." };
+  if (v > ID20_MAX) {
+    return { ok: false, msg: "An EV1527 address is 20 bits: 0 to 0xFFFFF (1048575). " +
+      "0x" + v.toString(16).toUpperCase() + " is too large." };
+  }
+  /* 0 is the API's "pick one for me" sentinel, so it can never be a real
+     address -- say so instead of creating something that decodes as random. */
+  return { ok: true, blank: v === 0, value: v };
+}
+function hex20(v) { return "0x" + v.toString(16).toUpperCase(); }
+function ev1527Text(id20, button) { return "EV1527 id=" + hex20(id20) + " btn=" + hex20(button); }
+
+/* ----------------------------------------------------------------------
+   Hand-crafting a signal, as a flow. Reached as the third option ("Configure
+   by hand") both from a Signal node and from the stored-signals list.
+
+   The copy used to fork on direction, because a source node could only listen
+   and a transmit sink could only send, and the same made-up code therefore
+   meant two different things depending on which end you were standing at. A
+   Signal node is BOTH ends, so the fork is gone and the sheet says both things:
+   the box will send this code, and it will also react to hearing it. The
+   sentence that had to survive from the old source copy is the one about
+   nothing happening on its own -- without it a user invents a code, hears
+   silence, and concludes the box is broken.
+
+   opts.mode: "signal" (a node's code, both directions) | "sink" (the stored
+   signals list, where there is no node and pairing is the whole point).
+   Default "sink". Resolves with the created signal.
+   ---------------------------------------------------------------------- */
+function openVirtualFlow(opts) {
+  opts = opts || {};
+  var isNode = opts.mode === "signal";
+  return new Promise(function (resolve) {
+    var done = false;
+    var sh = openSheet("Enter a code",
+      isNode
+        ? "A code this node will send, and fire on when it hears."
+        : "A brand-new code, so you can pair your own receivers to this box.",
+      function () { if (!done) { done = true; resolve(null); } });
+
+    if (isNode) {
+      add(sh.body, el("p", "small",
+        "Use this when you already KNOW the code — from another Klingelbox, from a remote you " +
+        "decoded elsewhere — or when you are inventing a fresh one for a receiver of your own. " +
+        "If the remote is in your hand, Learn is easier and cannot get a digit wrong."));
+      add(sh.body, el("div", "note warn",
+        "A code on its own does nothing. Link something into this node's input and the box " +
+        "transmits it — which is also how you pair a chime, relay or socket to it. Its output " +
+        "stays quiet until something actually sends that code over the air."));
+    } else {
+      add(sh.body, el("p", "small",
+        "A virtual signal is a brand-new EV1527 code that no remote in the world is using yet. " +
+        "It exists so you can pair YOUR OWN receivers to this box: put a plug-in chime, a relay " +
+        "or a socket into its learning mode, then transmit this signal. From then on the receiver " +
+        "obeys this box, and any node can ring it."));
+    }
+
+    var grid = el("div", "formgrid");
+    var vName = inputEl("text", isNode ? "Hand-entered code" : "Virtual chime 1",
+      { maxlength: "40", placeholder: isNode ? "Hand-entered code" : "Virtual chime 1" });
+    var vBtn = selectEl([1, 2, 4, 8].map(function (b) { return { value: b, label: "Button " + b }; }), 8);
+    var vBase = inputEl("number", "350", { min: "100", max: "1500", step: "10", inputmode: "numeric" });
+    /* text, not number: "0xA685A" is the form this UI displays everywhere. */
+    var vId = inputEl("text", "", { maxlength: "12", placeholder: "0xA685A or blank",
+      autocapitalize: "off", autocorrect: "off" });
+
+    var idRow = el("div", "row");
+    idRow.style.gap = ".4rem";
+    vId.style.flex = "1 1 8rem";
+    var rnd = el("button", "btn small", "🎲 Randomize");
+    rnd.type = "button";
+    rnd.style.minHeight = "2.75rem";
+    rnd.style.flex = "0 0 auto";
+    add(idRow, vId, rnd);
+
+    var idField = field("20-bit address", idRow,
+      "Hex (0xA685A or A685A) or plain digits. Leave it blank — or tap Randomize — and the box " +
+      "picks a free address itself.", "full");
+
+    /* The preview is what makes hand-entry checkable: it is formatted exactly
+       like the decoded identity shown on every signal elsewhere in the UI. */
+    var preview = el("div", "hint mono");
+    add(idField, preview);
+
+    add(grid,
+      field("Name", vName, null, "full"),
+      field("Button code", vBtn, "The 4-bit button nibble sent with the address."),
+      field("Base pulse (us)", vBase, "350 us suits most EV1527 receivers."),
+      idField);
+    add(sh.body, grid);
+
+    var msg = el("div", "formmsg");
+
+    function syncPreview() {
+      var r = parseId20(vId.value);
+      var btn = intOf(vBtn, 8);
+      if (!r.ok) {
+        preview.textContent = r.msg;
+        preview.className = "hint mono bad-text";
+        return r;
+      }
+      preview.className = "hint mono";
+      preview.textContent = r.blank
+        ? ("EV1527 id=0x????? btn=" + hex20(btn) + "   — a random address, chosen by the box")
+        : ev1527Text(r.value, btn);
+      return r;
+    }
+    vId.addEventListener("input", syncPreview);
+    vBtn.addEventListener("change", syncPreview);
+    rnd.addEventListener("click", function () {
+      /* 1..0xFFFFF: never 0, which the API reads as "choose for me". */
+      vId.value = hex20(1 + Math.floor(Math.random() * ID20_MAX));
+      syncPreview();
+      setMsg(msg, "");
+    });
+    syncPreview();
+
+    var foot = el("div", "formfoot");
+    var save = el("button", "btn primary", isNode ? "Use this code" : "Create virtual signal");
+    save.type = "button";
+    /* The duplicate-address override.
+       The API refuses a code another signal already carries, because the two
+       cannot be told apart when one is RECEIVED. That is worth a stop, not a
+       wall: re-creating a code you already captured is a legitimate thing to
+       want — it is how you check that the box can GENERATE a code it can
+       currently only REPLAY. So the refusal turns into a second button rather
+       than a dead end, and the button stays hidden until there has actually
+       been a refusal: nobody should be offered "create a duplicate" before
+       there is one to duplicate. */
+    var anyway = el("button", "btn", "Create it anyway");
+    anyway.type = "button";
+    anyway.style.display = "none";
+    var cancel = el("button", "btn", "Cancel");
+    cancel.type = "button";
+    cancel.addEventListener("click", sh.close);
+    add(foot, save, anyway, cancel, msg);
+    add(sh.body, foot);
+
+    add(sh.body, el("div", "note", isNode
+      ? "The node is created carrying exactly this code, both ways. It gets a “Pair with a " +
+        "receiver” panel for teaching your chime the code, and its output shows up in the " +
+        "Activity feed under the graph the moment anything sends it over the air."
+      : "Next: the signal you are creating gets a “Pair with a receiver” panel. Put your receiver " +
+        "into pairing mode and tap Pair now there — the receiver stores this code and answers to " +
+        "it from then on."));
+
+    function submit(allowDuplicate) {
+      var r = syncPreview();
+      if (!r.ok) { setMsg(msg, r.msg, "err"); vId.focus(); return; }
+      var body = {
+        name: trimOf(vName) || (isNode ? "Hand-entered code" : "Virtual signal"),
+        button: intOf(vBtn, 8),
+        base_us: intOf(vBase, 350),
+        id20: r.blank ? 0 : r.value
+      };
+      if (allowDuplicate) body.allow_duplicate = true;
+      save.disabled = true;
+      anyway.disabled = true;
+      setMsg(msg, "Creating…");
+      postJSON("/api/signals/virtual", body).then(function (created) {
+        return loadSignals().then(function (list) {
+          var made = (created && created.id) ? (signalById(created.id) || created)
+                                             : list[list.length - 1];
+          done = true;
+          sh.close();
+          resolve(made || null);
+        });
+      }).catch(function (e) {
+        save.disabled = false;
+        anyway.disabled = false;
+        setMsg(msg, e.message, "err");
+        if (e.status === 409 && e.body && e.body.conflict_signal_id)
+          anyway.style.display = "";
+      });
+    }
+
+    save.addEventListener("click", function () { submit(false); });
+    anyway.addEventListener("click", function () { submit(true); });
+  });
+}
+
+/* ======================================================================
+   DASHBOARD -- the node graph IS the product
+
+   One screen, four things, in this order:
+     1. the view switch (Map / List) and "Add node",
+     2. the graph itself,
+     3. the live activity feed -- watching presses arrive while you wire is
+        exactly when it is needed, so it sits under the thing being wired,
+     4. the recipes.
+   ====================================================================== */
+
+/* `g` is the node's GROUP, and the group is what decides its ports:
+
+     source  -- output only
+     logic   -- both
+     sink    -- input only
+     signal  -- both, and the reason this list has four groups instead of three
+
+   A 433 MHz signal is not an input or an output, it is a thing that can be
+   received OR sent, so the one node that stands for a stored signal has a port
+   at each end. It replaced the old "433 MHz button" (in only) and "Transmit"
+   (out only), which between them made the box able to do both while showing
+   neither -- wiring a Virtual trigger into a 433 MHz button was refused, and
+   there was no reason for that anyone could see on the screen. */
+var NODE_TYPES = [
+  { t: "signal", g: "signal", label: "Signal", ico: "📶",
+    help: "One 433 MHz code, both ways: its output fires when the code is heard on air, " +
+          "and anything linked into its input transmits it." },
+  { t: "source.gpio", g: "source", label: "Wired button", ico: "🔌",
+    help: "Fires when a button wired to a GPIO pin is pressed. Optional." },
+  { t: "source.virtual", g: "source", label: "Virtual trigger", ico: "✨",
+    help: "Fires from this page, from the REST API, or from an MQTT topic." },
+  { t: "source.any_rf", g: "source", label: "Any RF signal", ico: "📻",
+    help: "Wildcard: fires on EVERY burst the receiver hears, registered or not." },
+  { t: "logic.group", g: "logic", label: "Group", ico: "🔗",
+    help: "Passes on when ANY or ALL of its inputs fire inside a time window." },
+  { t: "logic.throttle", g: "logic", label: "Rate limit", ico: "⏱",
+    help: "Passes the first press, then ignores everything for a cooldown you set. " +
+          "Someone can lean on the button — the bell still rings once." },
+  /* The "loop" node the user asked for, under a name that does not collide with
+     the graph's own meaning of a loop (a cycle in the wiring, which the engine
+     warns about and refuses to walk). */
+  { t: "logic.repeat", g: "logic", label: "Repeat", ico: "🔁",
+    help: "Rings straight away, then again a few more times at an interval you set. " +
+          "One press, several chimes — for when the first one gets missed." },
+  { t: "sink.mqtt", g: "sink", label: "MQTT publish", ico: "📨",
+    help: "Publishes to your broker / fires a Home Assistant device trigger." }
+];
+function nodeType(t) {
+  for (var i = 0; i < NODE_TYPES.length; i++) if (NODE_TYPES[i].t === t) return NODE_TYPES[i];
+  return { t: t, g: "logic", label: t || "unknown", ico: "⚙", help: "" };
+}
+function nodeById(id) {
+  var ns = (S.graph && S.graph.nodes) || [];
+  for (var i = 0; i < ns.length; i++) if (ns[i].id === id) return ns[i];
+  return null;
+}
+function nodeName(id) {
+  var n = nodeById(id);
+  return n ? (n.name || nodeType(n.type).label) : ("node " + id);
+}
+function signalName(id) {
+  var list = S.signals || [];
+  for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i].name || ("Signal " + id);
+  return null;
+}
+/* Ports follow from the group: a source has no input, a sink has no output, and
+   everything else -- logic and signal alike -- has both. */
+function hasInput(n) { return nodeType(n.type).g !== "source"; }
+function hasOutput(n) { return nodeType(n.type).g !== "sink"; }
+function linkExists(from, to) {
+  var ls = (S.graph && S.graph.links) || [];
+  for (var i = 0; i < ls.length; i++) if (ls[i].from === from && ls[i].to === to) return true;
+  return false;
+}
+
+var autoEls = {};   /* the graph */
+var dashEls = {};   /* the activity feed and the box-status chips under it */
 
 function buildDashboard() {
   if (S.built.dashboard) return;
   S.built.dashboard = true;
   var root = clear($("#tab-dashboard"));
 
-  /* --- status + call to action --- */
-  var p1 = el("div", "panel");
-  dashEls.statusRow = el("div", "chiprow");
-  add(p1, dashEls.statusRow);
+  var p = el("div", "panel");
+  var h = el("div", "panel-head");
+  add(h, el("h2", null, "Your box, as a flow"));
+  add(h, el("p", null,
+    "A press travels left to right: something hears it, optional LOGIC decides whether it " +
+    "passes, and something at the far end acts — send a signal, publish to MQTT. " +
+    "Nodes are linked by tapping, never by dragging."));
+  add(h, el("p", null,
+    "A “Signal” node is one 433 MHz code and works both ways: its output fires when that code " +
+    "is heard on air, and anything linked into its input transmits it. So the same node is the " +
+    "doorbell at one end of a chain and the chime at the other."));
+  add(h, el("p", null,
+    "Two more are worth knowing about: “Any RF signal” is a wildcard that fires on every " +
+    "burst on the band, and a “Group” lets several buttons drive one action."));
+  add(p, h);
+
+  /* The two things that make the whole screen a lie if they are wrong: no
+     radio, or no home network. They used to head the old Dashboard. */
   dashEls.statusNote = el("div");
-  add(p1, dashEls.statusNote);
-  var cta = el("div", "btnrow");
-  cta.style.marginTop = ".7rem";
-  var learnBtn = el("button", "btn primary", "➕ Learn a button");
-  learnBtn.type = "button";
-  learnBtn.addEventListener("click", function () { selectTab("learn"); armLearn(60); });
-  var diagBtn = el("button", "btn", "Diagnostics");
-  diagBtn.type = "button";
-  diagBtn.addEventListener("click", function () { selectTab("diagnostics"); });
-  add(cta, learnBtn, diagBtn);
-  add(p1, cta);
-  add(root, p1);
-
-  /* --- live event feed --- */
-  var p2 = el("div", "panel");
-  var h2 = el("div", "panel-head");
-  add(h2, el("h2", null, "Live activity"));
-  add(h2, el("p", null,
-    "Everything the receiver hears, as it happens. The radio listens continuously; " +
-    "learn mode only decides what to do with a signal it does not recognise."));
-  add(p2, h2);
-  dashEls.feed = el("ul", "feed");
-  add(p2, dashEls.feed);
-  dashEls.feedEmpty = el("div", "empty", "Nothing heard yet. Press a doorbell button.");
-  add(p2, dashEls.feedEmpty);
-  add(root, p2);
-
-  /* --- quick transmit --- */
-  var p3 = el("div", "panel");
-  var h3 = el("div", "panel-head");
-  add(h3, el("h2", null, "Stored signals"));
-  add(h3, el("p", null, "Tap Transmit to replay a signal on 433 MHz right now."));
-  add(p3, h3);
+  add(p, dashEls.statusNote);
   dashEls.txNote = el("div");
-  add(p3, dashEls.txNote);
-  dashEls.quick = el("div", "cards");
-  add(p3, dashEls.quick);
-  dashEls.quickEmpty = el("div", "empty",
-    "No signals stored yet. Use “Learn a button” above to add the first one.");
-  add(p3, dashEls.quickEmpty);
-  add(root, p3);
+  add(p, dashEls.txNote);
 
+  var topRow = el("div", "row");
+  var addBtn = el("button", "btn primary", "➕ Add node");
+  addBtn.type = "button";
+  addBtn.addEventListener("click", openAddNode);
+  add(topRow, addBtn);
+
+  /* View switch: hidden below 900 px by CSS -- the list is the whole product
+     on a phone, and the canvas is strictly additive.
+
+     Which one OPENS by default follows the screen, because the right answer
+     genuinely differs: on a desktop the map shows the whole flow at a glance,
+     while on a phone it is a cramped picture you cannot edit. An explicit
+     choice is remembered and wins on screens wide enough to honour it. */
+  autoEls.viewSwitch = el("div", "segmented graph-viewswitch");
+  var bList = el("button", null, "List"); bList.type = "button";
+  var bMap = el("button", null, "Map"); bMap.type = "button";
+  autoEls.bList = bList; autoEls.bMap = bMap;
+  bList.addEventListener("click", function () { setGraphView("list", bList, bMap, true); });
+  bMap.addEventListener("click", function () { setGraphView("map", bList, bMap, true); });
+  /* Map first: it is the default on any screen wide enough to show this
+     switch at all, and the leading position should match the default. */
+  add(autoEls.viewSwitch, bMap, bList);
+  add(topRow, autoEls.viewSwitch);
+  add(p, topRow);
+  add(root, p);
+
+  autoEls.listWrap = el("div", "stack");
+  add(root, autoEls.listWrap);
+  autoEls.canvasWrap = el("div", "panel hidden");
+  add(root, autoEls.canvasWrap);
+  autoEls.empty = el("div", "empty",
+    "No nodes yet. Add two “Signal” nodes — your doorbell and your chime — then link the " +
+    "first one's output to the second one's input.");
+  add(root, autoEls.empty);
+
+  /* --- live activity ---
+     Directly under the graph on purpose: the moment you want to see presses
+     arrive is the moment you are wiring the node that should catch them. */
+  var ap = el("div", "panel");
+  var ah = el("div", "panel-head");
+  add(ah, el("h2", null, "Activity"));
+  add(ah, el("p", null,
+    "Everything the receiver hears and everything the nodes do about it, as it happens. " +
+    "The radio listens continuously; learning a button only decides what happens to a " +
+    "signal it does not recognise."));
+  add(ap, ah);
+  dashEls.statusRow = el("div", "chiprow");
+  add(ap, dashEls.statusRow);
+  dashEls.feed = el("ul", "feed");
+  add(ap, dashEls.feed);
+  dashEls.feedEmpty = el("div", "empty", "Nothing heard yet. Press a doorbell button.");
+  add(ap, dashEls.feedEmpty);
+  add(root, ap);
+
+  /* Recipes: the group pattern is the least obvious capability here, and it is
+     precisely what "make several buttons ring one chime" needs. */
+  var rp = el("div", "panel");
+  var rh = el("div", "panel-head");
+  add(rh, el("h2", null, "Recipes"));
+  add(rh, el("p", null, "Patterns that need no special node type — just links."));
+  add(rp, rh);
+  [
+    ["Repeat a doorbell to a second chime",
+     "Signal (Front door) → Signal (Virtual chime 1). Two signal nodes: the first one's output " +
+     "fires when the doorbell is heard, the second one's input sends the chime's code."],
+    ["Several buttons, one chime",
+     "Signal (Front) + Signal (Back) → Group (mode: any) → Signal (Virtual chime 1). " +
+     "This is how you fold several remotes into a single virtual signal — no special node needed, " +
+     "just two signal outputs into one group."],
+    ["Two buttons pressed together",
+     "Same as above but set the Group to mode ALL and give it a window (e.g. 3 s)."],
+    ["Ring several times from one press",
+     "Signal (Front door) → Repeat (3 times, 5 s) → Signal (chime). The chime rings at once and " +
+     "then twice more, five seconds apart — no second link and no extra node needed, the one " +
+     "Repeat node does it all. Press again mid-run and the count starts over."],
+    ["Stop a stuck button ringing forever",
+     "Signal (Front door) → Rate limit (10 s cooldown) → Signal (chime)."],
+    ["Ring the chime from Home Assistant",
+     "Virtual trigger (topic: front_gate) → Signal (chime). Publish anything to the trigger topic " +
+     "and the code goes out."],
+    ["Tell Home Assistant someone rang",
+     "Signal (Front door) → MQTT publish (topic: front)."],
+    ["Proxy the whole band to Home Assistant",
+     "Any RF signal → MQTT publish. Every press within range reaches HA, including buttons you " +
+     "never registered. Add a Rate limit in the middle if the band is busy."]
+  ].forEach(function (r) {
+    var b = el("div");
+    b.style.marginBottom = ".6rem";
+    add(b, el("div", null, r[0]));
+    add(b, el("div", "hint mono", r[1]));
+    add(rp, b);
+  });
+  add(root, rp);
+
+  setGraphView(defaultGraphView(), bList, bMap, false);
+  watchGraphViewport();
+
+  renderGraph();
   renderDashStatus();
   renderFeed();
-  renderQuickSignals();
 }
+
+/* ------------------------------------------------------------- activity --
+   The live feed, the box-status chips beside it and the 1 Hz relabelling of
+   ages: all of it came off the old Dashboard unchanged, including the serial
+   guard in loadEvents() that leaves the DOM alone when nothing happened. */
 
 function tickDashClock() {
   if (!S.built.dashboard) return;
@@ -725,10 +1674,19 @@ function tickDashClock() {
   });
 }
 
+function renderTxNote() {
+  if (!dashEls.txNote) return;
+  clear(dashEls.txNote);
+  var warn = txBlockNote();
+  if (warn) add(dashEls.txNote, warn);
+}
+
 function renderDashStatus() {
   if (!dashEls.statusRow) return;
   var row = clear(dashEls.statusRow);
   var sys = S.sys;
+
+  renderTxNote();
 
   if (!sys) { add(row, el("span", "chip bad", "Box not reachable")); return; }
 
@@ -801,715 +1759,56 @@ function renderFeed() {
   });
 }
 
-function renderQuickSignals() {
-  if (!dashEls.quick) return;
-  var box = clear(dashEls.quick);
-  var list = S.signals || [];
-  dashEls.quickEmpty.classList.toggle("hidden", list.length > 0);
-  clear(dashEls.txNote);
-  var warn = txBlockNote();
-  if (warn) add(dashEls.txNote, warn);
+/* Must match the `min-width: 900px` rule that reveals .graph-viewswitch in
+   style.css. If the two ever disagree, the map can be selected on a screen where
+   the switch is invisible and the user has no way back to the list. */
+var GRAPH_MAP_MQ = "(min-width: 900px)";
+var GRAPH_VIEW_KEY = "klingelbox-graphview";
 
-  list.forEach(function (sig) {
-    var c = el("div", "card");
-    var head = el("div", "card-head");
-    add(head, el("div", "card-title", sig.name || ("Signal " + sig.id)));
-    add(c, head);
-    var chips = el("div", "chiprow");
-    if (sig.decoded && sig.decoded.text) add(chips, el("span", "chip mono", sig.decoded.text));
-    else add(chips, el("span", "chip warn", "raw waveform"));
-    if (sig.origin) add(chips, el("span", "chip", sig.origin));
-    if (typeof sig.seen_count === "number") add(chips, el("span", "chip", "seen " + sig.seen_count + "x"));
-    add(c, chips);
-    var msg = el("div", "formmsg");
-    var row = el("div", "btnrow");
-    var tx = el("button", "btn primary", "📡 Transmit");
-    tx.type = "button";
-    tx.disabled = !txAvailable();
-    if (!txAvailable()) tx.title = S.txBlock;
-    tx.addEventListener("click", function () { transmit(sig.id, tx, msg); });
-    var det = el("button", "btn", "Details");
-    det.type = "button";
-    det.addEventListener("click", function () { openSignalSheet(sig.id); });
-    add(row, tx, det);
-    add(c, row, msg);
-    add(box, c);
-  });
+function canvasUsable() {
+  return window.matchMedia ? window.matchMedia(GRAPH_MAP_MQ).matches : true;
 }
 
-/* ======================================================================
-   SIGNALS
-   ====================================================================== */
-
-var sigEls = {};
-
-function buildSignals() {
-  if (S.built.signals) return;
-  S.built.signals = true;
-  var root = clear($("#tab-signals"));
-
-  var p = el("div", "panel");
-  var h = el("div", "panel-head");
-  add(h, el("h2", null, "Signals"));
-  add(h, el("p", null,
-    "Every waveform this box knows: captured from a remote, or synthesized here. " +
-    "Tap one to see how it decoded, look at its pulse train, rename it, replay it or delete it."));
-  add(p, h);
-  sigEls.txNote = el("div");
-  add(p, sigEls.txNote);
-  sigEls.list = el("ul", "list");
-  add(p, sigEls.list);
-  sigEls.empty = el("div", "empty",
-    "No signals yet. Go to Learn and press your doorbell button, or create a virtual signal below.");
-  add(p, sigEls.empty);
-  sigEls.err = el("div", "note bad hidden");
-  add(p, sigEls.err);
-  add(root, p);
-
-  /* --- virtual signal --- */
-  var vp = el("div", "panel");
-  var vh = el("div", "panel-head");
-  add(vh, el("h2", null, "Create a virtual signal"));
-  add(vh, el("p", null,
-    "A virtual signal is a brand-new EV1527 code that no remote in the world is using yet. " +
-    "It exists so you can pair YOUR OWN receivers to this box: put a plug-in chime, a relay " +
-    "or a socket into its learning mode, then transmit this signal. From then on the receiver " +
-    "obeys this box, and any node in Automations can ring it."));
-  add(vp, vh);
-  var grid = el("div", "formgrid");
-  var vName = inputEl("text", "Virtual chime 1", { maxlength: "40", placeholder: "Virtual chime 1" });
-  var vBtn = selectEl([1, 2, 4, 8].map(function (b) { return { value: b, label: "Button " + b }; }), 8);
-  var vBase = inputEl("number", "350", { min: "100", max: "1500", step: "10", inputmode: "numeric" });
-  var vId = inputEl("number", "", { min: "0", max: "1048575", step: "1", inputmode: "numeric", placeholder: "random" });
-  add(grid,
-    field("Name", vName, null, "full"),
-    field("Button code", vBtn, "The 4-bit button nibble sent with the address."),
-    field("Base pulse (us)", vBase, "350 us suits most EV1527 receivers."),
-    field("20-bit address", vId, "Leave empty for a random address -- that is what you want.", "full"));
-  add(vp, grid);
-  var vFoot = el("div", "formfoot");
-  var vSave = el("button", "btn primary", "Create virtual signal");
-  vSave.type = "button";
-  var vMsg = el("div", "formmsg");
-  add(vFoot, vSave, vMsg);
-  add(vp, vFoot);
-  add(vp, el("div", "note",
-    "After creating it: put your receiver into pairing mode, open the new signal and tap " +
-    "Transmit a few times. The receiver stores the code and will answer to it from then on."));
-  vSave.addEventListener("click", function () {
-    var body = {
-      name: trimOf(vName) || "Virtual signal",
-      button: intOf(vBtn, 8),
-      base_us: intOf(vBase, 350)
-    };
-    var idv = parseInt(vId.value, 10);
-    body.id20 = isFinite(idv) ? idv : 0;
-    vSave.disabled = true;
-    setMsg(vMsg, "Creating…");
-    postJSON("/api/signals/virtual", body).then(function (sig) {
-      vSave.disabled = false;
-      setMsg(vMsg, "Created. Transmit it while your receiver is in pairing mode.", "ok");
-      loadSignals().then(function () { if (sig && sig.id) openSignalSheet(sig.id); });
-    }).catch(function (e) {
-      vSave.disabled = false;
-      setMsg(vMsg, e.message, "err");
-    });
-  });
-  add(root, vp);
-
-  renderSignals();
+function storedGraphView() {
+  try {
+    var v = localStorage.getItem(GRAPH_VIEW_KEY);
+    return (v === "list" || v === "map") ? v : null;
+  } catch (e) { return null; }
 }
 
-function renderSignals(err) {
-  if (!sigEls.list) return;
-  var ul = clear(sigEls.list);
-  clear(sigEls.txNote);
-  var warn = txBlockNote();
-  if (warn) add(sigEls.txNote, warn);
-
-  if (err) {
-    sigEls.err.classList.remove("hidden");
-    sigEls.err.textContent = "Could not read the signal store: " + err.message;
-  } else {
-    sigEls.err.classList.add("hidden");
-  }
-  var list = S.signals || [];
-  sigEls.empty.classList.toggle("hidden", list.length > 0 || !!err);
-
-  list.forEach(function (sig) {
-    var li = el("li");
-    var row = el("div", "row");
-    row.style.gap = ".4rem";
-    var b = el("button", "listitem"); b.type = "button";
-    b.style.flex = "1 1 12rem";
-    add(b, el("span", "li-ico", sig.origin === "synthesized" ? "✨" : "📥"));
-    var main = el("div", "li-main");
-    add(main, el("div", "li-title", sig.name || ("Signal " + sig.id)));
-    var subParts = [];
-    if (sig.decoded && sig.decoded.text) subParts.push(sig.decoded.text);
-    else subParts.push("raw waveform, " + numOr(sig.pulse_count, 0) + " pulses");
-    if (typeof sig.base_us === "number") subParts.push(sig.base_us + " us base");
-    add(main, el("div", "li-sub", subParts.join("  ·  ")));
-    add(b, main);
-    var meta = el("div", "li-meta");
-    if (typeof sig.seen_count === "number") add(meta, el("div", null, sig.seen_count + "x"));
-    if (typeof sig.last_seen_s === "number") add(meta, el("div", null, agoText(sig.last_seen_s)));
-    add(b, meta);
-    b.addEventListener("click", function () { openSignalSheet(sig.id); });
-    add(row, b);
-
-    var tx = el("button", "btn small", "📡");
-    tx.type = "button";
-    tx.setAttribute("aria-label", "Transmit " + (sig.name || sig.id));
-    tx.style.minHeight = "2.75rem";
-    tx.style.minWidth = "3rem";
-    tx.disabled = !txAvailable();
-    if (!txAvailable()) tx.title = S.txBlock;
-    tx.addEventListener("click", function () { transmit(sig.id, tx, null); });
-    add(row, tx);
-    add(li, row);
-    add(ul, li);
-  });
+/* Map on a real screen, list on a phone or tablet — unless the user has said
+   otherwise, in which case that stands (but only where the canvas is reachable). */
+function defaultGraphView() {
+  if (!canvasUsable()) return "list";
+  return storedGraphView() || "map";
 }
 
-/*
- * The pairing panel of a SYNTHESIZED signal.
- *
- * Written after a real report of "the virtual signal is broken". It was not:
- * a synthesized signal is a brand-new address, so no receiver on the band
- * answers to it until one has been TAUGHT it, and the user's chime was paired
- * to a different address entirely. The explanation existed only on the
- * creation form, which is the one screen you are no longer looking at by the
- * time you tap Transmit and nothing happens.
- *
- * The order of the steps is the whole feature: the receiver has to be listening
- * BEFORE the code goes out, and almost everyone tries it the other way round.
- */
-var PAIR_REPEATS = 20;    /* ~20 x 36 ms ≈ 0.7 s: long enough that a receiver
-                             that just entered learning mode cannot miss it,
-                             short enough to stay an inline request like every
-                             other transmit. */
-var PAIR_GAP_US = 8000;
-
-function pairPanel(sig) {
-  var box = el("div", "note");
-  add(box, el("b", null, "Pair with a receiver"));
-
-  var steps = el("ol");
-  steps.style.margin = ".45rem 0 .55rem";
-  steps.style.paddingLeft = "1.25rem";
-
-  var s1 = el("li");
-  add(s1, el("span", null, "Put your receiver into "), el("b", null, "learning mode"),
-      el("span", null, " — usually hold its button until it beeps or its LED blinks."));
-  var s2 = el("li");
-  add(s2, el("span", null, "Tap "), el("b", null, "Pair now"),
-      el("span", null, " below within a few seconds."));
-  var s3 = el("li", null, "The receiver stores this code and rings for it from then on.");
-  add(steps, s1, s2, s3);
-  add(box, steps);
-
-  add(box, el("div", "small muted",
-    "This code is new — nothing responds to it until a receiver has learned it. " +
-    "That is expected."));
-
-  var msg = el("div", "formmsg");
-  var row = el("div", "formfoot");
-  var b = el("button", "btn primary", "🔗 Pair now");
-  b.type = "button";
-  b.disabled = !txAvailable();
-  if (!txAvailable()) b.title = S.txBlock;
-  b.addEventListener("click", function () {
-    transmit(sig.id, b, msg, {
-      body: { repeats: PAIR_REPEATS, gap_us: PAIR_GAP_US },
-      sending: "Pairing…",
-      sent: "Sent ✓",
-      ok: "Code sent " + PAIR_REPEATS + " times. If the receiver was in learning mode it " +
-          "has stored it — test it with Transmit below. If not, put it back into learning " +
-          "mode and tap Pair now again."
-    });
-  });
-  add(row, b, msg);
-  add(box, row);
-  return box;
+/* Rotating a tablet or narrowing a window can take the canvas away underneath a
+   user who is looking at it; drop them back to the list rather than leaving a
+   hidden pane and no visible switch. */
+function watchGraphViewport() {
+  if (!window.matchMedia) return;
+  var mq = window.matchMedia(GRAPH_MAP_MQ);
+  var onChange = function () {
+    if (!autoEls.bList) return;
+    if (!mq.matches && S.graphView === "map")
+      setGraphView("list", autoEls.bList, autoEls.bMap, false);
+    else if (mq.matches && S.graphView === "list" && !storedGraphView())
+      setGraphView("map", autoEls.bList, autoEls.bMap, false);
+  };
+  if (mq.addEventListener) mq.addEventListener("change", onChange);
+  else if (mq.addListener) mq.addListener(onChange);
 }
 
-function openSignalSheet(id) {
-  var sh = openSheet("Signal", null);
-  add(sh.body, el("div", "empty", "Loading…"));
-  api("/api/signals/" + id).then(function (sig) {
-    clear(sh.body);
-    $("h3", sh.sheet).textContent = sig.name || ("Signal " + sig.id);
-
-    /* identity */
-    var chips = el("div", "chiprow");
-    if (sig.decoded && sig.decoded.text) add(chips, el("span", "chip accent mono", sig.decoded.text));
-    else add(chips, el("span", "chip warn", "Unknown protocol — stored as raw pulses"));
-    if (sig.origin) add(chips, el("span", "chip", sig.origin));
-    add(sh.body, chips);
-
-    if (!sig.decoded) {
-      add(sh.body, el("div", "note",
-        "No decoder claimed this waveform. That is a fully supported state: the exact pulse " +
-        "timings are stored and replay works normally. Only the human-readable identity is missing."));
-    }
-
-    /* Above every other control, because it is the answer to the question a
-       user has already formed by the time they open this sheet. */
-    if (sig.origin === "synthesized") add(sh.body, pairPanel(sig));
-
-    /* confidence meter */
-    if (typeof sig.confidence === "number") {
-      var cwrap = el("div");
-      cwrap.style.margin = ".7rem 0";
-      var crow = el("div", "row");
-      crow.style.justifyContent = "space-between";
-      add(crow, el("span", "small muted", "Decode confidence"));
-      add(crow, el("span", "small mono", sig.confidence + "%"));
-      add(cwrap, crow);
-      var m = el("div", "meter " + (sig.confidence >= 65 ? "ok" : sig.confidence >= 45 ? "warn" : "bad"));
-      var fill = el("i");
-      fill.style.width = Math.max(2, Math.min(100, sig.confidence)) + "%";
-      add(m, fill);
-      add(cwrap, m);
-      add(cwrap, el("div", "hint",
-        "Measured on this bench: real presses score 67-92%, band noise 24-48%."));
-      add(sh.body, cwrap);
-    }
-
-    /* facts */
-    var kv = el("dl", "kv");
-    function kvAdd(k, v) { if (v === null || v === undefined || v === "") return; add(kv, el("dt", null, k)); add(kv, el("dd", "mono", String(v))); }
-    kvAdd("Id", sig.id);
-    kvAdd("Fingerprint", sig.fingerprint);
-    kvAdd("Base pulse", typeof sig.base_us === "number" ? sig.base_us + " us" : null);
-    kvAdd("Pulses", sig.pulse_count);
-    kvAdd("RSSI", typeof sig.rssi_dbm === "number" ? sig.rssi_dbm + " dBm" : null);
-    kvAdd("Seen", typeof sig.seen_count === "number" ? sig.seen_count + " times" : null);
-    kvAdd("Last seen", typeof sig.last_seen_s === "number" ? agoText(sig.last_seen_s) : null);
-    kvAdd("Created", fmtEpoch(sig.created_at) || null);
-    if (sig.decoded) {
-      kvAdd("Protocol", sig.decoded.protocol);
-      kvAdd("Address", typeof sig.decoded.id === "number"
-        ? sig.decoded.id + " (0x" + sig.decoded.id.toString(16).toUpperCase() + ")" : null);
-      kvAdd("Button", sig.decoded.button);
-    }
-    add(sh.body, kv);
-
-    /* waveform */
-    var wf = waveform(sig.durations_us, sig.first_level);
-    if (wf) {
-      var wh = el("div", "field");
-      add(wh, el("span", null, "Pulse train"));
-      add(wh, wf);
-      add(wh, el("span", "hint",
-        "High = carrier on, low = carrier off. This is what gets replayed, verbatim, on transmit."));
-      /* Why a virtual signal does not look like a captured one. Read as a bug
-         otherwise -- and it has been. */
-      if (sig.origin === "synthesized") {
-        add(wh, el("span", "hint",
-          "A synthesized frame carries its ~9 ms sync gap up front, so it has one pulse more " +
-          "than the same code captured off the air (50 vs 49). A capture can never contain that " +
-          "gap: it is longer than the 8 ms idle threshold, so it is exactly what ENDS the " +
-          "recording. The two are the same code."));
-      }
-      add(sh.body, wh);
-    }
-
-    /* rename */
-    var nameIn = inputEl("text", sig.name || "", { maxlength: "40" });
-    add(sh.body, field("Name", nameIn));
-
-    var msg = el("div", "formmsg");
-    var foot = el("div", "formfoot");
-    var txb = el("button", "btn primary", "📡 Transmit");
-    txb.type = "button";
-    txb.disabled = !txAvailable();
-    if (!txAvailable()) txb.title = S.txBlock;
-    txb.addEventListener("click", function () { transmit(sig.id, txb, msg); });
-    var save = el("button", "btn", "Save name");
-    save.type = "button";
-    save.addEventListener("click", function () {
-      var n = trimOf(nameIn);
-      if (!n) { setMsg(msg, "A name cannot be empty.", "err"); return; }
-      save.disabled = true;
-      setMsg(msg, "Saving…");
-      postJSON("/api/signals/" + sig.id, { name: n }).then(function () {
-        save.disabled = false;
-        setMsg(msg, "Renamed.", "ok");
-        $("h3", sh.sheet).textContent = n;
-        loadSignals();
-        if (S.graph) loadGraph();
-      }).catch(function (e) { save.disabled = false; setMsg(msg, e.message, "err"); });
-    });
-    var delb = el("button", "btn danger", "Delete");
-    delb.type = "button";
-    delb.addEventListener("click", function () {
-      confirmSheet("Delete “" + (sig.name || sig.id) + "”?",
-        ["The stored waveform is removed permanently.",
-         "Any automation node pointing at it stops working until you point it somewhere else."],
-        "Delete", true).then(function (ok) {
-        if (!ok) return;
-        setMsg(msg, "Deleting…");
-        api("/api/signals/" + sig.id, { method: "DELETE" }).then(function () {
-          sh.close();
-          loadSignals();
-          if (S.graph) loadGraph();
-        }).catch(function (e) { setMsg(msg, e.message, "err"); });
-      });
-    });
-    add(foot, txb, save, delb, msg);
-    add(sh.body, foot);
-  }).catch(function (e) {
-    clear(sh.body);
-    add(sh.body, el("div", "note bad", "Could not load this signal: " + e.message));
-  });
-}
-
-/* ======================================================================
-   LEARN
-   ====================================================================== */
-
-var learnEls = {};
-
-function buildLearn() {
-  if (S.built.learn) return;
-  S.built.learn = true;
-  var root = clear($("#tab-learn"));
-
-  var p = el("div", "panel");
-  var h = el("div", "panel-head");
-  add(h, el("h2", null, "Learn a button"));
-  add(h, el("p", null,
-    "Arm learn mode, then press the button on your remote a few times."));
-  add(p, h);
-
-  learnEls.count = el("div", "countdown idle", "—");
-  add(p, learnEls.count);
-  learnEls.state = el("div", "listening");
-  add(p, learnEls.state);
-
-  var ctl = el("div", "btnrow");
-  ctl.style.marginTop = ".8rem";
-  learnEls.timeout = selectEl([
-    { value: 30, label: "30 seconds" },
-    { value: 60, label: "1 minute" },
-    { value: 120, label: "2 minutes" },
-    { value: 300, label: "5 minutes" }
-  ], 60);
-  learnEls.arm = el("button", "btn primary", "Arm learn mode");
-  learnEls.arm.type = "button";
-  learnEls.arm.addEventListener("click", function () { armLearn(intOf(learnEls.timeout, 60)); });
-  learnEls.cancel = el("button", "btn", "Cancel");
-  learnEls.cancel.type = "button";
-  learnEls.cancel.addEventListener("click", function () {
-    learnEls.cancel.disabled = true;
-    postJSON("/api/learn/cancel", {}).then(loadLearn)
-      .catch(function (e) { setMsg(learnEls.msg, e.message, "err"); })
-      .then(function () { learnEls.cancel.disabled = false; });
-  });
-  add(ctl, learnEls.arm, learnEls.cancel);
-  add(p, field("Stay armed for", learnEls.timeout,
-    "Learn mode always expires on its own, so the box never sits armed forever."));
-  add(p, ctl);
-  learnEls.msg = el("div", "formmsg");
-  add(p, learnEls.msg);
-  add(root, p);
-
-  /* candidate */
-  learnEls.candPanel = el("div", "panel hidden");
-  add(root, learnEls.candPanel);
-
-  /* explanation -- this is the single most misunderstood part of the box */
-  var ep = el("div", "panel");
-  var eh = el("div", "panel-head");
-  add(eh, el("h2", null, "What learn mode actually does"));
-  add(ep, eh);
-  add(ep, el("p", "small",
-    "The receiver is ALWAYS listening. It has to be: a button you already registered must " +
-    "ring the moment it is pressed, so there is no on-demand receive mode to switch on."));
-  add(ep, el("p", "small",
-    "Learn mode changes exactly one thing — the fate of a signal the box does NOT recognise. " +
-    "Normally such a signal is dropped with one line in the activity log. While armed, it is " +
-    "offered to you here for registration instead. Signals you already know behave identically " +
-    "either way."));
-  add(ep, el("div", "note",
-    "A candidate must repeat at least twice and decode with at least 65% confidence before it " +
-    "is offered. Both thresholds come from bench measurements: a real remote always sends " +
-    "several copies (67-92% confidence), while band noise scores 24-48% and rarely repeats. " +
-    "Without those filters the box would happily register the amplifier's own noise as a doorbell."));
-  add(root, ep);
-
-  renderLearn();
-}
-
-function armLearn(timeout) {
-  buildLearn();
-  if (learnEls.arm) learnEls.arm.disabled = true;
-  setMsg(learnEls.msg, "Arming…");
-  postJSON("/api/learn/arm", { timeout_s: timeout }).then(function () {
-    setMsg(learnEls.msg, "Armed. Press your remote button now — several times.", "ok");
-    poll("learn", 1000, loadLearn);
-  }).catch(function (e) {
-    setMsg(learnEls.msg, e.message, "err");
-  }).then(function () {
-    if (learnEls.arm) learnEls.arm.disabled = false;
-  });
-}
-
-function renderLearn(err) {
-  if (!learnEls.count) return;
-  var L = S.learn;
-
-  if (err) {
-    learnEls.count.textContent = "—";
-    learnEls.count.className = "countdown idle";
-    clear(learnEls.state);
-    add(learnEls.state, el("span", null, "Learn mode is not available: " + err.message));
-    learnEls.arm.disabled = true;
-    learnEls.cancel.disabled = true;
-    learnEls.candPanel.classList.add("hidden");
-    return;
-  }
-  learnEls.arm.disabled = false;
-
-  var active = !!(L && L.active);
-  learnEls.arm.classList.toggle("hidden", active);
-  learnEls.cancel.classList.toggle("hidden", !active);
-
-  if (active) {
-    var rem = numOr(L.remaining_s, 0);
-    learnEls.count.textContent = Math.floor(rem / 60) + ":" + ("0" + (rem % 60)).slice(-2);
-    learnEls.count.className = "countdown";
-    clear(learnEls.state);
-    add(learnEls.state, el("span", "pulse"), el("span", null,
-      L.candidate ? "Candidate captured — review it below." : "Armed — press your remote button"));
-  } else {
-    learnEls.count.textContent = "—";
-    learnEls.count.className = "countdown idle";
-    clear(learnEls.state);
-    add(learnEls.state, el("span", null,
-      "Not armed. The receiver is still listening — known buttons work as usual."));
-    /* Deliberately NOT re-scheduling the poll from here: poll() fires its
-       function immediately, so calling it from inside a render that was itself
-       triggered by that poll would recurse. The 1 s timer set on tab entry is
-       the only scheduler. */
-  }
-
-  renderCandidate(L && L.candidate);
-}
-
-function renderCandidate(c) {
-  var p = learnEls.candPanel;
-  if (!p) return;
-  if (!c) { p.classList.add("hidden"); clear(p); return; }
-  /* Do not rebuild while the user is typing the name. */
-  if (p.dataset.fp === (c.fingerprint || "") && $(".cand-name", p) === document.activeElement) return;
-  p.dataset.fp = c.fingerprint || "";
-  p.classList.remove("hidden");
-  clear(p);
-
-  var h = el("div", "panel-head");
-  add(h, el("h2", null, "New button detected"));
-  add(h, el("p", null, "Give it a name and accept it, or ignore it and press a different button."));
-  add(p, h);
-
-  var chips = el("div", "chiprow");
-  if (c.decoded && c.decoded.text) add(chips, el("span", "chip accent mono", c.decoded.text));
-  else add(chips, el("span", "chip warn", "Unknown protocol — will be stored as raw pulses"));
-  if (typeof c.repeats === "number") add(chips, el("span", "chip ok", c.repeats + " repeats"));
-  if (typeof c.rssi_dbm === "number") {
-    add(chips, el("span", "chip " + (c.rssi_dbm > -60 ? "ok" : "warn"), c.rssi_dbm + " dBm"));
-  }
-  add(p, chips);
-
-  if (typeof c.confidence === "number") {
-    var m = el("div", "meter " + (c.confidence >= 65 ? "ok" : "warn"));
-    var f = el("i");
-    f.style.width = Math.max(2, Math.min(100, c.confidence)) + "%";
-    add(m, f);
-    var wrap = el("div");
-    wrap.style.margin = ".6rem 0";
-    var r = el("div", "row");
-    r.style.justifyContent = "space-between";
-    add(r, el("span", "small muted", "Confidence"), el("span", "small mono", c.confidence + "%"));
-    add(wrap, r, m);
-    add(p, wrap);
-  }
-
-  var kv = el("dl", "kv");
-  if (typeof c.base_us === "number") { add(kv, el("dt", null, "Base pulse")); add(kv, el("dd", "mono", c.base_us + " us")); }
-  if (typeof c.pulse_count === "number") { add(kv, el("dt", null, "Pulses")); add(kv, el("dd", "mono", String(c.pulse_count))); }
-  if (c.fingerprint) { add(kv, el("dt", null, "Fingerprint")); add(kv, el("dd", "mono", c.fingerprint)); }
-  add(p, kv);
-
-  var nameIn = inputEl("text", (c.decoded && c.decoded.text) ? "" : "", { maxlength: "40", placeholder: "e.g. Front door" });
-  nameIn.className = "cand-name";
-  add(p, field("Name this button", nameIn, "Shown in the activity feed and in Automations."));
-
-  var msg = el("div", "formmsg");
-  var foot = el("div", "formfoot");
-  var acc = el("button", "btn primary", "Accept and save");
-  acc.type = "button";
-  acc.addEventListener("click", function () {
-    var n = trimOf(nameIn);
-    if (!n) { setMsg(msg, "Give the button a name first.", "err"); nameIn.focus(); return; }
-    acc.disabled = true;
-    setMsg(msg, "Saving…");
-    postJSON("/api/learn/accept", { name: n }).then(function () {
-      setMsg(msg, "Saved. Learn mode is now off.", "ok");
-      p.classList.add("hidden");
-      loadSignals();
-      loadLearn();
-      if (S.graph) loadGraph();
-    }).catch(function (e) {
-      acc.disabled = false;
-      setMsg(msg, e.message, "err");
-    });
-  });
-  add(foot, acc, msg);
-  add(p, foot);
-  if (!nameIn.value) setTimeout(function () { nameIn.focus(); }, 40);
-}
-
-/* ======================================================================
-   AUTOMATIONS -- the node graph
-   ====================================================================== */
-
-var NODE_TYPES = [
-  { t: "source.button", g: "source", label: "433 MHz button", ico: "🔘",
-    help: "Fires when a learned remote button is pressed." },
-  { t: "source.gpio", g: "source", label: "Wired button", ico: "🔌",
-    help: "Fires when a button wired to a GPIO pin is pressed. Optional." },
-  { t: "source.virtual", g: "source", label: "Virtual trigger", ico: "✨",
-    help: "Fires from this page, from the REST API, or from an MQTT topic." },
-  { t: "source.any_rf", g: "source", label: "Any RF signal", ico: "📻",
-    help: "Wildcard: fires on EVERY burst the receiver hears, registered or not." },
-  { t: "logic.group", g: "logic", label: "Group", ico: "🔗",
-    help: "Passes on when ANY or ALL of its inputs fire inside a time window." },
-  { t: "logic.throttle", g: "logic", label: "Rate limit", ico: "⏱",
-    help: "Passes the first press, then ignores everything for a cooldown you set. " +
-          "Someone can lean on the button — the bell still rings once." },
-  { t: "sink.transmit", g: "sink", label: "Transmit", ico: "📡",
-    help: "Transmits a stored signal on 433 MHz." },
-  { t: "sink.mqtt", g: "sink", label: "MQTT publish", ico: "📨",
-    help: "Publishes to your broker / fires a Home Assistant device trigger." }
-];
-function nodeType(t) {
-  for (var i = 0; i < NODE_TYPES.length; i++) if (NODE_TYPES[i].t === t) return NODE_TYPES[i];
-  return { t: t, g: "logic", label: t || "unknown", ico: "⚙", help: "" };
-}
-function nodeById(id) {
-  var ns = (S.graph && S.graph.nodes) || [];
-  for (var i = 0; i < ns.length; i++) if (ns[i].id === id) return ns[i];
-  return null;
-}
-function nodeName(id) {
-  var n = nodeById(id);
-  return n ? (n.name || nodeType(n.type).label) : ("node " + id);
-}
-function signalName(id) {
-  var list = S.signals || [];
-  for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i].name || ("Signal " + id);
-  return null;
-}
-/* Ports: a source has no input, a sink has no output. */
-function hasInput(n) { return nodeType(n.type).g !== "source"; }
-function hasOutput(n) { return nodeType(n.type).g !== "sink"; }
-function linkExists(from, to) {
-  var ls = (S.graph && S.graph.links) || [];
-  for (var i = 0; i < ls.length; i++) if (ls[i].from === from && ls[i].to === to) return true;
-  return false;
-}
-
-var autoEls = {};
-
-function buildAutomations() {
-  if (S.built.automations) return;
-  S.built.automations = true;
-  var root = clear($("#tab-automations"));
-
-  var p = el("div", "panel");
-  var h = el("div", "panel-head");
-  add(h, el("h2", null, "Automations"));
-  add(h, el("p", null,
-    "A press travels left to right: a SOURCE hears it, optional LOGIC decides whether it " +
-    "passes, and a SINK does something — transmit a signal, publish to MQTT. " +
-    "Nodes are linked by tapping, never by dragging."));
-  add(h, el("p", null,
-    "Two sources are worth knowing about: “Any RF signal” is a wildcard that fires on every " +
-    "burst on the band, and a “Group” lets several buttons drive one action."));
-  add(p, h);
-
-  var topRow = el("div", "row");
-  var addBtn = el("button", "btn primary", "➕ Add node");
-  addBtn.type = "button";
-  addBtn.addEventListener("click", openAddNode);
-  add(topRow, addBtn);
-
-  /* View switch: hidden below 900 px by CSS -- the list is the whole product
-     on a phone, and the canvas is strictly additive. */
-  autoEls.viewSwitch = el("div", "segmented graph-viewswitch");
-  var bList = el("button", null, "List"); bList.type = "button"; bList.classList.add("active");
-  var bMap = el("button", null, "Map"); bMap.type = "button";
-  bList.addEventListener("click", function () { setGraphView("list", bList, bMap); });
-  bMap.addEventListener("click", function () { setGraphView("map", bList, bMap); });
-  add(autoEls.viewSwitch, bList, bMap);
-  add(topRow, autoEls.viewSwitch);
-  add(p, topRow);
-  add(root, p);
-
-  autoEls.listWrap = el("div", "stack");
-  add(root, autoEls.listWrap);
-  autoEls.canvasWrap = el("div", "panel hidden");
-  add(root, autoEls.canvasWrap);
-  autoEls.empty = el("div", "empty",
-    "No nodes yet. Add a “433 MHz button” source and a “Transmit” sink, then link them.");
-  add(root, autoEls.empty);
-
-  /* Recipes: the group pattern is the least obvious capability here, and it is
-     precisely what "make several buttons ring one chime" needs. */
-  var rp = el("div", "panel");
-  var rh = el("div", "panel-head");
-  add(rh, el("h2", null, "Recipes"));
-  add(rh, el("p", null, "Patterns that need no special node type — just links."));
-  add(rp, rh);
-  [
-    ["Repeat a doorbell to a second chime",
-     "433 MHz button (Front door) → Transmit (Virtual chime 1)"],
-    ["Several buttons, one chime",
-     "433 MHz button (Front) + 433 MHz button (Back) → Group (mode: any) → Transmit (Virtual chime 1). " +
-     "This is how you fold several remotes into a single virtual signal — no special node needed, " +
-     "just two sources into one group."],
-    ["Two buttons pressed together",
-     "Same as above but set the Group to mode ALL and give it a window (e.g. 3000 ms)."],
-    ["Stop a stuck button ringing forever",
-     "433 MHz button → Rate limit (10 s cooldown) → Transmit."],
-    ["Ring the chime from Home Assistant",
-     "Virtual trigger (topic: front_gate) → Transmit. Publish anything to the trigger topic and it fires."],
-    ["Tell Home Assistant someone rang",
-     "433 MHz button → MQTT publish (topic: front)."],
-    ["Proxy the whole band to Home Assistant",
-     "Any RF signal → MQTT publish. Every press within range reaches HA, including buttons you " +
-     "never registered. Add a Rate limit in the middle if the band is busy."]
-  ].forEach(function (r) {
-    var b = el("div");
-    b.style.marginBottom = ".6rem";
-    add(b, el("div", null, r[0]));
-    add(b, el("div", "hint mono", r[1]));
-    add(rp, b);
-  });
-  add(root, rp);
-
-  renderGraph();
-}
-
-function setGraphView(v, bList, bMap) {
+function setGraphView(v, bList, bMap, persist) {
   S.graphView = v;
   bList.classList.toggle("active", v === "list");
   bMap.classList.toggle("active", v === "map");
   autoEls.listWrap.classList.toggle("hidden", v !== "list");
   autoEls.canvasWrap.classList.toggle("hidden", v !== "map");
+  if (persist) {
+    try { localStorage.setItem(GRAPH_VIEW_KEY, v); } catch (e) { /* private mode */ }
+  }
   if (v === "map") renderCanvas();
 }
 
@@ -1526,11 +1825,16 @@ function renderGraph(err) {
   var links = (S.graph && S.graph.links) || [];
   autoEls.empty.classList.toggle("hidden", nodes.length > 0);
 
-  /* Order sources, then logic, then sinks: that is the direction of flow, and
-     on a phone the reading order IS the diagram. */
-  var order = { source: 0, logic: 1, sink: 2 };
+  /* Order sources, then signals, then logic, then sinks: that is the direction
+     of flow, and on a phone the reading order IS the diagram. Signals sit where
+     their commonest role is, the same compromise nextPosition() makes on the
+     canvas — a node with both ports cannot be in exactly one place in a
+     left-to-right list. `|| 0` and not `numOr`: an unknown group must sort
+     somewhere definite, because an undefined here makes the comparator return
+     NaN and the whole list order arbitrary. */
+  var order = { source: 0, signal: 1, logic: 2, sink: 3 };
   nodes.slice().sort(function (a, b) {
-    var d = order[nodeType(a.type).g] - order[nodeType(b.type).g];
+    var d = (order[nodeType(a.type).g] || 0) - (order[nodeType(b.type).g] || 0);
     return d !== 0 ? d : (a.id - b.id);
   }).forEach(function (n) {
     add(wrap, nodeCard(n, links));
@@ -1547,10 +1851,14 @@ function noteRow(text) {
 
 function nodeSummary(n) {
   switch (n.type) {
-    case "source.button": {
+    /* Both directions in one line, because both are always true of this node:
+       what it listens for is what it sends. */
+    case "signal": {
       var sn = signalName(n.signal_id);
-      return sn ? ("Listens for: " + sn)
-                : (n.signal_id ? "Signal " + n.signal_id + " (missing from the store)" : "No signal chosen yet");
+      if (!sn) return n.signal_id ? "Signal " + n.signal_id + " (missing from the store)"
+                                  : "No signal chosen yet";
+      return sn + " · out when heard, in to send it (" +
+             numOr(n.repeats, 6) + "x, " + numOr(n.gap_us, 8000) + " us gap)";
     }
     case "source.gpio":
       return (n.gpio_pin >= 0 ? "GPIO " + n.gpio_pin : "No pin chosen") +
@@ -1566,10 +1874,13 @@ function nodeSummary(n) {
       return "Mode " + (n.group_mode === "all" ? "ALL" : "ANY") + " · window " + numOr(n.window_s, 1) + " s";
     case "logic.throttle":
       return "Rings once, then ignores presses for " + numOr(n.window_s, 10) + " s";
-    case "sink.transmit": {
-      var tn = signalName(n.signal_id);
-      return (tn ? "Transmits: " + tn : (n.signal_id ? "Signal " + n.signal_id + " (missing)" : "No signal chosen yet")) +
-        " · " + numOr(n.repeats, 6) + "x, " + numOr(n.gap_us, 8000) + " us gap";
+    case "logic.repeat": {
+      /* "1x" would read as a setting the user got wrong; it is a legal
+         pass-through, so say what it actually does. */
+      var times = numOr(n.repeats, 3);
+      return times <= 1
+        ? "Passes through once (no repeat)"
+        : "Rings " + times + "x total, " + numOr(n.window_s, 5) + " s apart";
     }
     case "sink.mqtt":
       return n.topic ? ("Publishes to " + mqttPublishTopic(n.topic)) : "No topic set";
@@ -1617,13 +1928,20 @@ function nodeCard(n, links) {
   var edit = el("button", "btn", "Edit");
   edit.type = "button";
   edit.addEventListener("click", function () { openNodeEditor(n); });
-  var fire = el("button", "btn", n.type === "source.virtual" ? "▶ Trigger" : "Test fire");
+  /* Firing a node runs its OUTPUT, so on a Signal node this is "pretend the
+     code was just heard" — it does not transmit. Sending one on demand is the
+     📡 Transmit button inside the node's signal section, or a link into its
+     input. The label has to say which, or the button reads as a transmit that
+     silently is not one. */
+  var fire = el("button", "btn",
+    n.type === "source.virtual" ? "▶ Trigger"
+      : n.type === "signal" ? "▶ Simulate heard" : "Test fire");
   fire.type = "button";
   fire.addEventListener("click", function () {
     fire.disabled = true;
     setMsg(msg, "Firing…");
     postJSON("/api/graph/nodes/" + n.id + "/fire", {}).then(function () {
-      setMsg(msg, "Fired. Watch the Dashboard feed for what it triggered.", "ok");
+      setMsg(msg, "Fired. Watch the Activity feed below the graph for what it triggered.", "ok");
     }).catch(function (e) { setMsg(msg, e.message, "err"); })
       .then(function () { fire.disabled = false; });
   });
@@ -1730,11 +2048,37 @@ function openLinkPicker(n, dir) {
     });
 }
 
+/* Sources on the left, logic in the middle, sinks on the right — the layout
+   mirrors the direction events actually travel.
+
+   Signal nodes get a column of their own, between sources and logic. There is
+   no honest single answer for a node with both ports — the same node is the
+   button at the start of one chain and the chime at the end of another — so it
+   is placed where its commonest role reads correctly (a press arriving) and is
+   simply dragged right when it is being used as the far end. What it must NOT
+   do is share a column with the sources, or the two would overlap on a canvas
+   the user then has to untangle by hand.
+
+   The four columns are 200 apart because a node box is 168 wide: any tighter
+   and the new column would visibly overlap its neighbours. Existing nodes keep
+   whatever ui_x they were saved with; this only decides where the NEXT one is
+   dropped.
+
+   Counting nodes in the column is not enough to pick a free row: delete the
+   second of three and the next node lands on top of the third. So walk down the
+   column and take the first row nothing already occupies. */
 function nextPosition(group) {
   var nodes = (S.graph && S.graph.nodes) || [];
-  var col = { source: 40, logic: 260, sink: 480 }[group] || 260;
-  var count = nodes.filter(function (n) { return nodeType(n.type).g === group; }).length;
-  return { x: col, y: 30 + count * 100 };
+  var col = { source: 40, signal: 240, logic: 440, sink: 640 }[group] || 440;
+  var ROW = 96;
+  for (var row = 0; row < 40; row++) {
+    var y = 30 + row * ROW;
+    var taken = nodes.some(function (n) {
+      return Math.abs(numOr(n.ui_x, 40) - col) < 80 && Math.abs(numOr(n.ui_y, 40) - y) < 60;
+    });
+    if (!taken) return { x: col, y: y };
+  }
+  return { x: col, y: 30 };
 }
 
 function openAddNode() {
@@ -1742,26 +2086,89 @@ function openAddNode() {
     return !(t.t === "source.gpio" && !S.has.gpio);
   }).map(function (t) {
     return {
-      value: t.t, icon: t.ico, label: t.label, sub: t.help,
-      meta: t.g === "source" ? "source" : t.g === "sink" ? "sink" : "logic"
+      value: t.t, icon: t.ico, label: t.label, sub: t.help, meta: t.g
     };
   });
-  pickerSheet("Add a node", "Sources hear things, logic filters, sinks act.", items, function (type) {
-    var ty = nodeType(type);
-    var pos = nextPosition(ty.g);
-    var body = {
-      type: type, name: ty.label, enabled: true,
-      signal_id: 0, gpio_pin: -1, gpio_active_low: true, gpio_debounce_ms: 50,
-      repeats: 6, gap_us: 8000, window_s: 10, group_mode: "any",
-      topic: "", ui_x: pos.x, ui_y: pos.y
-    };
-    postJSON("/api/graph/nodes", body).then(function (created) {
-      return loadGraph().then(function () {
-        var n = created && created.id ? nodeById(created.id) : null;
-        if (n) openNodeEditor(n);
-      });
-    }).catch(function (e) { alertSheet("Could not add the node", e.message); });
+  pickerSheet("Add a node",
+    "A signal goes both ways; sources hear things, logic filters, sinks act.",
+    items, function (type) {
+    /* A node that needs a signal is never created empty: the signal IS the
+       node's identity, so the choice of one is part of adding it. */
+    if (type === "signal") { openSignalNodeFlow(); return; }
+    createNode(type, null);
   });
+}
+
+/* Creating the node, optionally already bound to the signal that was just
+   learned, picked or synthesized. The node is named after that signal, because
+   "Front door" is what the user just typed and "Signal" is not. */
+function createNode(type, sig) {
+  var ty = nodeType(type);
+  var pos = nextPosition(ty.g);
+  /* A repeat node reads both of these differently — 3 emissions 5 s apart, not
+     6 frame copies and a 10 s cooldown — so it gets its own starting point
+     rather than being created wrong and corrected in the editor. */
+  var rep = (type === "logic.repeat");
+  var body = {
+    type: type, name: sig ? signalLabel(sig) : ty.label, enabled: true,
+    signal_id: sig ? sig.id : 0, gpio_pin: -1, gpio_active_low: true, gpio_debounce_ms: 50,
+    repeats: rep ? 3 : 6, gap_us: 8000, window_s: rep ? 5 : 10, group_mode: "any",
+    topic: "", ui_x: pos.x, ui_y: pos.y
+  };
+  return postJSON("/api/graph/nodes", body).then(function (created) {
+    return loadGraph().then(function () {
+      var n = created && created.id ? nodeById(created.id) : null;
+      if (n) openNodeEditor(n);
+    });
+  }).catch(function (e) { alertSheet("Could not add the node", e.message); });
+}
+
+/* The fork that replaces the old Learn tab and the old Signals tab in one
+   question: where does this node's signal come from? Every branch ends with a
+   node that already works, in one flow and one confirmation. */
+function openSignalNodeFlow() {
+  function learn() {
+    openLearnFlow({
+      title: "Learn a signal",
+      sub: "Arm the receiver, then press the remote button. The code is captured, " +
+           "named and stored — this node then fires when it is heard, and sends it when asked."
+    }).then(function (sig) { if (sig) createNode("signal", sig); });
+  }
+  function virtual() {
+    openVirtualFlow({ mode: "signal" })
+      .then(function (sig) { if (sig) createNode("signal", sig); });
+  }
+  function existing() {
+    openSignalPicker({
+      title: "Signal for this node",
+      onPick: function (sig) { createNode("signal", sig); },
+      onLearn: learn,
+      onVirtual: virtual
+    });
+  }
+
+  /* Learn · Select · Configure, in that order: the common case first, the
+     store second, and hand-entry last for the case where the code is known but
+     the remote is not in reach. */
+  var items = [
+    { value: "learn", icon: "🎓", label: "Learn a new button",
+      sub: "Arm the receiver and press your remote. The node picks up exactly that code.",
+      meta: "capture" },
+    { value: "existing", icon: "📚", label: "Use a signal you already have",
+      sub: "Everything this box has stored, whether a node uses it or not.",
+      meta: "stored" },
+    { value: "virtual", icon: "✨", label: "Configure by hand",
+      sub: "Type an EV1527 code you know, or roll a random one to pair your own chime to.",
+      meta: "by hand" }
+  ];
+  pickerSheet("Which signal is this node?",
+    "A Signal node IS its signal: its output fires when that code is heard, and its input " +
+    "transmits it. Pick where the code comes from.",
+    items, function (choice) {
+      if (choice === "learn") learn();
+      else if (choice === "virtual") virtual();
+      else existing();
+    });
 }
 
 function openNodeEditor(n) {
@@ -1776,28 +2183,34 @@ function openNodeEditor(n) {
     "A disabled node stays in the graph but never fires.");
   add(sh.body, enabled);
 
+  var ctl = {};   /* type-specific controls */
+
+  /* The signal lives HERE, in full, and ABOVE the node's own parameters: this
+     is where the deleted Signals screen went, and "which signal" is the first
+     question anyone has about a signal node. Decoded identity, waveform,
+     pairing, transmit-to-test, rename, and the ways to point the node
+     somewhere else. */
+  if (n.type === "signal") {
+    var sigSec = el("div", "sigsec");
+    add(sh.body, el("div", "lg-label", "Signal"));
+    add(sh.body, el("div", "hint",
+      "Its output fires when this code is heard on air. Anything linked into its input " +
+      "transmits it."));
+    add(sh.body, sigSec);
+    renderNodeSignal(sigSec, n);
+  }
+
   var grid = el("div", "formgrid");
   add(sh.body, grid);
 
-  var ctl = {};   /* type-specific controls */
-
-  if (n.type === "source.button" || n.type === "sink.transmit") {
-    var sigs = (S.signals || []).map(function (s) {
-      return { value: s.id, label: (s.name || ("Signal " + s.id)) +
-        (s.decoded && s.decoded.text ? "  —  " + s.decoded.text : "") };
-    });
-    sigs.unshift({ value: 0, label: "— choose a signal —" });
-    ctl.signal = selectEl(sigs, numOr(n.signal_id, 0));
-    add(grid, field(n.type === "source.button" ? "Listen for this signal" : "Signal to transmit",
-      ctl.signal,
-      (S.signals && S.signals.length) ? null : "No signals stored yet — learn a button first.",
-      "full"));
-  }
-
-  if (n.type === "sink.transmit") {
+  /* Transmit policy: only the input side uses these, but they belong to the
+     node either way — a signal node with no inbound link today may get one
+     tomorrow, and hiding them would make it look like it could not send. */
+  if (n.type === "signal") {
     ctl.repeats = inputEl("number", numOr(n.repeats, 6), { min: "1", max: "32", step: "1", inputmode: "numeric" });
     ctl.gap = inputEl("number", numOr(n.gap_us, 8000), { min: "500", max: "60000", step: "500", inputmode: "numeric" });
-    add(grid, field("Repeats", ctl.repeats, "Many cheap receivers need several identical copies before they act."));
+    add(grid, field("Repeats when sending", ctl.repeats,
+      "Many cheap receivers need several identical copies before they act."));
     add(grid, field("Gap between copies (us)", ctl.gap));
     if (!txAvailable()) add(sh.body, el("div", "note bad", S.txBlock));
   }
@@ -1880,8 +2293,11 @@ function openNodeEditor(n) {
       { value: "all", label: "ALL — pass on only when every input fired in the window" }
     ], n.group_mode === "all" ? "all" : "any");
     ctl.windowS = inputEl("number", numOr(n.window_s, 1), { min: "1", max: "6000", step: "1", inputmode: "numeric" });
+    ctl.windowDflt = 1;
     add(grid, field("Mode", ctl.mode, null, "full"));
-    add(grid, field("Window (ms)", ctl.window, "How long inputs are remembered when matching ALL."));
+    /* The API's field is window_s, in SECONDS -- this said "ms" and passed the
+       wrong variable, so the input never reached the DOM at all. */
+    add(grid, field("Window (seconds)", ctl.windowS, "How long inputs are remembered when matching ALL."));
     add(sh.body, el("div", "note",
       "This is how several remote buttons become one action: link every button node into this " +
       "group with mode ANY, then link the group to a Transmit sink."));
@@ -1895,6 +2311,21 @@ function openNodeEditor(n) {
       "how often the button is pressed."));
     add(grid, noteRow("Works the same for every input — a 433 MHz remote, a wired button " +
       "or an MQTT trigger. It limits whatever is linked into it."));
+  }
+
+  if (n.type === "logic.repeat") {
+    ctl.times = inputEl("number", numOr(n.repeats, 3), { min: "1", max: "20", step: "1", inputmode: "numeric" });
+    ctl.windowS = inputEl("number", numOr(n.window_s, 5), { min: "1", max: "6000", step: "1", inputmode: "numeric" });
+    ctl.windowDflt = 5;
+    add(grid, field("Times", ctl.times,
+      "How many times in total, counting the first one. 3 rings the chime three times."));
+    add(grid, field("Interval (seconds)", ctl.windowS,
+      "The gap between rings. 3 times at 5 seconds rings at 0 s, 5 s and 10 s."));
+    add(grid, noteRow("The first ring is immediate — nobody waits at the door for a chime. " +
+      "Set Times to 1 and the node simply passes the press through unchanged."));
+    add(sh.body, el("div", "note",
+      "Pressing again while it is still running starts the count over rather than adding a " +
+      "second run, so leaning on the button cannot queue up a dozen chimes."));
   }
 
   if (n.type === "sink.mqtt") {
@@ -1917,17 +2348,38 @@ function openNodeEditor(n) {
 
   var msg = el("div", "formmsg");
   var foot = el("div", "formfoot");
+  /* Delete belongs here too, not only on the list card: opening a node from the
+     map was a one-way trip with Save as the only exit. */
+  var delBtn = el("button", "btn danger", "Delete node");
+  delBtn.type = "button";
+  delBtn.addEventListener("click", function () {
+    confirmSheet("Delete \u201c" + (n.name || nodeType(n.type).label) + "\u201d?",
+      ["The node and every link to or from it are removed.",
+       "Stored signals are NOT touched — nothing has to be learned again."],
+      "Delete node", true).then(function (ok) {
+      if (!ok) return;
+      api("/api/graph/nodes/" + n.id, { method: "DELETE" })
+        .then(function () { sh.close(); loadGraph(); })
+        .catch(function (e) { setMsg(msg, e.message, "err"); });
+    });
+  });
+
   var save = el("button", "btn primary", "Save");
   save.type = "button";
   save.addEventListener("click", function () {
+    /* signal_id is deliberately absent: binding a signal is an action of its
+       own, applied the moment it is chosen, not a form field to remember. */
     patch = { name: trimOf(nameIn) || nodeType(n.type).label, enabled: enabled.input.checked };
-    if (ctl.signal) patch.signal_id = intOf(ctl.signal, 0);
     if (ctl.repeats) patch.repeats = intOf(ctl.repeats, 6);
+    /* Same wire field as a transmit sink's copy count, different meaning and a
+       different default — hence a control of its own rather than reusing
+       ctl.repeats and its default of 6. */
+    if (ctl.times) patch.repeats = intOf(ctl.times, 3);
     if (ctl.gap) patch.gap_us = intOf(ctl.gap, 8000);
     if (ctl.pin) patch.gpio_pin = intOf(ctl.pin, -1);
     if (ctl.activeLow) patch.gpio_active_low = ctl.activeLow.input.checked;
     if (ctl.debounce) patch.gpio_debounce_ms = intOf(ctl.debounce, 50);
-    if (ctl.windowS) patch.window_s = intOf(ctl.windowS, 10);
+    if (ctl.windowS) patch.window_s = intOf(ctl.windowS, numOr(ctl.windowDflt, 10));
     if (ctl.mode) patch.group_mode = ctl.mode.value;
     if (ctl.topic) patch.topic = trimOf(ctl.topic);
     save.disabled = true;
@@ -1940,8 +2392,96 @@ function openNodeEditor(n) {
   var cancel = el("button", "btn", "Cancel");
   cancel.type = "button";
   cancel.addEventListener("click", sh.close);
-  add(foot, save, cancel, msg);
+  add(foot, save, cancel, delBtn, msg);
   add(sh.body, foot);
+}
+
+/* The signal section of a node editor, rebuilt in place whenever the binding
+   changes. Async because the waveform only comes with GET /api/signals/{id}. */
+function renderNodeSignal(wrap, n) {
+  clear(wrap);
+  var sid = numOr(n.signal_id, 0);
+
+  if (!sid) {
+    add(wrap, el("div", "note warn",
+      "This node has no signal yet, so it never fires and sends nothing. Learn the button " +
+      "it should stand for, pick one you already have, or invent a code your own receiver " +
+      "can be paired to."));
+    add(wrap, signalChooser(wrap, n));
+    return;
+  }
+
+  add(wrap, el("div", "empty", "Loading signal…"));
+  api("/api/signals/" + sid).then(function (sig) {
+    clear(wrap);
+    add(wrap, signalBlock(sig, { node: n }));
+    add(wrap, signalChooser(wrap, n));
+  }).catch(function (e) {
+    clear(wrap);
+    add(wrap, el("div", "note bad",
+      "This node points at signal " + sid + ", which the box cannot produce: " + e.message +
+      " Pick another one below."));
+    add(wrap, signalChooser(wrap, n));
+  });
+}
+
+/* The three ways out of the current binding. Choosing one applies immediately
+   -- and never deletes the signal that was there before. */
+function signalChooser(wrap, n) {
+  var bound = numOr(n.signal_id, 0) > 0;
+  var box = el("div");
+  var row = el("div", "btnrow");
+  row.style.marginTop = ".6rem";
+  var msg = el("div", "formmsg");
+
+  function bind(sig) {
+    if (!sig) return;
+    setMsg(msg, "Linking…");
+    postJSON("/api/graph/nodes/" + n.id, { signal_id: sig.id }).then(function () {
+      n.signal_id = sig.id;
+      loadGraph();
+      renderNodeSignal(wrap, n);
+    }).catch(function (e) { setMsg(msg, e.message, "err"); });
+  }
+
+  var pick = el("button", "btn", bound ? "🔀 Use a different signal" : "📚 Choose a stored signal");
+  pick.type = "button";
+  pick.addEventListener("click", function () {
+    openSignalPicker({
+      title: "Signal for this node",
+      node: n,
+      onPick: bind,
+      onLearn: function () { relearn(); },
+      onVirtual: function () { makeVirtual(); }
+    });
+  });
+
+  function relearn() {
+    openLearnFlow({
+      title: bound ? "Learn a replacement" : "Learn a button",
+      sub: "Press the button this node should stand for from now on — the code it " +
+           "listens for and the code it sends.",
+      note: bound
+        ? "The signal this node uses today stays in the store under its name — re-learning " +
+          "only changes what this node points at."
+        : null
+    }).then(bind);
+  }
+  var learn = el("button", "btn", bound ? "🎓 Re-learn" : "🎓 Learn a new button");
+  learn.type = "button";
+  learn.addEventListener("click", relearn);
+  add(row, pick, learn);
+
+  /* The third path: a code entered by hand rather than learned or picked.
+     openVirtualFlow does the explaining about what a made-up code means. */
+  function makeVirtual() { openVirtualFlow({ mode: "signal" }).then(bind); }
+  var virt = el("button", "btn", "✨ Configure by hand");
+  virt.type = "button";
+  virt.addEventListener("click", makeVirtual);
+  add(row, virt);
+
+  add(box, row, msg);
+  return box;
 }
 
 /* ---------------------------------------------------------------- canvas --
@@ -1964,34 +2504,195 @@ function renderCanvas() {
     maxX = Math.max(maxX, numOr(n.ui_x, 40) + NW);
     maxY = Math.max(maxY, numOr(n.ui_y, 40) + NH);
   });
-  var VW = Math.max(700, maxX + 40), VH = Math.max(360, maxY + 40);
+  /* Generous slack past the furthest node, so there is ALWAYS empty canvas to
+     drag something into. Sizing the viewBox tightly around the existing nodes
+     left nowhere to drop a new one. */
+  var VW = Math.max(900, maxX + 280), VH = Math.max(420, maxY + 220);
+
+  /* Zoom lives outside renderCanvas so it survives a re-render (every link edit
+     redraws the whole canvas). Kept in the same 0.4..2 range the buttons offer. */
+  var zoom = numOr(S.graphZoom, 1);
+
+  var zbar = el("div", "row canvas-tools");
+  var zOut = el("button", "btn small", "\u2212"); zOut.type = "button";
+  var zLbl = el("span", "hint mono zoom-lbl");
+  var zIn = el("button", "btn small", "+"); zIn.type = "button";
+  var zFit = el("button", "btn small", "Fit"); zFit.type = "button";
+  add(zbar, zOut, zLbl, zIn, zFit);
+  add(wrap, zbar);
 
   var box = el("div", "canvas-wrap");
   var svg = svgEl("svg", "canvas");
+  /* 1:1 and scrolling, NOT scale-to-fit.
+     With `xMidYMid meet` the whole graph was squeezed to fit a fixed-height box:
+     nodes shrank as the graph grew, and — because the viewBox and the element
+     rarely share an aspect ratio — `meet` letterboxed, leaving bands of the
+     canvas where a pointer lands outside the viewBox and a node simply cannot be
+     placed. Rendering at true size inside a scrolling wrapper removes both: the
+     drag distance always equals the pointer distance, and every pixel of the
+     canvas is real canvas. */
   svg.setAttribute("viewBox", "0 0 " + VW + " " + VH);
-  svg.setAttribute("preserveAspectRatio", "xMidYMid meet");
+
+  /* Zoom scales the RENDERED size while the viewBox stays in graph units, so all
+     the geometry below keeps working untouched — and svgPoint(), which derives
+     its ratio from viewBox-vs-rect, stays correct at any zoom without knowing
+     zoom exists. */
+  function applyZoom() {
+    zoom = Math.min(2, Math.max(0.4, zoom));
+    S.graphZoom = zoom;
+    svg.style.width = Math.round(VW * zoom) + "px";
+    svg.style.height = Math.round(VH * zoom) + "px";
+    zLbl.textContent = Math.round(zoom * 100) + "%";
+  }
+  zOut.addEventListener("click", function () { zoom -= 0.2; applyZoom(); });
+  zIn.addEventListener("click", function () { zoom += 0.2; applyZoom(); });
+  zFit.addEventListener("click", function () {
+    var avail = box.clientWidth || VW;
+    zoom = avail / VW;
+    applyZoom();
+  });
+  applyZoom();
   var gLinks = svgEl("g");
   var gNodes = svgEl("g");
+  var gTemp  = svgEl("g");   /* the in-progress link, drawn above everything */
   add(svg, gLinks);
   add(svg, gNodes);
+  add(svg, gTemp);
 
   function pos(n) { return { x: numOr(n.ui_x, 40), y: numOr(n.ui_y, 40) }; }
+
+  /* A node's ports follow directly from its group: a source has nothing feeding
+   * it, a sink emits nothing onward, and everything else — logic and signal
+   * alike — has both. Drawing them makes the direction of flow legible at a
+   * glance, and gives the pointer something concrete to drag from — without
+   * connectors the canvas is only a picture, and every link has to be made over
+   * in the list view.
+   *
+   * A signal node drawing BOTH ports is the whole point of the type: the two
+   * dots are what say "this code can be heard here, and sent from here". */
+  function hasIn(ty)  { return ty.g !== "source"; }
+  function hasOut(ty) { return ty.g !== "sink"; }
+  function outXY(n) { var p = pos(n); return { x: p.x + NW, y: p.y + NH / 2 }; }
+  function inXY(n)  { var p = pos(n); return { x: p.x,      y: p.y + NH / 2 }; }
+
+  function curve(x1, y1, x2, y2) {
+    var dx = Math.max(30, Math.abs(x2 - x1) / 2);
+    return "M" + x1 + "," + y1 + " C" + (x1 + dx) + "," + y1 +
+           " " + (x2 - dx) + "," + y2 + " " + x2 + "," + y2;
+  }
 
   function drawLinks() {
     clear(gLinks);
     links.forEach(function (l) {
       var a = nodeById(l.from), b = nodeById(l.to);
       if (!a || !b) return;
-      var p1 = pos(a), p2 = pos(b);
-      var x1 = p1.x + NW, y1 = p1.y + NH / 2;
-      var x2 = p2.x, y2 = p2.y + NH / 2;
-      var dx = Math.max(30, Math.abs(x2 - x1) / 2);
+      var p1 = outXY(a), p2 = inXY(b);
+      /* A fat transparent path under the visible one: a 1.6 px stroke is far too
+       * thin to hit with a finger or a quick click. */
+      var hit = svgEl("path", "lnk-hit");
+      hit.setAttribute("d", curve(p1.x, p1.y, p2.x, p2.y));
       var path = svgEl("path", "lnk");
-      path.setAttribute("d", "M" + x1 + "," + y1 + " C" + (x1 + dx) + "," + y1 +
-        " " + (x2 - dx) + "," + y2 + " " + x2 + "," + y2);
+      path.setAttribute("d", curve(p1.x, p1.y, p2.x, p2.y));
+      function removeLink(ev) {
+        ev.stopPropagation();
+        confirmSheet("Remove this link?",
+          [nodeName(l.from) + "  \u2192  " + nodeName(l.to),
+           "Both nodes stay; only the connection between them goes away."],
+          "Remove link", true).then(function (ok) {
+          if (!ok) return;
+          delJSON("/api/graph/links", { from: l.from, to: l.to }).then(loadGraph)
+            .catch(function (e) { alertSheet("Could not remove the link", e.message); });
+        });
+      }
+      hit.addEventListener("click", removeLink);
+      path.addEventListener("click", removeLink);
+      hit.setAttribute("tabindex", "0");
+      add(gLinks, hit);
       add(gLinks, path);
     });
   }
+
+  /* ---- drag a link from an output port to a target node ----
+   * The drop target is the whole node rather than its input port: a 6 px circle
+   * is an unfair target on a trackpad and impossible on a touchscreen, and there
+   * is no ambiguity about what dropping on a node means. */
+  var linking = null;
+
+  function cancelLink() {
+    linking = null;
+    clear(gTemp);
+    svg.classList.remove("linking");
+  }
+
+  function nodeAt(pt) {
+    for (var i = nodes.length - 1; i >= 0; i--) {
+      var q = pos(nodes[i]);
+      if (pt.x >= q.x && pt.x <= q.x + NW && pt.y >= q.y && pt.y <= q.y + NH)
+        return nodes[i];
+    }
+    return null;
+  }
+
+  svg.addEventListener("pointermove", function (ev) {
+    if (!linking) return;
+    var pt = svgPoint(svg, ev);
+    clear(gTemp);
+    var from = nodeById(linking.from);
+    if (!from) return;
+    var a = outXY(from);
+    var tmp = svgEl("path", "lnk tmp");
+    tmp.setAttribute("d", curve(a.x, a.y, pt.x, pt.y));
+    add(gTemp, tmp);
+  });
+
+  svg.addEventListener("pointerup", function (ev) {
+    if (!linking) return;
+    var pt = svgPoint(svg, ev);
+    var target = nodeAt(pt);
+    var from = linking.from;
+    cancelLink();
+    if (!target) return;
+    /* Newly reachable: a signal node has both ports, so its own output can be
+       dragged onto its own input. The firmware refuses a self-link outright
+       (a cycle of one), and it would be a pointless one anyway — hearing a code
+       and immediately sending it back is a feedback loop, not a doorbell. Say
+       so rather than letting the drag die silently. */
+    if (target.id === from) {
+      if (hasIn(nodeType(target.type)) && hasOut(nodeType(target.type)))
+        alertSheet("A node cannot feed itself",
+          nodeName(from) + " would hear its own code and send it straight back out. " +
+          "Link it to another node instead.");
+      return;
+    }
+    if (!hasIn(nodeType(target.type))) {
+      alertSheet("That node has no input",
+                 nodeName(target.id) + " is a source, so nothing can feed into it.");
+      return;
+    }
+    var dup = links.some(function (l) { return l.from === from && l.to === target.id; });
+    if (dup) return;
+    postJSON("/api/graph/links", { from: from, to: target.id }).then(loadGraph)
+      .catch(function (e) { alertSheet("Could not create the link", e.message); });
+  });
+  svg.addEventListener("pointerleave", cancelLink);
+
+  /* Drag empty canvas to pan. Only when the press lands on the background — a
+     press on a node still moves that node, and one on a port still starts a
+     link. Matters once you are zoomed in and the graph is bigger than the box. */
+  var pan = null;
+  svg.addEventListener("pointerdown", function (ev) {
+    if (linking || ev.target !== svg) return;
+    pan = { x: ev.clientX, y: ev.clientY, l: box.scrollLeft, t: box.scrollTop };
+    svg.classList.add("panning");
+  });
+  svg.addEventListener("pointermove", function (ev) {
+    if (!pan) return;
+    box.scrollLeft = pan.l - (ev.clientX - pan.x);
+    box.scrollTop  = pan.t - (ev.clientY - pan.y);
+  });
+  function endPan() { pan = null; svg.classList.remove("panning"); }
+  svg.addEventListener("pointerup", endPan);
+  svg.addEventListener("pointercancel", endPan);
 
   nodes.forEach(function (n) {
     var ty = nodeType(n.type);
@@ -2010,11 +2711,33 @@ function renderCanvas() {
     t2.setAttribute("x", "12"); t2.setAttribute("y", "38");
     t2.textContent = ty.ico + " " + ty.label;
     add(g, t2);
+
+    if (hasIn(ty)) {
+      var pin = svgEl("circle", "port in");
+      pin.setAttribute("cx", "0"); pin.setAttribute("cy", NH / 2); pin.setAttribute("r", "5");
+      add(g, pin);
+    }
+    if (hasOut(ty)) {
+      var pout = svgEl("circle", "port out");
+      pout.setAttribute("cx", NW); pout.setAttribute("cy", NH / 2); pout.setAttribute("r", "5");
+      add(g, pout);
+      /* Bigger invisible grab area over the port than the dot it draws. */
+      var grab = svgEl("circle", "port-grab");
+      grab.setAttribute("cx", NW); grab.setAttribute("cy", NH / 2); grab.setAttribute("r", "13");
+      grab.addEventListener("pointerdown", function (ev) {
+        ev.stopPropagation();   /* must not also start dragging the node */
+        ev.preventDefault();
+        linking = { from: n.id };
+        svg.classList.add("linking");
+      });
+      add(g, grab);
+    }
     add(gNodes, g);
 
     /* pointer drag -> persist ui_x/ui_y on release */
     var drag = null;
     g.addEventListener("pointerdown", function (ev) {
+      if (linking) return;
       var pt = svgPoint(svg, ev);
       drag = { sx: pt.x, sy: pt.y, ox: numOr(n.ui_x, 40), oy: numOr(n.ui_y, 40), moved: false };
       try { g.setPointerCapture(ev.pointerId); } catch (e) { /* ignore */ }
@@ -2022,8 +2745,13 @@ function renderCanvas() {
     g.addEventListener("pointermove", function (ev) {
       if (!drag) return;
       var pt = svgPoint(svg, ev);
-      var nx = Math.max(0, Math.round(drag.ox + pt.x - drag.sx));
-      var ny = Math.max(0, Math.round(drag.oy + pt.y - drag.sy));
+      /* Clamp to the canvas. Without an upper bound a node could be dragged off
+         the right or bottom edge and effectively lost — the viewBox only grows
+         to contain it on the NEXT render, so mid-drag it simply vanished. The
+         canvas already keeps slack past the furthest node, so there is room to
+         move outward; it just now has an edge that stops you. */
+      var nx = Math.min(Math.max(0, Math.round(drag.ox + pt.x - drag.sx)), VW - NW);
+      var ny = Math.min(Math.max(0, Math.round(drag.oy + pt.y - drag.sy)), VH - NH);
       if (Math.abs(nx - drag.ox) > 3 || Math.abs(ny - drag.oy) > 3) drag.moved = true;
       n.ui_x = nx; n.ui_y = ny;
       g.setAttribute("transform", "translate(" + nx + "," + ny + ")");
@@ -2045,15 +2773,15 @@ function renderCanvas() {
   add(wrap, box);
 }
 
+/* The canvas renders 1:1 inside a scrolling wrapper, so this is a plain offset
+   from the element's top-left. The ratios stay in the maths only so a future
+   zoom control cannot silently break dragging. */
 function svgPoint(svg, ev) {
   var r = svg.getBoundingClientRect();
   var vb = svg.viewBox.baseVal;
-  var sx = vb.width / r.width, sy = vb.height / r.height;
-  var s = Math.max(sx, sy);   /* matches xMidYMid meet */
-  return {
-    x: (ev.clientX - r.left - (r.width - vb.width / s) / 2) * s,
-    y: (ev.clientY - r.top - (r.height - vb.height / s) / 2) * s
-  };
+  var sx = r.width ? vb.width / r.width : 1;
+  var sy = r.height ? vb.height / r.height : 1;
+  return { x: (ev.clientX - r.left) * sx, y: (ev.clientY - r.top) * sy };
 }
 
 /* ======================================================================
@@ -2082,6 +2810,7 @@ function buildSettings() {
   add(root, sectionAp());
   add(root, sectionMqtt());
   add(root, sectionRadio());
+  add(root, sectionSignals());
   add(root, sectionFirmware());
   add(root, sectionReboot());
 }
@@ -2392,6 +3121,176 @@ function sectionRadio() {
       "Open Diagnostics for the probe result."));
   });
   return s;
+}
+
+/* ----------------------------------------------------------------------
+   Stored signals -- housekeeping, and the ONLY place a signal is destroyed.
+
+   The store outlives the graph on purpose: a learned waveform is a recording
+   of a physical remote, and deleting a node must never cost a walk to the
+   front door with that remote in hand. So nothing on the Dashboard can remove
+   a signal, and this list exists so an entry you genuinely never want again
+   can still go away without reflashing anything.
+
+   The LIST stays a maintenance list -- name, identity, in-use marker, age --
+   and a tap opens the full detail sheet: the very same signalBlock() the node
+   editor embeds, so the waveform, the confidence meter, the pairing panel and
+   Transmit are all here without a second implementation of any of them, plus
+   the delete this screen alone is allowed to offer.
+
+   Transmit being here is the point at which a signal no node uses stops being
+   a dead entry: it can be test-fired straight from the store.
+   ---------------------------------------------------------------------- */
+var settingsSigRender = null;   /* set once Settings is built */
+
+function sectionSignals() {
+  /* The blurb and the create buttons sit BELOW the list: the list is what you
+     came for, and pushing it under two paragraphs of explanation buries it. */
+  var s = section("Stored signals", "", false);
+  /* Signals can be born here too, not only while wiring a node. Learning a
+     remote you want on the box before you have decided what it should DO is a
+     perfectly normal order to work in, and hand-entering a code you already know
+     never needed a node at all. Both reuse the same flows the node builder
+     uses — one implementation, so they cannot drift. */
+  var listWrap = el("div");
+  add(s.bodyEl, listWrap);
+
+  /* ...and everything explanatory goes after it. */
+  add(s.bodyEl, el("div", "divider"));
+  add(s.bodyEl, el("p", "muted",
+    "Every waveform the box has learned or synthesized. Nodes come and go without "
+    + "touching this list — removing one here is permanent."));
+
+  var mkRow = el("div", "row");
+  var bLearn = el("button", "btn", "\u{1F4E1} Learn a signal");
+  bLearn.type = "button";
+  bLearn.addEventListener("click", function () {
+    openLearnFlow({}).then(function (sig) { if (sig) loadSignals(); });
+  });
+  var bMake = el("button", "btn", "\u2728 Create custom or random");
+  bMake.type = "button";
+  bMake.addEventListener("click", function () {
+    openVirtualFlow({ mode: "sink" }).then(function (sig) { if (sig) loadSignals(); });
+  });
+  add(mkRow, bLearn, bMake);
+  add(s.bodyEl, mkRow);
+  add(s.bodyEl, el("div", "hint",
+    "A signal created here belongs to no node yet. Wire it up later from the "
+    + "Dashboard, or test it straight away by opening it above."));
+
+  /* The rows stay a maintenance list: name, what it decodes to, whether a node
+     uses it. Everything else is one tap away, in the same signalBlock() the
+     node editor shows -- a signal must look and behave identically wherever
+     you meet it, so there is exactly one rendering of one. */
+  function render() {
+    clear(listWrap);
+    if (S.signalsErr) {
+      add(listWrap, el("div", "note bad",
+        "Could not read the signal store: " + S.signalsErr.message));
+      return;
+    }
+    var list = S.signals || [];
+    if (!list.length) {
+      add(listWrap, el("div", "empty",
+        "Nothing stored yet. Signals appear here once you learn a button or create a " +
+        "virtual one while adding a node."));
+      return;
+    }
+    var ul = el("ul", "list");
+    list.forEach(function (sig) {
+      var users = nodesUsingSignal(sig.id, 0);
+      var li = el("li");
+      var b = el("button", "listitem"); b.type = "button";
+      add(b, el("span", "li-ico", sig.origin === "synthesized" ? "✨" : "📥"));
+      var main = el("div", "li-main");
+      add(main, el("div", "li-title", signalLabel(sig)));
+      add(main, el("div", "li-sub", signalIdent(sig) + "  ·  " +
+        (sig.origin === "synthesized" ? "virtual" : "learned")));
+      add(main, el("div", "li-sub", usedByText(users)));
+      add(b, main);
+      var meta = el("div", "li-meta");
+      if (typeof sig.last_seen_s === "number") add(meta, el("div", null, agoText(sig.last_seen_s)));
+      add(b, meta);
+      b.setAttribute("aria-label", "Open " + signalLabel(sig));
+      b.title = "Waveform, transmit, rename, delete";
+      b.addEventListener("click", function () { openStoredSignal(sig.id); });
+      add(li, b);
+      add(ul, li);
+    });
+    add(listWrap, ul);
+  }
+
+  settingsSigRender = render;
+  render();
+  return s;
+}
+
+/* The full detail view of a stored signal, reached from the list above.
+ *
+ * The body is signalBlock() -- the SAME fragment the node editor embeds -- so
+ * identity, the "no decoder claimed this" note, the confidence meter, base
+ * pulse, pulse count, RSSI, seen/last-seen, the inline waveform with its
+ * 49-vs-50 note, the pairing panel for a synthesized code and Transmit are all
+ * here by construction, and can never drift from the node editor's version.
+ *
+ * That also makes this the place a signal NO node uses can still be test-fired:
+ * the store is reachable on its own, so a waveform does not have to be wired to
+ * something before you can hear whether it works.
+ *
+ * Only the destructive action is added on top, because this is the one screen
+ * that is allowed to have one. */
+function openStoredSignal(id) {
+  var sh = openSheet("Signal", null);
+  add(sh.body, el("div", "empty", "Loading…"));
+  api("/api/signals/" + id).then(function (sig) {
+    clear(sh.body);
+    $("h3", sh.sheet).textContent = signalLabel(sig);
+
+    add(sh.body, signalBlock(sig, {
+      storeNote: false,
+      onChanged: function (what, value) {
+        if (what === "renamed") $("h3", sh.sheet).textContent = value;
+      }
+    }));
+
+    /* --- the one destructive action in the whole UI --- */
+    var users = nodesUsingSignal(sig.id, 0);
+    add(sh.body, el("div", "divider"));
+    add(sh.body, el("div", "lg-label", "Remove from the box"));
+    add(sh.body, el("div", "hint", users.length
+      ? usedByText(users) + ". Deleting leaves those nodes without a signal until you give " +
+        "them another one — they are not deleted with it."
+      : "No node uses this signal, so deleting it changes nothing in your graph."));
+
+    var msg = el("div", "formmsg");
+    var foot = el("div", "formfoot");
+    var del = el("button", "btn danger", "Delete signal");
+    del.type = "button";
+    del.addEventListener("click", function () {
+      var lines = ["The stored waveform is removed permanently. " +
+        "If it came off a remote you will have to learn that button again."];
+      if (users.length) {
+        lines.push(usedByText(users) + ". Those nodes keep existing but are left without a " +
+          "signal, and do nothing until you give them another one.");
+      } else {
+        lines.push("No node uses it, so nothing in your graph changes.");
+      }
+      confirmSheet("Delete “" + signalLabel(sig) + "”?", lines, "Delete", true).then(function (ok) {
+        if (!ok) return;
+        setMsg(msg, "Deleting…");
+        api("/api/signals/" + sig.id, { method: "DELETE" }).then(function () {
+          sh.close();
+          loadSignals();
+          if (S.graph) loadGraph();
+        }).catch(function (e) { setMsg(msg, e.message, "err"); });
+      });
+    });
+    add(foot, del, msg);
+    add(sh.body, foot);
+  }).catch(function (e) {
+    clear(sh.body);
+    add(sh.body, el("div", "note bad", "Could not load this signal: " + e.message));
+  });
 }
 
 /*

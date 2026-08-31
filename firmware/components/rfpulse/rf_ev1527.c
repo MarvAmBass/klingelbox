@@ -218,15 +218,43 @@ const rf_decoder_t rf_decoder_ev1527 = {
 /* ---- encoder ------------------------------------------------------------- */
 
 /*
- * Emits sync-first: [1x high][31x low] then the 24 bit-pairs.
+ * Emits sync-LAST: the 24 bit-pairs, then [1x high][31x low].
  *
- * Sync-first rather than sync-last matters for a SINGLE transmission, which is
- * what a "virtual signal" pairing burst may amount to if the user's receiver
- * latches on the first word it sees: a receiver that needs a preamble gets one
- * immediately instead of only after a full word has gone past it. When the
- * transmitter repeats (which rf_transmit does, and which real receivers usually
- * insist on), the gap that opens each copy also serves as the terminator of the
- * previous one, so the wire looks exactly like a genuine fob either way.
+ * WHY THE ORDER IS NOT A MATTER OF TASTE (bench, 2026-08-31). This used to emit
+ * sync-FIRST, on the reasoning that a receiver latching onto a single word wants
+ * its preamble immediately. That reasoning ignores what the *repeated* waveform
+ * looks like, and repeats are what receivers actually decode. rf_transmit adds
+ * an idle gap after every copy, so a sync-first frame put TWO long lows into
+ * each period, separated by a stray one-base high:
+ *
+ *     ...[24 bits][gap ~8 ms][1x high][31x low][24 bits][gap ~8 ms]...
+ *                 \___________/       \______/
+ *                  not a sync a fob    the real sync
+ *                  ever emits
+ *
+ * No EV1527 transmitter on earth emits that. A real fob sends words back to
+ * back with exactly ONE long low per word, and receivers use that low both to
+ * frame the word and — in every rc-switch-derived decoder, which is most of
+ * them — to DERIVE the base pulse width as sync/31. Two alternating long lows
+ * desynchronise that: the decoder alternates between a 48-pulse segment and a
+ * 1-pulse segment and, because it only attempts a decode on every second sync,
+ * it can lock onto the wrong parity and never decode the word at all. Modelled
+ * against rc-switch's exact algorithm, the sync-first waveform decodes zero
+ * times out of six repeats; sync-last decodes every time. That is the concrete
+ * reason hand-made virtual signals never paired while a REPLAYED CAPTURE of the
+ * same code rang the chime: the capture, clipped by the receiver's idle
+ * threshold, happens to end just before its sync and so has only one long low
+ * per period once rf_transmit's gap is appended.
+ *
+ * The 31x low stays IN the frame rather than being left to rf_transmit's gap,
+ * because it is base-proportional and the gap is not: at base 1000 us the sync
+ * must be 31 ms, and an 8 ms configured gap would make an rc-switch receiver
+ * derive a 258 us base for a 1000 us waveform and reject every bit. The frame
+ * is therefore self-contained and correct at any base. rf_transmit treats
+ * gap_us as a MINIMUM idle between copies, so the sync the frame already ends
+ * with is not padded on top of — see rf_transmit.c.
+ *
+ * The result, repeated, is byte-for-byte the waveform a genuine fob emits.
  */
 bool rf_ev1527_build(uint32_t id20, uint8_t button4, uint16_t base_us, rf_frame_t *out)
 {
@@ -244,9 +272,6 @@ bool rf_ev1527_build(uint32_t id20, uint8_t button4, uint16_t base_us, rf_frame_
     rf_frame_reset(out);
     out->first_level = 1;                                   /* starts with carrier on */
 
-    if (!rf_frame_push(out, (uint16_t)base)) return false;                    /* sync high */
-    if (!rf_frame_push(out, (uint16_t)(base * EV1527_SYNC_MULT))) return false; /* sync gap */
-
     for (int b = (int)EV1527_BITS - 1; b >= 0; b--) {
         uint32_t bit = (code >> b) & 1u;
         uint16_t high = (uint16_t)(bit ? base * 3u : base);
@@ -255,5 +280,8 @@ bool rf_ev1527_build(uint32_t id20, uint8_t button4, uint16_t base_us, rf_frame_
         if (!rf_frame_push(out, high)) return false;
         if (!rf_frame_push(out, low)) return false;
     }
+
+    if (!rf_frame_push(out, (uint16_t)base)) return false;                    /* sync high */
+    if (!rf_frame_push(out, (uint16_t)(base * EV1527_SYNC_MULT))) return false; /* sync gap */
     return true;
 }

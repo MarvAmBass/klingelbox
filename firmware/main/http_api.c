@@ -74,6 +74,7 @@
 #include "esp_app_desc.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_ota_ops.h"
 #include "esp_spiffs.h"
 #include "esp_system.h"
@@ -97,6 +98,25 @@
 #include "wifi_mgr.h"
 
 #define LE_HOSTNAME_CMP_MAX 64
+
+/*
+ * Asset revalidation token.
+ *
+ * The web UI was being served with NO cache headers at all, so browsers applied
+ * their own heuristics and held on to app.js indefinitely. After a web-UI OTA the
+ * device served the new file and the browser kept showing the old one — the user
+ * saw a feature "missing" that was actually already flashed. Silent, and
+ * confusing exactly when someone has just updated.
+ *
+ * The fix is an ETag plus `Cache-Control: no-cache`, which means "you may keep a
+ * copy, but always ask before using it". The token is drawn once per boot: the
+ * SPIFFS image cannot change while the device is running (a web-UI OTA rewrites
+ * the partition and reboots), so within one boot a cached copy is always valid
+ * and gets a cheap 304, while any UI update necessarily produces a new token.
+ * That gives correctness after an update AND fast reloads in between, which
+ * plain `no-store` would not.
+ */
+static char s_asset_tag[12];
 
 static const char *TAG = "http_api";
 
@@ -149,10 +169,19 @@ static const char *status_for(esp_err_t err)
     }
 }
 
+/*
+ * The last-resort failure message: a caller's phrasing plus db_err_text()'s
+ * human clause. An ESP_ERR_* constant must never reach this envelope — see
+ * db_diag.h. Any handler that knows more than the error code (which signal
+ * clashed, which field was rejected) should call send_error() with that instead.
+ */
 static esp_err_t send_esp_err(httpd_req_t *req, esp_err_t err, const char *what)
 {
-    char msg[128];
-    snprintf(msg, sizeof(msg), "%s: %s", what, esp_err_to_name(err));
+    char msg[192];
+    /* The code itself is diagnostics, not UI — keep it in the log, where it is
+     * exactly the right thing to have. */
+    ESP_LOGW(TAG, "%s: %s", what, esp_err_to_name(err));
+    snprintf(msg, sizeof(msg), "%s — %s.", what, db_err_text(err));
     return send_error(req, status_for(err), msg);
 }
 
@@ -758,8 +787,20 @@ static esp_err_t api_signal_transmit(httpd_req_t *req, uint16_t id)
     return send_json(req, o, "200 OK");
 }
 
-/* POST /api/signals/virtual — synthesize an EV1527 signal to pair one of the
- * user's OWN receivers to (PLAN.md §6.3). id20 == 0 draws a random address. */
+/*
+ * POST /api/signals/virtual — synthesize an EV1527 signal to pair one of the
+ * user's OWN receivers to (PLAN.md §6.3). id20 == 0 draws a random address.
+ *
+ * THE DUPLICATE RULE, AND WHY IT IS NOT A FLAT REFUSAL. Two stored signals with
+ * the same protocol+address+button are genuinely ambiguous to db_signals_match()
+ * — a burst matches whichever sits earlier in the store, so a source node can
+ * fire the wrong one — and that is worth a 409 by default. But it is not
+ * dangerous, and there is one obvious reason to want it: re-creating a code you
+ * have already captured, as a synthesized signal, which is exactly how you
+ * establish that the box can GENERATE a code it can currently only REPLAY.
+ * `allow_duplicate: true` says so explicitly. The refusal names the signal in
+ * the way, because "0xA685A is taken" is useless if you cannot see by what.
+ */
 static esp_err_t api_signal_virtual(httpd_req_t *req)
 {
     cJSON *j = read_json(req);
@@ -773,14 +814,41 @@ static esp_err_t api_signal_virtual(httpd_req_t *req)
     uint32_t id20 = 0;
     uint8_t button = 8;
     uint16_t base_us = 0;   /* 0 => the store's default */
+    bool allow_dup = false;
+    json_bool(j, "allow_duplicate", &allow_dup);
     if (json_num(j, "id20", &d))    id20 = (uint32_t)clampl(d, 0, 0xFFFFF);
     if (json_num(j, "button", &d))  button = (uint8_t)clampl(d, 0, 15);
     if (json_num(j, "base_us", &d)) base_us = (uint16_t)clampl(d, 0, 5000);
     cJSON_Delete(j);
 
+    /* Look the clash up BEFORE trying, so the 409 can name it. Done here rather
+     * than in the store because only this layer has a user to talk to. */
+    if (id20 != 0 && !allow_dup) {
+        const db_signal_meta_t *clash = db_signals_find_decoded("ev1527", id20, button);
+        if (clash) {
+            char msg[288];
+            snprintf(msg, sizeof(msg),
+                     "Signal '%s' already uses address 0x%05lX with button 0x%X, "
+                     "and two signals with the same code cannot be told apart when "
+                     "one is received. Pick another address or button, or send "
+                     "\"allow_duplicate\": true to create it anyway.",
+                     clash->name, (unsigned long)id20, (unsigned)button);
+            cJSON *e = cJSON_CreateObject();
+            cJSON_AddStringToObject(e, "error", msg);
+            /* Machine-readable too, so a UI can offer "create it anyway" rather
+             * than making the user re-read the sentence and retype the form. */
+            cJSON_AddNumberToObject(e, "conflict_signal_id", (double)clash->id);
+            return send_json(req, e, "409 Conflict");
+        }
+    }
+
     uint16_t id = 0;
-    esp_err_t err = db_signals_create_virtual(name, id20, button, base_us, &id);
+    esp_err_t err = db_signals_create_virtual(name, id20, button, base_us, allow_dup, &id);
     if (err == ESP_OK) db_mqtt_on_signals_changed();
+    if (err == ESP_ERR_NOT_FOUND)
+        return send_error(req, "409 Conflict",
+                          "Could not find a free EV1527 address to use. "
+                          "Delete a signal you no longer need, or enter an address yourself.");
     if (err != ESP_OK) return send_esp_err(req, err, "could not create the virtual signal");
 
     const db_signal_meta_t *m = db_signals_get(id);
@@ -885,12 +953,19 @@ static esp_err_t api_learn_accept(httpd_req_t *req)
  * DESIGNATED INITIALIZERS, NOT POSITIONAL ONES. The enum has already been
  * renumbered once (source.any_rf was inserted after source.virtual, shifting
  * every logic/sink value), and a positional table would have kept compiling
- * while silently relabelling every stored node — turning a saved sink.transmit
+ * while silently relabelling every stored node — turning a saved transmit node
  * into a logic.throttle on the next GET. Indexing by name makes an insertion a
  * no-op here and a missing entry a visible NULL rather than a wrong string.
+ *
+ * Slot 7, the retired sink.transmit, is deliberately absent: it stays NULL, so
+ * no request can name it and no stored node can be reported as it. Every helper
+ * below skips NULL entries for exactly that reason.
  */
 static const char *const NODE_TYPES[DB_NODE__COUNT] = {
-    [DB_NODE_SOURCE_BUTTON]  = "source.button",
+    /* One stored 433 MHz signal, with both ports: link INTO it to transmit that
+     * signal, link OUT of it to act on hearing it. Replaces the old
+     * source.button (in only) and sink.transmit (out only). */
+    [DB_NODE_SIGNAL]         = "signal",
     [DB_NODE_SOURCE_GPIO]    = "source.gpio",
     [DB_NODE_SOURCE_VIRTUAL] = "source.virtual",
     /* Wildcard: fires on every received burst, matched or not. It carries no
@@ -898,7 +973,10 @@ static const char *const NODE_TYPES[DB_NODE__COUNT] = {
     [DB_NODE_SOURCE_ANY_RF]  = "source.any_rf",
     [DB_NODE_LOGIC_GROUP]    = "logic.group",
     [DB_NODE_LOGIC_THROTTLE] = "logic.throttle",
-    [DB_NODE_SINK_TRANSMIT]  = "sink.transmit",
+    /* Auto-repeat: emits at once, then `repeats - 1` more times `window_s`
+     * apart. Named "repeat" and not "loop" because a loop in this engine means a
+     * cycle in the wiring, which the graph refuses to walk. */
+    [DB_NODE_LOGIC_REPEAT]   = "logic.repeat",
     [DB_NODE_SINK_MQTT]      = "sink.mqtt",
 };
 
@@ -969,7 +1047,16 @@ static void node_apply_json(db_node_t *n, const cJSON *j)
     if (json_num(j, "gpio_pin", &d)) n->gpio_pin = (int8_t)clampl(d, -1, 48);
     if (json_bool(j, "gpio_active_low", &b)) n->gpio_active_low = b;
     if (json_num(j, "gpio_debounce_ms", &d)) n->gpio_debounce_ms = (uint16_t)clampl(d, 0, 2000);
-    if (json_num(j, "repeats", &d)) n->repeats = (uint8_t)clampl(d, 1, 32);
+    /* `repeats` means two different things, so it is bounded two different ways.
+     * On a signal node it is how many copies of the frame go out (up to 32 —
+     * cheap receivers want several). On a logic.repeat it is how many times the
+     * chain fires in total, and 20 rings is already far past anything anyone
+     * wants at their front door. Clamping here as well as in the engine keeps
+     * the value the API echoes back equal to the value the engine will act on;
+     * n->type is already set by the time this runs, on both create and update. */
+    if (json_num(j, "repeats", &d))
+        n->repeats = (uint8_t)clampl(d, 1,
+                                     n->type == DB_NODE_LOGIC_REPEAT ? 20 : 32);
     if (json_num(j, "gap_us", &d))  n->gap_us = (uint32_t)clampl(d, 0, 200000);
     /* window_s wins when both are present. Upper bound 6000 s (~100 min): well
      * past anything sensible, but the ceiling is the user's to choose, not ours. */
@@ -1086,8 +1173,13 @@ static esp_err_t api_node_delete(httpd_req_t *req, uint16_t id)
 /*
  * POST /api/graph/nodes/<id>/fire — test-fire, or trigger a source.virtual.
  *
+ * On a `signal` node this fires the OUTPUT side: it is the "pretend that code
+ * was just heard" button, and it does not transmit. Transmitting one on demand
+ * is POST /api/signals/{id}/transmit, or a link into the node's input.
+ *
  * Same ~200 ms inline-blocking rationale as api_signal_transmit: a traversal
- * that reaches a sink.transmit keys the radio synchronously on this worker.
+ * that reaches the input of a signal node keys the radio synchronously on this
+ * worker.
  * The radio-presence check is unconditional rather than "only if the chain
  * contains a transmit sink": the traversal's shape is not known until it runs,
  * a doorbell chain almost always ends in a transmit, and a clear 503 is far more
@@ -1118,6 +1210,19 @@ static esp_err_t api_link_edit(httpd_req_t *req, bool add)
     uint16_t from = (uint16_t)clampl(f, 0, 0xFFFF);
     uint16_t to = (uint16_t)clampl(t, 0, 0xFFFF);
     cJSON_Delete(j);
+
+    /* Name the missing endpoint. The generic fallback would say "it no longer
+     * exists" about a link that was never asked to exist, which is nonsense to
+     * read; the caller can always be told WHICH node it got wrong. */
+    for (int which = 0; which < 2; which++) {
+        uint16_t node_id = which ? to : from;
+        if (!db_graph_node(node_id)) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "There is no node %u to link %s.",
+                     (unsigned)node_id, which ? "to" : "from");
+            return send_error(req, "404 Not Found", msg);
+        }
+    }
 
     esp_err_t err = add ? db_graph_add_link(from, to) : db_graph_delete_link(from, to);
     if (err == ESP_OK) db_mqtt_on_graph_changed();
@@ -2026,8 +2131,30 @@ static esp_err_t static_router(httpd_req_t *req)
         strlcpy(clean, "/index.html", sizeof(clean));
     }
 
+    /* ETag = <per-boot token>-<size>. Size alone would be too weak (an edit can
+     * preserve it); the boot token is what actually changes after an OTA. */
+    long fsize = -1;
+    if (fseek(f, 0, SEEK_END) == 0) { fsize = ftell(f); fseek(f, 0, SEEK_SET); }
+    char etag[48];
+    snprintf(etag, sizeof(etag), "\"%s-%ld\"", s_asset_tag, fsize);
+
+    char inm[64];
+    if (httpd_req_get_hdr_value_str(req, "If-None-Match", inm, sizeof(inm)) == ESP_OK &&
+        strcmp(inm, etag) == 0) {
+        fclose(f);
+        httpd_resp_set_status(req, "304 Not Modified");
+        httpd_resp_set_hdr(req, "ETag", etag);
+        httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
     httpd_resp_set_type(req, content_type_for(clean));
     if (is_gz) httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+    httpd_resp_set_hdr(req, "ETag", etag);
+    /* "no-cache" is NOT "no-store": the browser may keep it, but must revalidate
+     * every time — which is what makes an OTA'd UI appear without a hard refresh. */
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
 
     char chunk[1024];
     size_t r;
@@ -2066,6 +2193,7 @@ static void mount_spiffs(void)
 esp_err_t db_http_start(db_config_t *cfg)
 {
     s_cfg = cfg;
+    snprintf(s_asset_tag, sizeof(s_asset_tag), "%08" PRIx32, esp_random());
     mount_spiffs();
 
     httpd_config_t hc = HTTPD_DEFAULT_CONFIG();

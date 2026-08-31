@@ -42,12 +42,30 @@
  * wires A -> B -> A therefore gets one warning and a stopped branch instead of a
  * stack overflow. DB_GRAPH_MAX_DEPTH bounds a long acyclic chain on top of that.
  *
+ * That guard carries the weight now that DB_NODE_SIGNAL has both ports and a
+ * cycle is something a user can draw without meaning to. A -> A is refused
+ * outright by db_graph_add_link(); A -> B -> A is walked once and stopped by the
+ * mark. What the mark cannot see is a cycle closed OVER THE AIR — signal node A
+ * transmits, a receiver echoes it, signal node A hears it and starts a fresh
+ * traversal. That one is rf_service's TX echo window's job, not this file's.
+ *
  * Note what the mark does NOT do. It never stops a node from fanning out to all
  * of its children, and it never stops two different parents from reaching a
  * shared child — the crossing of every link is recorded before the mark is
  * consulted, which is precisely what an ALL-group needs to become satisfied by
  * its second inbound link within a single traversal. The mark is only consulted
  * to decide whether the child is entered a SECOND time, which is never wanted.
+ *
+ * A REPEAT IS A PARKED TRAVERSAL, NOT A SLEEP. logic.repeat never blocks the
+ * graph task — one blocked task would stall every other press on the box. It
+ * works with the grain of the walk instead: the event passes through
+ * immediately, and the emissions still owed are parked as {node, trigger, due}
+ * in a small fixed table. When an entry comes due the task starts a NEW
+ * traversal whose START is the repeat node itself, and traverse() never calls
+ * node_passes() on its own start — so the node does not re-arm itself from the
+ * inside, and the walk simply runs into its children again. No resume flag, no
+ * second task, no esp_timer: the one thing that changes is how long the task is
+ * willing to wait on its queue.
  *
  * THE TRIGGER TRAVELS. Every traversal carries a db_trigger_t from its source to
  * every sink it reaches. A sink that knows only *that* it fired cannot produce a
@@ -85,7 +103,20 @@ static const char *TAG = "db_graph";
 #define DB_GRAPH_NS      "dbgraph"
 #define DB_GRAPH_NODES   "nodes"
 #define DB_GRAPH_LINKS   "links"
-#define DB_GRAPH_VERSION 1u
+/*
+ * Layout version of the two blobs.
+ *
+ *   v1 - the original nine types, 0 source.button ... 7 sink.transmit, 8 sink.mqtt.
+ *   v2 - source.button and sink.transmit consolidated into one two-ported
+ *        DB_NODE_SIGNAL. Slot 0 is unchanged (see node_graph.h), so the whole
+ *        migration is "type 7 becomes type 0"; nothing else moves, and
+ *        db_node_t / db_link_t are byte-identical to v1.
+ *
+ * A blob whose version is OLDER than this is migrated on load and written back
+ * in the current layout. A blob NEWER than this is refused, because guessing at
+ * a layout from the future is how a downgrade eats a user's graph.
+ */
+#define DB_GRAPH_VERSION 2u
 
 /* At most this many wired inputs. Fixed slots, never compacted: an ISR argument
  * is a slot index, and compacting the table under a live interrupt would point
@@ -102,6 +133,35 @@ static const char *TAG = "db_graph";
 #define GRAPH_TASK_PRIO  5
 #define GRAPH_QUEUE_LEN  12
 
+/* How many repeat sequences may be running at once. Fixed slots, statically
+ * allocated, like everything else in this file — a doorbell must not be able to
+ * malloc itself to death because a neighbour's remote is chattering.
+ *
+ * ONE SLOT PER RUNNING SEQUENCE, not one per queued emission: a slot carries how
+ * many emissions are still owed and re-arms itself for the next one. That is why
+ * a 20-times repeat costs a single slot, and why sixteen of them is a ceiling on
+ * concurrently running repeat nodes rather than on rings. A graph may hold only
+ * DB_NODE_MAX nodes in the first place, so the table can never be swamped by
+ * distinct nodes — only by a graph that keeps re-triggering, and that restarts
+ * its own slot instead of taking another. Overflow is reported rather than
+ * hidden (see repeat_arm): a ring the user asked for that silently never happens
+ * is a far worse bug than a full table. */
+#define DB_REPEAT_SLOTS 16
+
+/* How many times one event may cross INTO a repeat node before the engine calls
+ * it a runaway. See repeat_arm() for why a hop count, and not a duplicate check,
+ * is the right guard. This bounds cycles, never a legitimate sequence: the
+ * emissions of one repeat run do not increment it. */
+#define DB_REPEAT_MAX_HOPS DB_GRAPH_MAX_DEPTH
+
+/* Bounds on logic.repeat's two parameters, enforced here as well as in the API
+ * so a hand-written REST call or an older stored graph cannot arm a thousand
+ * rings. `repeats` counts the immediate emission, so 1 means "no repeat". */
+#define DB_REPEAT_MIN_TIMES 1u
+#define DB_REPEAT_MAX_TIMES 20u
+#define DB_REPEAT_DEF_TIMES 3u
+#define DB_REPEAT_DEF_MS    5000u
+
 /* ---- persisted layout ---------------------------------------------------- */
 
 typedef struct {
@@ -113,7 +173,7 @@ typedef struct {
 /* ---- trigger queue ------------------------------------------------------- */
 
 typedef enum {
-    TRIG_RF = 0,   /* an RF burst: source.button (if recognized) + source.any_rf */
+    TRIG_RF = 0,   /* an RF burst: the matching signal node + source.any_rf     */
     TRIG_NODE,     /* arg = node id (UI/REST/MQTT fire, or a test-fire)          */
     TRIG_WIRED,    /* arg = node id, already debounced                           */
     TRIG_GPIO,     /* arg = GPIO slot index, straight from the ISR               */
@@ -151,6 +211,40 @@ static uint8_t s_blob[sizeof(grf_hdr_t) + DB_NODE_MAX * sizeof(db_node_t)];
 /* Traversal scratch — static because exactly one task ever walks the graph. */
 static struct { uint16_t id; uint8_t depth; } s_work[DB_NODE_MAX + 1];
 static uint8_t s_seen[DB_NODE_MAX];
+
+/*
+ * Repeat sequences in flight: emissions a logic.repeat node still owes.
+ *
+ * node_id 0 marks a free slot, which is why the table needs no separate count
+ * and no compaction. Entries are keyed by NODE ID rather than by array index
+ * precisely because delete_node() shifts s_nodes[] under us — an index would
+ * quietly come to mean a different node.
+ *
+ * The trigger is stored BY VALUE, not by reference. It is the whole reason the
+ * feature is worth having: a repeated sink.mqtt must still publish which signal
+ * caused it, and the burst it describes is long gone by the time the second ring
+ * falls due. ~70 bytes per slot is a cheap price for a payload that means
+ * something.
+ *
+ * A node owns at most ONE entry at a time. That is not an optimisation, it is
+ * the "restart, don't stack" rule made structural: arming a repeat clears the
+ * node's old entry first, so a leaned-on button can never accumulate runs.
+ */
+typedef struct {
+    uint16_t     node_id;   /* the repeat node to resume from; 0 = free slot  */
+    uint8_t      hops;      /* how many repeat nodes this event has crossed   */
+    uint8_t      left;      /* emissions still owed, INCLUDING this one       */
+    int64_t      due_us;    /* esp_timer_get_time() at which the next is due  */
+    db_trigger_t trig;      /* what caused it, delivered unchanged on resume  */
+} pending_repeat_t;
+
+static pending_repeat_t s_repeat[DB_REPEAT_SLOTS];
+
+/* Hop count of the traversal currently in flight: 0 for anything a source
+ * started, and the parked entry's own count while a resume is running. Static
+ * and unguarded is safe here for the same reason s_work and s_seen are — exactly
+ * one task ever walks the graph, and a walk is never re-entered. */
+static uint8_t s_repeat_hops;
 
 /* Wired inputs. pin < 0 means the slot is free. */
 typedef struct {
@@ -190,15 +284,15 @@ static uint16_t next_free_node_id(void)
 static const char *type_name(uint8_t t)
 {
     switch (t) {
-    case DB_NODE_SOURCE_BUTTON:  return "source.button";
+    case DB_NODE_SIGNAL:         return "signal";
     case DB_NODE_SOURCE_GPIO:    return "source.gpio";
     case DB_NODE_SOURCE_VIRTUAL: return "source.virtual";
     case DB_NODE_SOURCE_ANY_RF:  return "source.any_rf";
     case DB_NODE_LOGIC_GROUP:    return "logic.group";
     case DB_NODE_LOGIC_THROTTLE: return "logic.throttle";
-    case DB_NODE_SINK_TRANSMIT:  return "sink.transmit";
+    case DB_NODE_LOGIC_REPEAT:   return "logic.repeat";
     case DB_NODE_SINK_MQTT:      return "sink.mqtt";
-    default:                     return "?";
+    default:                     return "?";   /* incl. the retired slot 7 */
     }
 }
 
@@ -246,9 +340,18 @@ static esp_err_t save_blob(const char *key, const void *items, size_t item_size,
 }
 
 /* Caller holds the lock. Returns the number of items read (0 on any problem —
- * an unreadable graph is an empty graph, never a half-parsed one). */
-static int load_blob(const char *key, void *items, size_t item_size, int max)
+ * an unreadable graph is an empty graph, never a half-parsed one).
+ *
+ * *ver_out receives the layout version the blob was written in, or 0 when there
+ * was no readable blob at all. The caller needs that to know whether a migration
+ * is owed AND whether it may write back: "no blob" and "an old blob" look the
+ * same in the item count when the graph is simply empty. */
+static int load_blob(const char *key, void *items, size_t item_size, int max,
+                     uint32_t *ver_out)
 {
+    if (ver_out)
+        *ver_out = 0;
+
     nvs_handle_t h;
     if (nvs_open(DB_GRAPH_NS, NVS_READONLY, &h) != ESP_OK)
         return 0;
@@ -261,12 +364,19 @@ static int load_blob(const char *key, void *items, size_t item_size, int max)
 
     grf_hdr_t hdr;
     memcpy(&hdr, s_blob, sizeof(hdr));
-    if (hdr.version != DB_GRAPH_VERSION || hdr.item_size != item_size) {
-        ESP_LOGW(TAG, "%s blob is layout v%u/%u, this build wants v%u/%u — ignored",
+    /* Older layouts are migrated by the caller; a NEWER one is refused. The item
+     * size must match either way — every shipped version of db_node_t and
+     * db_link_t has had the same layout, so a mismatch is corruption or a
+     * struct change that would need its own frozen typedef here. */
+    if (hdr.version == 0 || hdr.version > DB_GRAPH_VERSION ||
+        hdr.item_size != item_size) {
+        ESP_LOGW(TAG, "%s blob is layout v%u/%u, this build reads up to v%u/%u — ignored",
                  key, (unsigned)hdr.version, (unsigned)hdr.item_size,
                  (unsigned)DB_GRAPH_VERSION, (unsigned)item_size);
         return 0;
     }
+    if (ver_out)
+        *ver_out = hdr.version;
 
     int n = (hdr.count > (uint32_t)max) ? max : (int)hdr.count;
     if (len < sizeof(hdr) + (size_t)n * item_size) {
@@ -289,14 +399,216 @@ static esp_err_t save_links(void)
     return save_blob(DB_GRAPH_LINKS, s_links, sizeof(db_link_t), s_link_count);
 }
 
+/* ---- migration chain -----------------------------------------------------
+ *
+ * Same shape as db_config.c and signal_store.c: the blob header carries the
+ * layout it was written in, an older one is converted IN PLACE onto today's
+ * structs, and the caller writes it back so the next boot reads it directly.
+ *
+ * v1 -> v2 is a single relabelling. db_node_t did not change, so there is no
+ * frozen db_node_v1_t to copy field by field; only the meaning of one `type`
+ * value did:
+ *
+ *     v1 slot 7 "sink.transmit"  ->  v2 slot 0 DB_NODE_SIGNAL
+ *
+ * Slot 0 was source.button and is now DB_NODE_SIGNAL, which is exactly why
+ * every stored button node needs no work at all — the consolidation was
+ * designed around keeping that slot. Everything the migrated node needs is
+ * already in the struct: signal_id names the same stored signal, and repeats /
+ * gap_us still describe how its frame goes out. The node keeps its id, its
+ * name, its position and every link, so a graph drawn under v1 comes back
+ * looking the same, with one extra input port on the nodes that used to be
+ * transmit sinks.
+ *
+ * ADDING v3: add a `case 2:` below, and let `case 1:` fall INTO it, so a v1
+ * blob is carried forward through every step in turn rather than needing its
+ * own v1->v3 shortcut. (`case 1:` breaks today only because it is the last one.)
+ *
+ * Caller holds the lock. Returns how many nodes were changed.
+ */
+static int migrate_nodes(uint32_t from_version)
+{
+    int changed = 0;
+
+    switch (from_version) {
+    case 1:
+        for (int i = 0; i < s_node_count; i++) {
+            if (s_nodes[i].type != DB_NODE__RETIRED_TRANSMIT)
+                continue;
+            s_nodes[i].type = DB_NODE_SIGNAL;
+            changed++;
+            ESP_LOGI(TAG, "migrated node %u '%s': sink.transmit -> signal",
+                     (unsigned)s_nodes[i].id, s_nodes[i].name);
+        }
+        break;
+    default:
+        break;
+    }
+
+    return changed;
+}
+
+/* ---- repeat sequences ---------------------------------------------------- */
+
+/* Interval between the emissions of a repeat node, in milliseconds. Same unit
+ * convention as logic.throttle: milliseconds live in the struct, and a zero
+ * window means "unset", not "instantly". Zero would also let repeat_service()
+ * spin, because the next emission would be due the moment it was armed. */
+static uint32_t repeat_interval_ms(const db_node_t *n)
+{
+    return n->window_ms ? n->window_ms : DB_REPEAT_DEF_MS;
+}
+
+/* How many emissions a repeat node makes in total, the immediate one included.
+ * Clamped here as well as in the API: a graph written by an older firmware, or
+ * by a hand-rolled curl, must not be able to arm a thousand rings. */
+static uint8_t repeat_total(const db_node_t *n)
+{
+    uint32_t t = n->repeats ? n->repeats : DB_REPEAT_DEF_TIMES;
+    if (t < DB_REPEAT_MIN_TIMES) t = DB_REPEAT_MIN_TIMES;
+    if (t > DB_REPEAT_MAX_TIMES) t = DB_REPEAT_MAX_TIMES;
+    return (uint8_t)t;
+}
+
+/* Forget the sequence a node still owes. Caller holds the lock.
+ *
+ * This is not housekeeping, it is correctness: an entry outlives the traversal
+ * that created it, so a node deleted, disabled or re-typed mid-run would
+ * otherwise keep ringing a chain the user has already taken apart. Returns how
+ * many entries were dropped, for the log. */
+static int repeat_cancel_node(uint16_t node_id)
+{
+    int dropped = 0;
+    for (int i = 0; i < DB_REPEAT_SLOTS; i++) {
+        if (s_repeat[i].node_id != node_id)
+            continue;
+        memset(&s_repeat[i], 0, sizeof(s_repeat[i]));
+        dropped++;
+    }
+    return dropped;
+}
+
+/*
+ * Start (or restart) the run of extra emissions a logic.repeat node owes after
+ * the one that is passing through right now. Caller holds the lock and is the
+ * graph task.
+ *
+ * RESTART, NEVER STACK. A new event arriving mid-run cancels what was left of
+ * the previous run and begins again from this press. Anything else turns an
+ * impatient visitor into a runaway: five presses of a "3 times" repeat would
+ * otherwise leave fifteen rings queued, which is precisely the behaviour this
+ * node exists to make safe.
+ *
+ * THE RUNAWAY GUARD, and why it is a hop count.
+ *
+ * Every resumed emission is a BRAND NEW traversal with a fresh s_seen, so the
+ * per-traversal cycle mark that protects the rest of this engine buys nothing
+ * across them: a user who wires repeat -> ... -> repeat (or, through the REST
+ * API, anything -> back into the same repeat) would get a chain of traversals
+ * that re-arms itself for ever, at whatever rate the interval sets. Nothing else
+ * in the box would notice; it would just ring at 3 a.m. until someone pulled the
+ * power.
+ *
+ * So each entry carries how many repeat nodes the event has already crossed, and
+ * a resumed traversal passes that count on to anything it arms. A fresh press
+ * always starts at zero, a cycle increments on every lap, and the run is refused
+ * once it reaches DB_REPEAT_MAX_HOPS. The emissions WITHIN one run never touch
+ * the count, so a legitimate 20-times repeat is never cut short.
+ *
+ * The tempting alternative - "refuse if this node already has an entry for this
+ * trigger" - was rejected because it cannot tell a cycle from an ordinary second
+ * press. Two presses of the same wired button produce byte-identical triggers
+ * (trigger_from_node zeroes everything but the label), so that rule would drop
+ * the user's real second ring, while a cycle built from two DIFFERENT repeat
+ * nodes would sail straight through it. A hop count gets both cases right.
+ *
+ * The price is paid by NESTED repeats, and it is the right price. In a chain of
+ * repeat A -> repeat B, each of A's emissions restarts B one hop further along,
+ * so a very long A eventually spends the budget and B stops repeating. Resetting
+ * the count per node would remove that ceiling — and with it the only thing
+ * bounding a mutual A -> B -> A cycle, which is a graph that rings for ever. A
+ * bounded surprise beats an unbounded one at three in the morning.
+ */
+static void repeat_arm(const db_node_t *n, int64_t now, const db_trigger_t *trig)
+{
+    uint8_t  total  = repeat_total(n);
+    uint32_t int_ms = repeat_interval_ms(n);
+
+    /* Whatever this node still owed belongs to a press the user has superseded.
+     * Done before the hop check too, so even a refused run leaves no stale
+     * sequence ticking away behind it. */
+    repeat_cancel_node(n->id);
+
+    if (total <= 1)
+        return;   /* "1 time" is the immediate emission and nothing more */
+
+    if (s_repeat_hops >= DB_REPEAT_MAX_HOPS) {
+        ESP_LOGW(TAG, "repeat '%s' not re-armed: this event has already crossed "
+                      "%u repeat node(s) - the wiring feeds a repeat back into "
+                      "itself, which stops here",
+                 n->name, (unsigned)s_repeat_hops);
+        db_events_push(DB_EV_SYSTEM, 0, n->id, 0, 0,
+                       "Repeat loop stopped at \"%s\"",
+                       n->name[0] ? n->name : "repeat");
+        return;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < DB_REPEAT_SLOTS; i++)
+        if (s_repeat[i].node_id == 0) { slot = i; break; }
+
+    if (slot < 0) {
+        /* Drop the NEWEST run rather than evicting one already promised: the
+         * sequences ahead of it are closer to their next ring, and stealing a
+         * slot would turn one lost repeat into several. Say so both ways round -
+         * the log for whoever is watching a console, an event for the user who
+         * is not. The immediate emission has already happened, so the press is
+         * not lost; only its repeats are. */
+        ESP_LOGW(TAG, "repeat '%s' dropped its repeats: all %d slots are running",
+                 n->name, DB_REPEAT_SLOTS);
+        db_events_push(DB_EV_SYSTEM, trig->signal_id, n->id, trig->rssi_dbm, 0,
+                       "Repeat \"%s\" full - repeats dropped",
+                       n->name[0] ? n->name : "repeat");
+        return;
+    }
+
+    s_repeat[slot].node_id = n->id;
+    s_repeat[slot].hops    = (uint8_t)(s_repeat_hops + 1);
+    s_repeat[slot].left    = (uint8_t)(total - 1);   /* the immediate one is done */
+    s_repeat[slot].due_us  = now + (int64_t)int_ms * 1000;
+    s_repeat[slot].trig    = *trig;
+
+    ESP_LOGI(TAG, "repeat '%s': '%s' fired, %u more %lums apart",
+             n->name, trig->label, (unsigned)(total - 1), (unsigned long)int_ms);
+}
+
+/* Earliest due time of anything owed, or 0 when nothing is running. Caller holds
+ * the lock. */
+static int64_t repeat_next_due_us(void)
+{
+    int64_t best = 0;
+    for (int i = 0; i < DB_REPEAT_SLOTS; i++) {
+        if (s_repeat[i].node_id == 0)
+            continue;
+        if (best == 0 || s_repeat[i].due_us < best)
+            best = s_repeat[i].due_us;
+    }
+    return best;
+}
+
 /* ---- gating logic -------------------------------------------------------- */
 
 /*
  * Decide whether an event reaching `n` continues past it. Sources and sinks
- * always pass; the two logic types are the whole reason this function exists.
+ * always pass; the logic types are the whole reason this function exists.
+ *
+ * `trig` is needed because passing is not always the end of it: a logic.repeat
+ * lets the event through AND owes it again later, so it has to keep a copy of
+ * what caused it.
+ *
  * Caller holds the lock and is the graph task.
  */
-static bool node_passes(db_node_t *n, int idx, int64_t now)
+static bool node_passes(db_node_t *n, int idx, int64_t now, const db_trigger_t *trig)
 {
     switch (n->type) {
     case DB_NODE_LOGIC_GROUP: {
@@ -341,27 +653,60 @@ static bool node_passes(db_node_t *n, int idx, int64_t now)
         return true;
     }
 
+    case DB_NODE_LOGIC_REPEAT:
+        /* "Yes, and again later." The first ring must be immediate — a doorbell
+         * that makes a visitor wait out an interval before anything happens is
+         * broken — so this returns true and the traversal walks straight on into
+         * the children. What is scheduled is only what is still OWED.
+         *
+         * Those emissions are picked up by repeat_service(), which starts a
+         * fresh traversal FROM this node. traverse() does not gate its own
+         * start, so we are not consulted again for them: the node cannot re-arm
+         * itself from the inside, and each resume simply rings the children
+         * once more. */
+        repeat_arm(n, now, trig);
+        return true;
+
     default:
         return true;
     }
 }
 
-/* Perform whatever a node DOES on being reached. Only sinks act; sources and
- * logic nodes exist to route. Caller holds the lock and is the graph task. */
-static void node_act(const db_node_t *n, const db_trigger_t *trig)
+/*
+ * Perform whatever a node DOES on being reached. Only sinks act — and the input
+ * side of a signal node, which is a sink in all but name; sources and logic
+ * nodes exist to route. Caller holds the lock and is the graph task.
+ *
+ * `is_start` says the node is where this traversal BEGAN rather than somewhere
+ * it arrived over a link. That distinction is what makes DB_NODE_SIGNAL's two
+ * ports mean different things:
+ *
+ *   started here  -> the code was heard on air (or the node was test-fired).
+ *                    The node's OUTPUT is what fired; the walk continues into
+ *                    its children and nothing is transmitted.
+ *   reached by a  -> something upstream is asking for this signal to go out.
+ *   link             That is the INPUT, and it transmits.
+ *
+ * Acting on the start too would turn every signal node into an unrequested
+ * repeater: hear the code, immediately say it again. Do not "simplify" this by
+ * dropping the flag.
+ */
+static void node_act(const db_node_t *n, const db_trigger_t *trig, bool is_start)
 {
     switch (n->type) {
-    case DB_NODE_SINK_TRANSMIT:
+    case DB_NODE_SIGNAL:
+        if (is_start)
+            break;   /* the output side: heard, not asked to send */
         if (!s_transmit.fn) {
             ESP_LOGW(TAG, "node %u '%s' wants to transmit but no handler is "
                           "registered", (unsigned)n->id, n->name);
             return;
         }
-        ESP_LOGI(TAG, "sink transmit: node %u '%s' -> signal %u x%u (from '%s')",
+        ESP_LOGI(TAG, "signal transmit: node %u '%s' -> signal %u x%u (from '%s')",
                  (unsigned)n->id, n->name, (unsigned)n->signal_id, n->repeats,
                  trig->label);
         db_events_push(DB_EV_NODE_FIRED, n->signal_id, n->id, trig->rssi_dbm,
-                       n->repeats, "%s", n->name[0] ? n->name : "transmit");
+                       n->repeats, "%s", n->name[0] ? n->name : "signal");
         s_transmit.fn(n, trig, s_transmit.ctx);
         break;
 
@@ -386,6 +731,17 @@ static void node_act(const db_node_t *n, const db_trigger_t *trig)
 /*
  * Walk forward from one node, carrying `trig` to everything reached. See the
  * file header for the fan-out and cycle-guard rules.
+ *
+ * THE START NODE IS NOT GATED. node_passes() is asked about the TARGET of a
+ * link, never about start_id — a source has nothing to gate, and a test-fire
+ * must fire. That was always true; logic.repeat now leans on it, because each
+ * owed emission is a traversal starting AT the repeat node, and the node must
+ * step aside rather than restart its own run every time it rings. Do not "tidy"
+ * this by gating the start.
+ *
+ * The start node is ALSO the one thing node_act() treats differently, for a
+ * related reason: a signal node that a burst just fired is acting as an input,
+ * not being asked to send. See node_act().
  *
  * Caller holds the lock and is the graph task.
  */
@@ -418,7 +774,9 @@ static void traverse(uint16_t start_id, const db_trigger_t *trig)
         if (!n->enabled)
             continue;
 
-        node_act(n, trig);
+        /* `id == start_id` is exactly "this is the start": a node is entered at
+         * most once per traversal, so no later hop can wear the start's id. */
+        node_act(n, trig, id == start_id);
 
         if (depth >= DB_GRAPH_MAX_DEPTH) {
             ESP_LOGW(TAG, "traversal stopped at node %u '%s': depth limit %d "
@@ -463,7 +821,7 @@ static void traverse(uint16_t start_id, const db_trigger_t *trig)
                 continue;
             }
 
-            if (!node_passes(&s_nodes[t], t, now))
+            if (!node_passes(&s_nodes[t], t, now, trig))
                 continue;
 
             if (tail >= (int)(sizeof(s_work) / sizeof(s_work[0]))) {
@@ -475,6 +833,73 @@ static void traverse(uint16_t start_id, const db_trigger_t *trig)
             s_work[tail].depth = (uint8_t)(depth + 1);
             tail++;
         }
+    }
+}
+
+/*
+ * Ring whatever is due, oldest first, and re-arm the sequences that owe more.
+ * Caller holds the lock and is the graph task.
+ *
+ * Order matters twice over. The entry is copied and its slot settled BEFORE the
+ * traversal runs, because that traversal may arm repeats of its own and must see
+ * a coherent table. And entries are taken in due order, so two repeat nodes that
+ * both came due while the task was busy still ring in the sequence the user
+ * wired them.
+ *
+ * DRIFT IS CORRECTED, NOT ACCUMULATED. The next emission is due one interval
+ * after the one just made was DUE, not after it actually ran, so a run of ten
+ * rings does not slowly slide later because the task was busy. If the box was so
+ * busy that the corrected time is already past, it falls back to now + interval
+ * rather than firing the rest of the sequence back to back.
+ *
+ * This loop terminates. Every entry it writes is due strictly later than the
+ * `now` it was called with, so nothing it creates can satisfy the same pass -
+ * the hop guard in repeat_arm() is about laps across time, this is about not
+ * spinning inside one wake-up.
+ */
+static void repeat_service(int64_t now)
+{
+    for (;;) {
+        int best = -1;
+        for (int i = 0; i < DB_REPEAT_SLOTS; i++) {
+            if (s_repeat[i].node_id == 0 || s_repeat[i].due_us > now)
+                continue;
+            if (best < 0 || s_repeat[i].due_us < s_repeat[best].due_us)
+                best = i;
+        }
+        if (best < 0)
+            return;
+
+        pending_repeat_t e = s_repeat[best];
+
+        /* The node may have gone away or been switched off in the seconds this
+         * run spent waiting. The mutation paths cancel their own entries, so
+         * this is the belt to their braces rather than the only check. */
+        int idx = node_index(e.node_id);
+        if (idx < 0 || !s_nodes[idx].enabled) {
+            memset(&s_repeat[best], 0, sizeof(s_repeat[best]));
+            continue;
+        }
+
+        if (e.left > 1) {
+            int64_t next = e.due_us + (int64_t)repeat_interval_ms(&s_nodes[idx]) * 1000;
+            if (next <= now)
+                next = now + (int64_t)repeat_interval_ms(&s_nodes[idx]) * 1000;
+            s_repeat[best].left   = (uint8_t)(e.left - 1);
+            s_repeat[best].due_us = next;
+        } else {
+            memset(&s_repeat[best], 0, sizeof(s_repeat[best]));
+        }
+
+        ESP_LOGI(TAG, "repeat '%s': emission for '%s' (%u left after this)",
+                 s_nodes[idx].name, e.trig.label, (unsigned)(e.left - 1));
+
+        /* Carry the hop count into the resumed traversal so anything IT arms
+         * counts as one repeat node further from the press that started all
+         * this. The emissions of this run do not increment it. */
+        s_repeat_hops = e.hops;
+        traverse(e.node_id, &e.trig);
+        s_repeat_hops = 0;
     }
 }
 
@@ -758,14 +1183,58 @@ static void handle_gpio_edge(uint16_t slot_idx)
 
 /* ---- the graph task ------------------------------------------------------ */
 
+/*
+ * How long to wait on the trigger queue.
+ *
+ * portMAX_DELAY whenever nothing is owed — an idle box must cost nothing, which
+ * has been true of this engine from the start and stays true. Only when a repeat
+ * sequence is running does the wait become finite, and then it is exactly the
+ * time to the next emission: the task wakes for that ring and for nothing else.
+ * No polling interval, no timer task, no second queue.
+ *
+ * The floor of one tick is what keeps it that way. pdMS_TO_TICKS() truncates, so
+ * a remainder shorter than a tick would otherwise become a zero-timeout receive
+ * — a spin, at full task priority, until the millisecond arrived. Sleeping one
+ * tick too long is invisible in a doorbell; busy-waiting is not.
+ */
+static TickType_t graph_wait_ticks(void)
+{
+    lock();
+    int64_t due = repeat_next_due_us();
+    unlock();
+
+    if (due == 0)
+        return portMAX_DELAY;
+
+    int64_t rem_ms = (due - esp_timer_get_time()) / 1000;
+    if (rem_ms <= 0)
+        return 0;                      /* already due: drain the queue, then ring */
+
+    TickType_t t = pdMS_TO_TICKS(rem_ms);
+    return t ? t : 1;
+}
+
 static void graph_task(void *arg)
 {
     (void)arg;
     static queued_t q;   /* ~70 bytes, kept off the task stack */
 
     for (;;) {
-        if (xQueueReceive(s_queue, &q, portMAX_DELAY) != pdTRUE)
+        bool got = (xQueueReceive(s_queue, &q, graph_wait_ticks()) == pdTRUE);
+
+        /* Waking on the timeout with nothing queued is the normal case for a
+         * repeat: there is no trigger to handle, only emissions to make. */
+        if (!got) {
+            lock();
+            repeat_service(esp_timer_get_time());
+            unlock();
             continue;
+        }
+
+        /* A trigger from a source starts its own chain: whatever it arms is one
+         * repeat node away from the press, not however many the emission that
+         * happened to precede it had crossed. */
+        s_repeat_hops = 0;
 
         switch (q.kind) {
         case TRIG_RF:
@@ -780,9 +1249,11 @@ static void graph_task(void *arg)
                     /* The wildcard: every burst, recognized or not. Opt-in — it
                      * does nothing unless the user placed one. */
                     fires = true;
-                } else if (n->type == DB_NODE_SOURCE_BUTTON &&
+                } else if (n->type == DB_NODE_SIGNAL &&
                            q.trig.signal_id != 0 &&
                            n->signal_id == q.trig.signal_id) {
+                    /* The signal node's OUTPUT side. traverse() starts here, so
+                     * node_act() sees is_start and does not send it back out. */
                     fires = true;
                 }
                 if (!fires)
@@ -792,7 +1263,7 @@ static void graph_task(void *arg)
                          q.trig.label, (unsigned)n->id, n->name,
                          type_name(n->type));
                 /* A separate traversal per source node, so a burst driving both
-                 * a button chain and the wildcard chain reaches everything on
+                 * a signal chain and the wildcard chain reaches everything on
                  * both — that is intended, not double-firing. */
                 traverse(n->id, &q.trig);
             }
@@ -824,6 +1295,14 @@ static void graph_task(void *arg)
         default:
             break;
         }
+
+        /* Handling that trigger may have taken a while (a transmit sink keys the
+         * radio for a couple of hundred milliseconds), so an emission can have
+         * fallen due meanwhile. Serviced here rather than only on the timeout
+         * path, so a busy box still rings on time. */
+        lock();
+        repeat_service(esp_timer_get_time());
+        unlock();
     }
 }
 
@@ -842,8 +1321,20 @@ esp_err_t db_graph_init(void)
         s_gpio[i].pin = -1;
 
     lock();
-    s_node_count = load_blob(DB_GRAPH_NODES, s_nodes, sizeof(db_node_t), DB_NODE_MAX);
-    s_link_count = load_blob(DB_GRAPH_LINKS, s_links, sizeof(db_link_t), DB_LINK_MAX);
+    uint32_t nodes_ver = 0, links_ver = 0;
+    s_node_count = load_blob(DB_GRAPH_NODES, s_nodes, sizeof(db_node_t),
+                             DB_NODE_MAX, &nodes_ver);
+    s_link_count = load_blob(DB_GRAPH_LINKS, s_links, sizeof(db_link_t),
+                             DB_LINK_MAX, &links_ver);
+
+    /* Bring an older layout forward BEFORE anything else looks at the types —
+     * in particular before the unknown-type sanitiser below, which would
+     * otherwise see a retired slot and disable the user's node. */
+    if (nodes_ver != 0 && nodes_ver < DB_GRAPH_VERSION) {
+        int changed = migrate_nodes(nodes_ver);
+        ESP_LOGI(TAG, "graph nodes migrated v%u -> v%u (%d node(s) retyped)",
+                 (unsigned)nodes_ver, (unsigned)DB_GRAPH_VERSION, changed);
+    }
 
     /* Sanitise what came off flash: bounded strings and no link that points at a
      * node which no longer exists (a graph edited by an older firmware, or a
@@ -851,7 +1342,11 @@ esp_err_t db_graph_init(void)
     for (int i = 0; i < s_node_count; i++) {
         s_nodes[i].name[DB_NODE_NAME_MAX - 1]   = '\0';
         s_nodes[i].topic[DB_NODE_TOPIC_MAX - 1] = '\0';
-        if (s_nodes[i].type >= DB_NODE__COUNT) {
+        /* The retired slot counts as unknown: after migrate_nodes() nothing may
+         * still be one, and a node that somehow is must not be left holding a
+         * type nothing in this file knows how to act on. */
+        if (s_nodes[i].type >= DB_NODE__COUNT ||
+            s_nodes[i].type == DB_NODE__RETIRED_TRANSMIT) {
             ESP_LOGW(TAG, "node %u has unknown type %u — disabling it",
                      (unsigned)s_nodes[i].id, s_nodes[i].type);
             s_nodes[i].type    = DB_NODE_SOURCE_VIRTUAL;
@@ -871,6 +1366,22 @@ esp_err_t db_graph_init(void)
 
     memset(s_pass_us, 0, sizeof(s_pass_us));
     memset(s_fired_us, 0, sizeof(s_fired_us));
+    /* Nothing may survive a (re)load: an entry names a node id, and the graph
+     * that has just come off flash is not necessarily the one those ids belonged
+     * to. Zero at boot too, so this holds however init comes to be called. */
+    memset(s_repeat, 0, sizeof(s_repeat));
+    s_repeat_hops = 0;
+
+    /* Write the graph back in the current layout so the next boot reads it
+     * directly and the migration is a one-off. Only when a blob was actually
+     * READ and was older: an absent blob must stay absent (a box with no graph
+     * yet should not acquire an empty one), and a failed save is logged by
+     * save_blob() and simply left for the next mutation to retry — the in-RAM
+     * graph is already correct either way. */
+    if (nodes_ver != 0 && nodes_ver < DB_GRAPH_VERSION)
+        save_nodes();
+    if (links_ver != 0 && links_ver < DB_GRAPH_VERSION)
+        save_links();
     unlock();
 
     if (!s_queue)
@@ -934,6 +1445,14 @@ void db_graph_node_defaults(db_node_t *node, db_node_type_t type)
          * a genuine second visitor still gets a chime. */
         node->window_ms = 10000;
         break;
+    case DB_NODE_LOGIC_REPEAT:
+        /* Three rings five seconds apart: the "I did not hear it the first
+         * time" default. `repeats` here is a count of emissions, NOT the number
+         * of copies of a frame a transmit sink sends, so it overrides the
+         * transmit default set above. */
+        node->window_ms = DB_REPEAT_DEF_MS;
+        node->repeats   = (uint8_t)DB_REPEAT_DEF_TIMES;
+        break;
     default:
         /* Sources (including the parameterless SOURCE_ANY_RF) and sinks have no
          * window of their own. */
@@ -969,6 +1488,11 @@ esp_err_t db_graph_add_node(const db_node_t *node, uint16_t *id_out)
     n->name[DB_NODE_NAME_MAX - 1]   = '\0';
     n->topic[DB_NODE_TOPIC_MAX - 1] = '\0';
     s_pass_us[s_node_count] = 0;
+    /* Node ids are reused: next_free_node_id() hands back the lowest one free,
+     * so a brand-new node can inherit the id of one deleted moments ago. Delete
+     * already clears its own entries; this makes the invariant hold even if some
+     * future path forgets to. */
+    repeat_cancel_node(id);
     s_node_count++;
 
     esp_err_t err = save_nodes();
@@ -1008,6 +1532,21 @@ esp_err_t db_graph_update_node(const db_node_t *node)
     if (prev.type != node->type || prev.window_ms != node->window_ms)
         s_pass_us[i] = 0;
 
+    /* The same reasoning, but with teeth: a repeat sequence in flight belongs to
+     * the node as it was CONFIGURED when it started. Retype it, retime it,
+     * change how many rings it owes, or switch it off, and those rings are no
+     * longer the ones the user is asking for — a disabled node in particular
+     * must go quiet at once, not finish its run. Editing the name or the canvas
+     * position is deliberately not on this list; nobody expects dragging a node
+     * to cancel a chime. */
+    if (prev.type != node->type || prev.window_ms != node->window_ms ||
+        prev.repeats != node->repeats || (prev.enabled && !node->enabled)) {
+        int cancelled = repeat_cancel_node(prev.id);
+        if (cancelled)
+            ESP_LOGI(TAG, "node %u edited: %d pending repeat run(s) cancelled",
+                     (unsigned)prev.id, cancelled);
+    }
+
     esp_err_t err = save_nodes();
     if (err != ESP_OK)
         s_nodes[i] = prev;
@@ -1030,6 +1569,12 @@ esp_err_t db_graph_delete_node(uint16_t id)
         unlock();
         return ESP_ERR_NOT_FOUND;
     }
+
+    /* Before the shift, and unconditionally: an emission still owed by this node
+     * would otherwise come due against a node that no longer exists — at best a
+     * silent no-op, at worst a ring from a chain the user has just deleted. The
+     * table is keyed by node id, so the shift below cannot touch it either way. */
+    int stopped = repeat_cancel_node(id);
 
     for (int k = i; k < s_node_count - 1; k++) {
         s_nodes[k]   = s_nodes[k + 1];
@@ -1059,7 +1604,8 @@ esp_err_t db_graph_delete_node(uint16_t id)
      * db_graph_apply_gpio_inputs() releases the pin for good. */
     unlock();
 
-    ESP_LOGI(TAG, "node %u deleted (%d link(s) with it)", (unsigned)id, dropped);
+    ESP_LOGI(TAG, "node %u deleted (%d link(s) with it%s)", (unsigned)id, dropped,
+             stopped ? ", repeat run stopped" : "");
     return err;
 }
 

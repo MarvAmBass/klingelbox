@@ -303,13 +303,13 @@ esp_err_t rf_service_start(void)
 
     esp_err_t err = cc1101_init(&pins, &s_radio);
     if (err != ESP_OK) {
-        db_diag_report(DB_DIAG_SPI_ERROR, "cc1101_init: %s", esp_err_to_name(err));
+        db_diag_report(DB_DIAG_SPI_ERROR, "bringing up the SPI bus: %s", db_err_text(err));
         return err;
     }
 
     err = cc1101_probe(s_radio, &s_ident);
     if (err != ESP_OK) {
-        db_diag_report(DB_DIAG_SPI_ERROR, "probe transaction: %s", esp_err_to_name(err));
+        db_diag_report(DB_DIAG_SPI_ERROR, "reading the chip ID: %s", db_err_text(err));
         return err;
     }
 
@@ -328,7 +328,8 @@ esp_err_t rf_service_start(void)
     cc1101_radio_cfg_default(&s_radio_cfg);
     err = cc1101_configure(s_radio, &s_radio_cfg);
     if (err != ESP_OK) {
-        db_diag_report(DB_DIAG_RADIO_CONFIG_SUSPECT, "configure: %s", esp_err_to_name(err));
+        db_diag_report(DB_DIAG_RADIO_CONFIG_SUSPECT, "writing the radio settings: %s",
+                       db_err_text(err));
         return err;
     }
     ESP_LOGI(TAG, "radio: %lu Hz, OOK, %lu bps, %lu Hz bw, %d dBm",
@@ -341,7 +342,8 @@ esp_err_t rf_service_start(void)
     err = enter_rx();
     radio_unlock();
     if (err != ESP_OK) {
-        db_diag_report(DB_DIAG_RADIO_CONFIG_SUSPECT, "enter RX: %s", esp_err_to_name(err));
+        db_diag_report(DB_DIAG_RADIO_CONFIG_SUSPECT, "switching the radio to receive: %s",
+                       db_err_text(err));
         return err;
     }
 
@@ -399,14 +401,17 @@ esp_err_t rf_service_transmit(const rf_frame_t *frame, uint8_t repeats, uint32_t
     radio_unlock();
 
     if (err != ESP_OK) {
-        db_diag_report(DB_DIAG_TX_FAILED, "%s", esp_err_to_name(err));
+        db_diag_report(DB_DIAG_TX_FAILED, "%s", db_err_text(err));
     } else {
         /* Arm echo suppression. Recorded AFTER the send so the window starts
          * when the carrier stops, not when it started. */
         s_tx_last       = *frame;
         s_tx_end_us     = esp_timer_get_time();
         s_tx_last_valid = true;
-        db_diag_report(DB_DIAG_TX_OK, "%u pulses x%u, gap %lu us (software-level)",
+        /* ">=": gap_us is a floor, and a frame that ends with its own framing
+         * gap keeps that period instead (see rf_transmit.h). Saying "gap 8000"
+         * when the wire carried 9021 would be a lie in a diagnostic. */
+        db_diag_report(DB_DIAG_TX_OK, "%u pulses x%u, gap >=%lu us (software-level)",
                        frame->count, repeats, (unsigned long)gap_us);
     }
 

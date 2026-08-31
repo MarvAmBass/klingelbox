@@ -83,6 +83,7 @@
 #include "freertos/task.h"
 #include "mqtt_client.h"        /* esp-mqtt: esp_mqtt_client_* (NOT our header) */
 
+#include "db_diag.h"
 #include "event_log.h"
 #include "node_graph.h"
 #include "rf_service.h"
@@ -995,8 +996,10 @@ static void handle_transmit(const char *slug, const char *payload)
 
     db_trigger_t t = { .signal_id = id, .repeats = repeats };
     trigger_enrich(&t);
+    /* This text lands in a Home Assistant entity and in the activity feed, so it
+     * is UI: db_err_text(), never the raw constant (see db_diag.h). */
     publish_event(DB_EV_TRANSMIT, &t, 0, NULL,
-                  err == ESP_OK ? "transmitted via MQTT" : esp_err_to_name(err));
+                  err == ESP_OK ? "transmitted via MQTT" : db_err_text(err));
 }
 
 static void handle_fire(const char *suffix)

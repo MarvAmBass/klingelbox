@@ -25,6 +25,26 @@
  * gap is emitted by the same peripheral that emits the pulses, so it is as
  * accurate as they are.
  *
+ * A FRAME THAT ALREADY ENDS IN A FRAMING GAP KEEPS ITS OWN PERIOD (bench,
+ * 2026-08-31). gap_us has always been documented as "gap_us of idle between
+ * copies", and it used to be appended unconditionally. That is wrong for any
+ * frame that already carries its protocol's own framing gap at the end — which
+ * is what rf_ev1527_build deliberately emits, and what a capture looks like
+ * whenever the gap happened to fall inside the recording. Appending on top of
+ * it produces a period no transmitter ever emits: for a synthesized EV1527 word
+ * at base 291 us that meant a 17 ms low where a real fob emits 9 ms. Receivers
+ * do not merely tolerate the framing gap, they MEASURE it — every rc-switch
+ * derived decoder recovers the base pulse width as sync/31 — so a stretched gap
+ * makes them compute the wrong base and reject every bit of the word.
+ *
+ * So: if the frame's last pulse is idle-level AND dwarfs every other pulse in
+ * the frame, it IS the framing gap, and the frame's period is left exactly as
+ * authored. Otherwise gap_us is a minimum that the trailing idle counts toward.
+ * Frames ending on a HIGH — nearly every capture, because the idle threshold
+ * that ENDS a recording is the following gap — get the full gap_us exactly as
+ * they always did. The test is a question about the waveform, not about any
+ * protocol, so this file stays as ignorant as the rest of the pulse layer.
+ *
  * WHY _frame() BLOCKS. The caller's next move after transmitting is to flip the
  * CC1101 back to RX and give the pin back to rf_capture. Doing that while the
  * peripheral still has symbols queued truncates the tail of the transmission —
@@ -286,6 +306,9 @@ esp_err_t rf_transmit_frame(const rf_frame_t *frame, uint8_t repeats, uint32_t g
     size_t n_symbols;
     esp_err_t err;
     uint8_t n_reps = (repeats == 0) ? 1u : repeats;
+    uint32_t trailing_idle_us = 0;   /* idle the frame itself already ends with */
+    bool     frame_frames_itself = false;  /* that idle is the frame's own framing gap */
+    uint32_t pad_us;                 /* what still has to be appended to reach gap_us */
 
     if (frame == NULL || frame->count == 0 || frame->count > RF_FRAME_MAX_PULSES) {
         return ESP_ERR_INVALID_ARG;
@@ -296,10 +319,39 @@ esp_err_t rf_transmit_frame(const rf_frame_t *frame, uint8_t repeats, uint32_t g
     }
     tx_cfg.flags.eot_level = s_tx.idle_level;
 
-    /* Build the waveform once: one copy of the frame plus the trailing idle gap.
-     * The gap is included in every copy — including the last — so the radio is
-     * guaranteed to be quiet for gap_us before the caller switches it back to
-     * RX, and so a receiver counting repeats sees a uniform cadence. */
+    /* How much idle the frame already ends with, and whether that idle is the
+     * frame's OWN framing gap rather than a data pulse that happens to be last.
+     * Only a trailing pulse at the idle level counts at all: a frame ending on a
+     * HIGH (carrier on) provides no idle, so it gets the whole gap.
+     *
+     * The framing test is protocol-agnostic on purpose — it asks a question
+     * about the waveform, not about EV1527. A framing gap dwarfs every data
+     * pulse in its own frame (31x base against a 3x base long half, for
+     * EV1527); a trailing data pulse does not. Twice the longest other pulse is
+     * a wide, uncontroversial line between the two. */
+    {
+        uint16_t last = (uint16_t)(frame->count - 1u);
+        if (rf_frame_level_at(frame, last) == (s_tx.idle_level & 1u)) {
+            uint32_t longest_other = 0;
+            trailing_idle_us = frame->durations_us[last];
+            for (uint16_t i = 0; i < last; i++) {
+                if (frame->durations_us[i] > longest_other)
+                    longest_other = frame->durations_us[i];
+            }
+            frame_frames_itself = (trailing_idle_us >= 2u * longest_other);
+        }
+    }
+    /* A frame that frames itself defines its own period; stretching it to
+     * gap_us would put a gap on the wire that the source protocol never emits
+     * and that a receiver deriving the base width from the sync would misread.
+     * Everything else gets topped up to gap_us. */
+    pad_us = frame_frames_itself ? 0u
+           : (gap_us > trailing_idle_us) ? (gap_us - trailing_idle_us) : 0u;
+
+    /* Build the waveform once: one copy of the frame plus whatever idle is still
+     * missing from gap_us. The pad is included in every copy — including the
+     * last — so the radio is guaranteed to be quiet before the caller switches
+     * it back to RX, and so a receiver counting repeats sees a uniform cadence. */
     b.syms          = s_tx.syms;
     b.cap_entries   = RF_TX_MAX_ENTRIES;
     b.n_entries     = 0;
@@ -311,7 +363,7 @@ esp_err_t rf_transmit_frame(const rf_frame_t *frame, uint8_t repeats, uint32_t g
             return ESP_ERR_INVALID_SIZE;
         }
     }
-    if (gap_us > 0 && !rf_tx_put(&b, s_tx.idle_level, gap_us)) {
+    if (pad_us > 0 && !rf_tx_put(&b, s_tx.idle_level, pad_us)) {
         ESP_LOGE(TAG, "inter-frame gap does not fit in %u symbols",
                  (unsigned)RF_TX_MAX_SYMBOLS);
         return ESP_ERR_INVALID_SIZE;
@@ -337,8 +389,9 @@ esp_err_t rf_transmit_frame(const rf_frame_t *frame, uint8_t repeats, uint32_t g
     }
 
     ESP_LOGI(TAG, "sent %u pulses x%u (%" PRIu32 " us airtime each, %" PRIu32
-                  " us gap, %u symbols)",
+                  " us gap = %" PRIu32 " in-frame + %" PRIu32 " padded, %u symbols)",
              (unsigned)frame->count, n_reps, rf_frame_duration_us(frame),
-             gap_us, (unsigned)n_symbols);
+             trailing_idle_us + pad_us, trailing_idle_us, pad_us,
+             (unsigned)n_symbols);
     return ESP_OK;
 }

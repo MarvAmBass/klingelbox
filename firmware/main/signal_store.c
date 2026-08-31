@@ -316,6 +316,91 @@ static void erase_frame(uint16_t id)
 
 /* ---- init ---------------------------------------------------------------- */
 
+/*
+ * ONE-TIME REPAIR OF SYNTHESIZED EV1527 FRAMES WRITTEN BY THE OLD ENCODER
+ * (bench, 2026-08-31).
+ *
+ * rf_ev1527_build() used to emit its sync pair at the FRONT of the frame, which
+ * — once rf_transmit added its inter-frame gap behind it — put two long lows
+ * into every on-air period and stopped real receivers decoding the word at all
+ * (see the long note in rf_ev1527.c). The encoder is fixed, but a virtual signal
+ * is a FRAME ON FLASH, not a recipe: every one created before the fix still
+ * holds the broken waveform, and the user has no way to know that the cure is
+ * "delete it and make it again". Since we know exactly what those frames are —
+ * synthesized, EV1527, and re-derivable from the address and button we stored
+ * alongside them — rebuilding them at boot is strictly better than making
+ * someone re-do their setup.
+ *
+ * This is deliberately narrow. It touches nothing captured (a recording is
+ * evidence and is never rewritten), nothing undecoded, and nothing that does not
+ * still carry the old sync-first shape, so it is idempotent and a second boot is
+ * a no-op. Frames are only rewritten if the rebuild succeeds; a failure leaves
+ * the old frame exactly where it was.
+ *
+ * Caller holds the lock.
+ */
+#define DB_EV1527_SYNTH_PULSES 50u   /* 24 bit-pairs + the 2-pulse sync */
+
+/* Defined further down with the rest of the persistence, but needed here: this
+ * repair has to run before anything else can observe a stale frame. */
+static esp_err_t load_frame_locked(uint16_t id, rf_frame_t *out);
+
+static void repair_synthesized_ev1527(void)
+{
+    /* ~1.6 KB of buffers: static, because db_signals_init() runs on app_main's
+     * stack and this module allocates nothing at runtime by policy. */
+    static rf_frame_t   frame;
+    static rf_norm_t    norm;
+    static rf_decoded_t dec;
+    int repaired = 0;
+
+    for (int i = 0; i < s_count; i++) {
+        db_signal_meta_t *m = &s_meta[i];
+
+        if (m->origin != DB_ORIGIN_SYNTHESIZED || !m->decoded_valid)
+            continue;
+        if (strncmp(m->protocol, "ev1527", RF_PROTOCOL_NAME_MAX) != 0)
+            continue;
+        if (load_frame_locked(m->id, &frame) != ESP_OK)
+            continue;
+        if (frame.count != DB_EV1527_SYNTH_PULSES || frame.first_level != 1)
+            continue;
+        /* The tell: pulse 0 is the one-base sync high and pulse 1 the 31x sync
+         * low. In a repaired frame those two are a bit pair, so their ratio is
+         * 3 or 1/3 — nowhere near the 8x this asks for. */
+        if (frame.durations_us[0] == 0 ||
+            frame.durations_us[1] < 8u * (uint32_t)frame.durations_us[0])
+            continue;
+
+        if (!rf_ev1527_build(m->decoded_id, m->decoded_button, m->base_us, &frame))
+            continue;
+        if (save_frame(m->id, &frame) != ESP_OK)
+            continue;
+
+        /* The durations moved, so the fingerprint moved with them. Re-derive it
+         * from the frame the same way the capture path would, rather than
+         * patching fields by hand. */
+        rf_normalize(&frame, &norm);
+        rf_decode(&frame, &norm, &dec);
+        m->fingerprint = rf_fingerprint(&frame, &norm);
+        m->base_us     = norm.base_us;
+        m->confidence  = norm.confidence;
+        m->pulse_count = frame.count;
+        repaired++;
+
+        ESP_LOGW(TAG, "rebuilt virtual signal %u '%s' (EV1527 id=0x%05lX btn=0x%X): "
+                      "its sync gap was at the wrong end of the frame",
+                 (unsigned)m->id, m->name,
+                 (unsigned long)m->decoded_id, m->decoded_button);
+    }
+
+    if (repaired > 0 && save_index() == ESP_OK)
+        /* DB_EVENT_TEXT_MAX is tight — say the actionable thing and stop. */
+        db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                       "Rebuilt %d virtual signal(s): their sync gap was at the "
+                       "wrong end", repaired);
+}
+
 esp_err_t db_signals_init(void)
 {
     if (!s_lock)
@@ -327,6 +412,7 @@ esp_err_t db_signals_init(void)
 
     lock();
     esp_err_t err = load_index();
+    repair_synthesized_ev1527();
     s_ready = true;
     int n = s_count;
     unlock();
@@ -349,26 +435,19 @@ const db_signal_meta_t *db_signals_get(uint16_t id)
     return find_meta(id);
 }
 
-esp_err_t db_signals_load_frame(uint16_t id, rf_frame_t *out)
+/* Caller holds the lock. */
+static esp_err_t load_frame_locked(uint16_t id, rf_frame_t *out)
 {
-    if (!out)
-        return ESP_ERR_INVALID_ARG;
-
-    lock();
-    if (!find_meta(id)) {
-        unlock();
+    if (!find_meta(id))
         return ESP_ERR_NOT_FOUND;
-    }
 
     char key[16];
     frame_key(key, sizeof(key), id);
 
     nvs_handle_t h;
     esp_err_t err = nvs_open(DB_SIG_NS, NVS_READONLY, &h);
-    if (err != ESP_OK) {
-        unlock();
+    if (err != ESP_OK)
         return err;
-    }
 
     size_t len = sizeof(s_blob);
     err = nvs_get_blob(h, key, s_blob, &len);
@@ -393,9 +472,19 @@ esp_err_t db_signals_load_frame(uint16_t id, rf_frame_t *out)
         err = ESP_ERR_INVALID_SIZE;
     }
 
-    unlock();
     if (err != ESP_OK)
         ESP_LOGE(TAG, "load frame %u: %s", (unsigned)id, esp_err_to_name(err));
+    return err;
+}
+
+esp_err_t db_signals_load_frame(uint16_t id, rf_frame_t *out)
+{
+    if (!out)
+        return ESP_ERR_INVALID_ARG;
+
+    lock();
+    esp_err_t err = load_frame_locked(id, out);
+    unlock();
     return err;
 }
 
@@ -918,7 +1007,10 @@ esp_err_t db_signals_learn_accept(const char *name, uint16_t *id_out)
 
 /* ---- virtual signals ----------------------------------------------------- */
 
-/* Caller holds the lock. True if some stored signal already owns this address. */
+/* Caller holds the lock. True if some stored signal already owns this address,
+ * whatever button nibble it carries. Used ONLY when drawing a random address:
+ * "brand new, nothing on this box uses it" is the whole promise of that draw, so
+ * there the bar is the address and not the full code. */
 static bool address_taken(uint32_t id20)
 {
     for (int i = 0; i < s_count; i++) {
@@ -930,8 +1022,37 @@ static bool address_taken(uint32_t id20)
     return false;
 }
 
+/* Caller holds the lock. The stored signal carrying this exact identity, if any.
+ * Same key as match_decoded() — see the header for why that is the right bar. */
+static db_signal_meta_t *find_decoded(const char *protocol, uint32_t id, uint8_t button)
+{
+    for (int i = 0; i < s_count; i++) {
+        db_signal_meta_t *m = &s_meta[i];
+        if (!m->decoded_valid)
+            continue;
+        if (m->decoded_id != id || m->decoded_button != button)
+            continue;
+        if (strncmp(m->protocol, protocol, RF_PROTOCOL_NAME_MAX) != 0)
+            continue;
+        return m;
+    }
+    return NULL;
+}
+
+const db_signal_meta_t *db_signals_find_decoded(const char *protocol,
+                                                uint32_t id, uint8_t button)
+{
+    if (!protocol)
+        return NULL;
+    lock();
+    const db_signal_meta_t *m = find_decoded(protocol, id, button);
+    unlock();
+    return m;
+}
+
 esp_err_t db_signals_create_virtual(const char *name, uint32_t id20, uint8_t button4,
-                                    uint16_t base_us, uint16_t *id_out)
+                                    uint16_t base_us, bool allow_duplicate,
+                                    uint16_t *id_out)
 {
     id20 &= 0x000FFFFFu;
     button4 &= 0x0Fu;
@@ -955,13 +1076,20 @@ esp_err_t db_signals_create_virtual(const char *name, uint32_t id20, uint8_t but
             ESP_LOGE(TAG, "could not draw a free EV1527 address");
             return ESP_ERR_NOT_FOUND;
         }
-    } else {
+    } else if (!allow_duplicate) {
+        /* Refuse only what the MATCHER cannot tell apart: the same protocol,
+         * address AND button. Refusing the address alone (which this used to do)
+         * banned the single most ordinary thing an EV1527 user has — a
+         * multi-button remote, four buttons on one factory-burned address — and
+         * it is also what stopped the reporter re-creating a code they had
+         * captured. Neither is a hazard; an ambiguous match is. */
         lock();
-        bool taken = address_taken(id20);
+        const db_signal_meta_t *clash = find_decoded("ev1527", id20, button4);
+        uint16_t clash_id = clash ? clash->id : 0;
         unlock();
-        if (taken) {
-            ESP_LOGE(TAG, "EV1527 address 0x%05lX is already stored",
-                     (unsigned long)id20);
+        if (clash_id != 0) {
+            ESP_LOGW(TAG, "EV1527 id=0x%05lX btn=0x%X is already signal %u",
+                     (unsigned long)id20, button4, (unsigned)clash_id);
             return ESP_ERR_INVALID_STATE;   /* the API maps this to 409 */
         }
     }

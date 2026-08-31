@@ -13,11 +13,16 @@
   Klingelbox web UI — mobile-first shell.
   The product name is German; the interface is English on purpose.
 
+  THREE destinations, and the first one is the product: the node graph. There is
+  no separate Signals or Learn screen — a signal is learned, created, inspected
+  and deleted from inside the node that uses it, so the graph is the only place
+  wiring happens.
+
   The markup here is only the frame: header, the two navigations (a bottom bar
   on phones, a header tab strip from 720 px up) and one empty <section> per
   screen. Everything inside the sections is built by app.js, because every
   screen's content depends on what the box actually reports — a node graph, a
-  signal store, a diagnostics table — and because a feature whose endpoint
+  live event feed, a diagnostics table — and because a feature whose endpoint
   answers 404/503 must vanish rather than sit there as dead HTML.
 
   Both navigations are always in the DOM and select the same panes; CSS decides
@@ -34,9 +39,6 @@
   <!-- Wide-screen tab strip. Hidden below 720 px, where .bottomnav takes over. -->
   <nav class="tabs" role="tablist" aria-label="Sections">
     <button class="tab active" type="button" data-tab="dashboard" role="tab" aria-selected="true">Dashboard</button>
-    <button class="tab" type="button" data-tab="signals" role="tab" aria-selected="false">Signals</button>
-    <button class="tab" type="button" data-tab="learn" role="tab" aria-selected="false">Learn</button>
-    <button class="tab" type="button" data-tab="automations" role="tab" aria-selected="false">Automations</button>
     <button class="tab" type="button" data-tab="settings" role="tab" aria-selected="false">Settings</button>
     <button class="tab" type="button" data-tab="diagnostics" role="tab" aria-selected="false">Diagnostics</button>
   </nav>
@@ -52,28 +54,21 @@
        .recovery to <body>, when /api/system reports wifi_mode == "recovery". -->
   <section id="tab-recovery" class="tabpane" role="tabpanel" aria-label="Wi-Fi setup"></section>
 
+  <!-- The Dashboard IS the node graph: view switch, the graph, the live
+       activity feed and the recipes, in that order. -->
   <section id="tab-dashboard"   class="tabpane active" role="tabpanel" aria-label="Dashboard"></section>
-  <section id="tab-signals"     class="tabpane" role="tabpanel" aria-label="Signals"></section>
-  <section id="tab-learn"       class="tabpane" role="tabpanel" aria-label="Learn"></section>
-  <section id="tab-automations" class="tabpane" role="tabpanel" aria-label="Automations"></section>
   <section id="tab-settings"    class="tabpane" role="tabpanel" aria-label="Settings"></section>
   <section id="tab-diagnostics" class="tabpane" role="tabpanel" aria-label="Diagnostics"></section>
 
   <footer class="foot">Klingelbox &mdash; <i>Die Klingel, lokal und ohne Cloud.</i><span id="foot-ver"></span></footer>
 </main>
 
-<!-- Phone navigation: fixed to the bottom, in thumb reach, 6 targets of
-     56x60 px at 360 px wide. Scrolls horizontally as a safety net for very
-     narrow viewports or very large system text. -->
+<!-- Phone navigation: fixed to the bottom, in thumb reach. Three targets share
+     the full width at 360 px, so each is 120x56 px — far past the 44 px floor.
+     Still an overflow-x scroller as a safety net for very large system text. -->
 <nav class="bottomnav" role="tablist" aria-label="Sections">
   <button class="navbtn active" type="button" data-tab="dashboard" role="tab" aria-selected="true">
-    <span class="ico" aria-hidden="true">&#127968;</span><span class="lbl">Home</span></button>
-  <button class="navbtn" type="button" data-tab="signals" role="tab" aria-selected="false">
-    <span class="ico" aria-hidden="true">&#128246;</span><span class="lbl">Signals</span></button>
-  <button class="navbtn" type="button" data-tab="learn" role="tab" aria-selected="false">
-    <span class="ico" aria-hidden="true">&#10133;</span><span class="lbl">Learn</span></button>
-  <button class="navbtn" type="button" data-tab="automations" role="tab" aria-selected="false">
-    <span class="ico" aria-hidden="true">&#128256;</span><span class="lbl">Flows</span></button>
+    <span class="ico" aria-hidden="true">&#128256;</span><span class="lbl">Dashboard</span></button>
   <button class="navbtn" type="button" data-tab="settings" role="tab" aria-selected="false">
     <span class="ico" aria-hidden="true">&#9881;</span><span class="lbl">Settings</span></button>
   <button class="navbtn" type="button" data-tab="diagnostics" role="tab" aria-selected="false">

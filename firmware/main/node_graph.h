@@ -1,6 +1,11 @@
 /*
  * node_graph.h - The routing engine: sources -> logic -> sinks.
  *
+ * ...with one node type that is deliberately both ends at once. A 433 MHz
+ * SIGNAL can be received or sent, so DB_NODE_SIGNAL has an input (transmit it)
+ * and an output (it was heard). Everything else in this file is still strictly
+ * left-to-right.
+ *
  * This is what turns "a button was pressed" into "these chimes ring". Users
  * think in terms of wiring things together — this button rings that chime, these
  * three buttons all ring the upstairs chime, don't ring at night — so the
@@ -55,20 +60,56 @@ extern "C" {
 /* Bounds the blast radius of a mis-wired graph. */
 #define DB_GRAPH_MAX_DEPTH 8
 
+/*
+ * THE ENUM VALUES ARE THE ON-FLASH FORMAT. A node blob stores `type` as a raw
+ * uint8_t, so a slot number is a persisted fact, not an implementation detail.
+ * Never renumber an existing entry; append, or retire a slot and leave the hole.
+ * node_graph.c's load path migrates old blobs by slot number, and the version in
+ * the blob header is what tells it which numbering it is looking at.
+ */
 typedef enum {
+    /*
+     * DB_NODE_SIGNAL — one stored 433 MHz signal, with BOTH ports.
+     *
+     *          in o-[ Front door / EV1527 0xA685A ]-o out
+     *
+     *   in  -> transmit this signal (repeats / gap_us apply)
+     *   out -> fires when this signal is heard on air
+     *
+     * A signal is not inherently an input or an output; it is a thing that can
+     * be received or sent. This node type says so. It replaces the old
+     * source.button (input only) and sink.transmit (output only), whose split
+     * made "ring my chime when this virtual trigger fires" wireable but
+     * "recognize the code my own box sends" not.
+     *
+     * It sits at slot 0, where source.button was, so every stored button node
+     * migrates by doing nothing at all.
+     */
+    DB_NODE_SIGNAL = 0,
+
     /* ---- sources: things that start a chain ---- */
-    DB_NODE_SOURCE_BUTTON = 0, /* a stored RF signal was recognized          */
-    DB_NODE_SOURCE_GPIO,       /* a wired button on a GPIO (see below)       */
+    DB_NODE_SOURCE_GPIO = 1,   /* a wired button on a GPIO (see below)       */
     DB_NODE_SOURCE_VIRTUAL,    /* fired from the UI / REST / an MQTT topic   */
     DB_NODE_SOURCE_ANY_RF,     /* WILDCARD: every received burst, incl. unknown */
 
     /* ---- logic: things that shape a chain ---- */
     DB_NODE_LOGIC_GROUP,       /* any-of / all-of within a time window       */
     DB_NODE_LOGIC_THROTTLE,    /* debounce / rate limit                      */
+    /* Emit now, then again N-1 times, `window_ms` apart. This is the node the
+     * user asked for as a "loop"; it is called REPEAT because "loop" already
+     * means something else and worse in this engine — a cycle in the wiring,
+     * which traverse() warns about and refuses to walk. */
+    DB_NODE_LOGIC_REPEAT,      /* auto-repeat: ring again, N times, spaced    */
 
     /* ---- sinks: things that act ---- */
-    DB_NODE_SINK_TRANSMIT,     /* transmit a stored signal                   */
-    DB_NODE_SINK_MQTT,         /* publish an event                           */
+    /* RETIRED, NEVER REUSED. Slot 7 was sink.transmit; its behaviour is now the
+     * input side of DB_NODE_SIGNAL. The hole is deliberate: sink.mqtt keeps
+     * slot 8 so that only ONE slot has to be remapped when a v1 blob is loaded,
+     * and a stray 7 arriving from anywhere else must never silently become a
+     * different node type. There is no wire name for it, so the REST API cannot
+     * produce one. */
+    DB_NODE__RETIRED_TRANSMIT = 7,
+    DB_NODE_SINK_MQTT = 8,     /* publish an event                           */
 
     DB_NODE__COUNT
 } db_node_type_t;
@@ -81,7 +122,7 @@ typedef struct {
     bool     enabled;
     char     name[DB_NODE_NAME_MAX];
 
-    /* SOURCE_BUTTON / SINK_TRANSMIT: which stored signal. */
+    /* DB_NODE_SIGNAL: which stored signal this node both listens for and sends. */
     uint16_t signal_id;
 
     /* SOURCE_GPIO — an OPTIONAL wired button, fully configured from the web UI.
@@ -98,12 +139,19 @@ typedef struct {
     bool     gpio_active_low;
     uint16_t gpio_debounce_ms;
 
-    /* SINK_TRANSMIT: how the frame goes out. Real receivers usually require
-     * several consistent copies before acting, so repeats is not cosmetic. */
+    /* DB_NODE_SIGNAL: how the frame goes out. Real receivers usually require
+     * several consistent copies before acting, so repeats is not cosmetic.
+     *
+     * LOGIC_REPEAT borrows `repeats` for a different but honestly named job: how
+     * many times in TOTAL it emits, counting the immediate one. Reusing the
+     * field rather than adding a second count keeps the flat struct (and with it
+     * the NVS layout and the REST mapping) exactly as it was — the two types are
+     * never both interpreting it at once. */
     uint8_t  repeats;
     uint32_t gap_us;
 
-    /* LOGIC_GROUP / LOGIC_THROTTLE: the time window, in MILLISECONDS internally.
+    /* LOGIC_GROUP / LOGIC_THROTTLE / LOGIC_REPEAT: the time window, in
+     * MILLISECONDS internally.
      * The REST API and the UI both speak SECONDS (`window_s`), because that is
      * the unit people actually reason in for a doorbell cooldown — "ring at most
      * once every 10 seconds". Milliseconds are kept in the struct only so a
@@ -117,7 +165,22 @@ typedef struct {
      *
      * It is source-agnostic: an RF remote, a wired GPIO button and an MQTT
      * trigger are all limited identically, because it limits whatever is linked
-     * into it rather than inspecting where the event came from. */
+     * into it rather than inspecting where the event came from.
+     *
+     * LOGIC_REPEAT uses the window as the INTERVAL between emissions. It passes
+     * the event on immediately and then releases it again `repeats - 1` more
+     * times, one window apart, each one UNCHANGED — same trigger, same label,
+     * same signal — down its own outgoing links. It drops nothing and it never
+     * blocks; it places the same action repeatedly in time.
+     *
+     *     button --> repeat (3 times, 5 s) --> transmit
+     *
+     * rings at 0 s, 5 s and 10 s from a single press. `repeats` of 1 is a legal
+     * pass-through that does nothing at all.
+     *
+     * A NEW event arriving while a repeat is still running RESTARTS it rather
+     * than stacking a second run on top: five impatient presses must not leave
+     * fifteen queued rings. */
     uint32_t window_ms;
     uint8_t  group_mode;                /* db_group_mode_t */
 
@@ -192,14 +255,18 @@ void db_graph_set_mqtt_handler(db_sink_fn fn, void *ctx);
 
 /*
  * An RF burst arrived. Fires:
- *   - every enabled SOURCE_BUTTON node bound to trig->signal_id (when non-zero), and
+ *   - every enabled DB_NODE_SIGNAL node bound to trig->signal_id (when non-zero), and
  *   - every enabled SOURCE_ANY_RF node, ALWAYS — including for bursts that match
  *     no stored signal.
+ *
+ * A signal node reached this way is acting as an INPUT: its output side fires
+ * and the walk continues into its children. It does NOT transmit — see
+ * node_act() in node_graph.c for why a heard code must not re-send itself.
  *
  * SOURCE_ANY_RF is the "proxy everything to MQTT" primitive: wire one to a
  * sink.mqtt and Home Assistant sees every press on the band, registered or not.
  * Because it also fires for recognized signals, a burst can legitimately drive
- * both a specific button chain and the wildcard chain in one traversal — that is
+ * both a specific signal chain and the wildcard chain in one traversal — that is
  * intended, not double-firing.
  *
  * Safe to call from the RF event path. */

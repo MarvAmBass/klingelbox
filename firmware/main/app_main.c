@@ -26,9 +26,10 @@
  * The RF listener callback runs on the capture task *while that task holds the
  * radio mutex*. Doing real work there would be wrong in two separate ways:
  *
- *   1. DEADLOCK. A node graph traversal can reach a sink.transmit, which calls
- *      rf_service_transmit(), which takes the same non-recursive mutex the
- *      caller is already holding. The radio would wedge permanently.
+ *   1. DEADLOCK. A node graph traversal can reach the input of a signal node,
+ *      which transmits by calling rf_service_transmit(), which takes the same
+ *      non-recursive mutex the caller is already holding. The radio would wedge
+ *      permanently.
  *   2. LATENCY. Even without a transmit, publishing MQTT or writing NVS while
  *      holding the radio lock stalls capture — precisely when a burst is still
  *      arriving and we most want to be listening.
@@ -77,9 +78,9 @@ static db_config_t s_cfg;
 #define DISPATCH_QUEUE_DEPTH 3
 static QueueHandle_t s_dispatch_q;
 
-/* Transmit requests raised by sink.transmit nodes. Kept separate from the
- * dispatch queue so that a graph which transmits cannot stall the traversal
- * that produced it. */
+/* Transmit requests raised by the input side of a signal node. Kept separate
+ * from the dispatch queue so that a graph which transmits cannot stall the
+ * traversal that produced it. */
 typedef struct {
     uint16_t signal_id;
     uint8_t  repeats;
@@ -104,13 +105,24 @@ static void tx_task(void *arg)
             continue;
         }
         esp_err_t err = rf_service_transmit(&frame, req.repeats, req.gap_us);
-        db_events_push(DB_EV_TRANSMIT, req.signal_id, req.node_id, 0, req.repeats,
-                       err == ESP_OK ? "sent" : esp_err_to_name(err));
+        /* The activity feed is read by users, not by us: db_err_text() rather
+         * than the raw constant (see db_diag.h). The constant is in the log. */
+        if (err == ESP_OK) {
+            db_events_push(DB_EV_TRANSMIT, req.signal_id, req.node_id, 0,
+                           req.repeats, "sent");
+        } else {
+            ESP_LOGW(TAG, "transmit of signal %u failed: %s",
+                     req.signal_id, esp_err_to_name(err));
+            db_events_push(DB_EV_TRANSMIT, req.signal_id, req.node_id, 0,
+                           req.repeats, "not sent — %s", db_err_text(err));
+        }
     }
 }
 
-/* sink.transmit handler. Runs on the dispatch task; still queues rather than
- * transmitting inline, so one slow send cannot delay the rest of a fan-out. */
+/* Transmit handler: called for a signal node reached over an inbound link (its
+ * input side), never for one an RF match started. Runs on the dispatch task;
+ * still queues rather than transmitting inline, so one slow send cannot delay
+ * the rest of a fan-out. */
 static void transmit_sink(const db_node_t *node, const db_trigger_t *trig, void *ctx)
 {
     (void)trig;
@@ -181,8 +193,8 @@ static void dispatch_task(void *arg)
                                "candidate: %s", trig.label);
         }
 
-        /* Fires matching source.button nodes AND every source.any_rf node —
-         * including for unrecognized bursts (sid == 0). */
+        /* Fires the matching signal node's OUTPUT side AND every source.any_rf
+         * node — including for unrecognized bursts (sid == 0). */
         db_graph_on_rf(&trig);
     }
 }

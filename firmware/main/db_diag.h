@@ -25,6 +25,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "esp_err.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -62,6 +64,25 @@ const char *db_diag_help(db_diag_t state);
 
 /* Record an occurrence (and log it at an appropriate level). `fmt` may be NULL. */
 void db_diag_report(db_diag_t state, const char *fmt, ...);
+
+/*
+ * A HUMAN clause for an esp_err_t, for anything that ends up in front of a user.
+ *
+ * It lives here, next to db_diag_help(), because it answers the same question:
+ * what does this failure mean to somebody who is not holding the datasheet.
+ * "could not create the virtual signal: ESP_ERR_INVALID_STATE" is a real thing
+ * this firmware once said to a real user, and it is worse than saying nothing —
+ * it reads as a crash, it is unsearchable outside the ESP-IDF sources, and it
+ * gives no hint about what to do next. An esp_err_t is a contract between two C
+ * files; it is never UI. The raw name still belongs in the LOG, where it is
+ * exactly the right thing.
+ *
+ * The result is a lower-case clause with no trailing stop, so it can be pasted
+ * after a caller's own phrasing: "could not delete the signal — it no longer
+ * exists". A caller that knows something more specific than the code must say
+ * THAT instead; this is the floor, not the target.
+ */
+const char *db_err_text(esp_err_t err);
 
 /* ---- readback, for GET /api/diagnostics ---- */
 typedef struct {

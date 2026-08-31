@@ -123,12 +123,33 @@ bool db_signals_learn_candidate_info(db_signal_meta_t *meta,
 /* Commit the pending candidate as a stored signal, and disarm. */
 esp_err_t db_signals_learn_accept(const char *name, uint16_t *id_out);
 
+/* Find the stored signal that carries a given decoded identity, or NULL.
+ *
+ * The key is protocol + address + button — deliberately the SAME key
+ * db_signals_match() uses, because "would an incoming burst be ambiguous
+ * between these two signals?" is the only question a duplicate check is
+ * entitled to ask. Two entries sharing an address but not a button are not
+ * ambiguous at all: that is simply a multi-button remote, and the matcher tells
+ * them apart perfectly. */
+const db_signal_meta_t *db_signals_find_decoded(const char *protocol,
+                                                uint32_t id, uint8_t button);
+
 /* ---- virtual signal creation ----
- * Generates a fresh EV1527 address and stores it. This is how a user pairs one
- * of THEIR receivers to this box: create a virtual signal, put the receiver into
- * learning mode, and transmit it. If id20 is 0 a random address is drawn. */
+ * Generates an EV1527 word and stores it. This is how a user pairs one of THEIR
+ * receivers to this box: create a virtual signal, put the receiver into learning
+ * mode, and transmit it. If id20 is 0 a random address is drawn.
+ *
+ * `allow_duplicate` false refuses an address+button that a stored signal already
+ * carries, returning ESP_ERR_INVALID_STATE — such a pair makes db_signals_match()
+ * ambiguous, and whichever entry sits earlier in the store wins, silently. True
+ * creates it anyway, which is a legitimate thing to want: re-creating a captured
+ * code as a synthesized one is how you check that the box can *generate* a code
+ * it can only currently *replay*. Callers that expose this to a human should
+ * look the conflict up with db_signals_find_decoded() first so they can name it.
+ */
 esp_err_t db_signals_create_virtual(const char *name, uint32_t id20, uint8_t button4,
-                                    uint16_t base_us, uint16_t *id_out);
+                                    uint16_t base_us, bool allow_duplicate,
+                                    uint16_t *id_out);
 
 #ifdef __cplusplus
 }
