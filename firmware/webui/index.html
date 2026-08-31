@@ -49,20 +49,21 @@
     <button class="tab" type="button" data-tab="handbook" role="tab" aria-selected="false">Handbook</button>
   </nav>
 
+
+  <!-- Box status: a right-aligned block INSIDE the header row, two lines tall.
+       Placed before .topbar-right so it sits to the LEFT of the theme toggle —
+       the toggle and the badge stay the rightmost controls.
+
+       app.js builds these chips ONCE and thereafter only assigns nodeValue: the
+       uptime ticks at 1 Hz, and a rebuilt row would repaint the header every
+       second. -->
+  <div id="status-chips" class="statuschips" aria-label="Box status"></div>
+
   <div class="topbar-right">
     <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Theme">&#128421;</button>
     <div id="status-badge" class="status-badge" title="Box status">&hellip;</div>
   </div>
 
-  <!-- Box status, right-aligned on its own header line and allowed to wrap to
-       two. It used to sit inside the Dashboard's Activity panel, which meant
-       "is the radio even listening" was only answerable on one screen; it is a
-       fact about the box, so it belongs where the box's name is.
-
-       app.js builds these six chips ONCE and thereafter only assigns
-       textContent — the uptime ticks at 1 Hz and a rebuilt row would repaint
-       the header every second. -->
-  <div id="status-chips" class="statuschips" aria-label="Box status"></div>
 </header>
 
 <main>

@@ -38,7 +38,7 @@
  * diagnostics/register-dump path cannot accidentally reset the radio.
  *
  * WHY THE REGISTER VALUES ARE COMPUTED, NOT TABULATED.
- * PLAN.md §3.5 requires frequency, modulation, data rate and bandwidth to be
+ * The design requires frequency, modulation, data rate and bandwidth to be
  * configuration rather than constants. cc1101_configure() therefore derives
  * FREQ2/1/0, MDMCFG4/3/2 and the PATABLE entry from cc1101_radio_cfg_t using
  * the datasheet formulas. Only the registers that genuinely have no free
@@ -956,7 +956,7 @@ esp_err_t cc1101_carrier_sense(cc1101_handle_t dev, bool *asserted)
 
     /* PKTSTATUS bit 6 = CS (carrier sense), driven by the AGC thresholds set in
      * AGCCTRL1. This is the evidence that separates "RF energy present but
-     * nothing decodes" from "the band is silent" (PLAN.md §7). */
+     * nothing decodes" from "the band is silent". */
     *asserted = (status & 0x40u) != 0u;
     return ESP_OK;
 }

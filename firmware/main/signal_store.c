@@ -843,7 +843,7 @@ bool db_signals_learn_offer(const rf_event_t *ev)
         return false;
     }
 
-    /* Admission criteria, both required — see PLAN.md §6.2 and §13. Repeats is
+    /* Admission criteria, both required. Repeats is
      * the strongest filter (a real remote always sends several copies), and the
      * confidence floor sits in the empty gap between the measured noise and
      * signal populations. */
@@ -969,7 +969,7 @@ esp_err_t db_signals_learn_accept(const char *name, uint16_t *id_out)
 
     esp_err_t err = store(&m, &s_learn.cand_frame, id_out);
     if (err == ESP_OK) {
-        /* Learn mode cancels on the first accepted registration (PLAN.md §6.2):
+        /* Learn mode cancels on the first accepted registration:
          * leaving it armed would invite the next stray burst to overwrite the
          * candidate the user just confirmed. */
         s_learn.armed         = false;

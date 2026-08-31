@@ -158,6 +158,27 @@ captures/minute to **zero**, with real presses unaffected.
 
 ---
 
+## Security
+
+**Do not expose this box to the internet.** The REST API has no authentication —
+by design, because the security boundary is your network. On a trusted LAN that
+is a reasonable trade; port-forwarded, it is a device-takeover primitive.
+
+Anyone who can reach `:80` can transmit any signal you have learned, rewrite the
+node graph, overwrite your Wi-Fi and MQTT credentials, and — via
+`POST /api/ota/upload` — **flash arbitrary firmware onto the device**.
+
+Reach it from outside over a VPN into your own network, never a port forward.
+
+Related, and deliberate:
+* The **recovery portal is open** (no passphrase) by default, so a box that has
+  lost its Wi-Fi can always be rescued. Anyone in RF range can join it and
+  reconfigure the device. Set a recovery password if that matters where you live.
+* The **operational AP passphrase is generated from the hardware RNG at first
+  boot**, not baked into the image, so two boxes never ship with the same key.
+* Stored passwords are **write-only** over the API: they can be set, never read
+  back.
+
 ## Documentation
 
 * [`docs/API.md`](docs/API.md) — the complete REST surface.

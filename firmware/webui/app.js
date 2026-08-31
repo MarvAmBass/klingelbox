@@ -2055,9 +2055,16 @@ function buildStatusChips() {
     return c;
   }
   /* sc-t2 / sc-t3 are the tiers CSS drops as the header gets tight. */
-  hdrChips.radio = chip(lineA, "sc-radio");
-  hdrChips.part  = chip(lineA, "mono sc-t3");
+  /* Grouped by subject, and the ticking values stay on line B.
+     Line A is the NETWORK side (which Wi-Fi, which broker); line B is the RADIO
+     side (which chip, which frequency, how noisy) with uptime last. Both chips
+     whose text changes every second — the noise floor and the uptime — are on
+     line B and min-width locked, so that line can never change width; line A is
+     set by the SSID and does not move while you look at it. */
   hdrChips.wifi  = chip(lineA, "sc-t2");
+  hdrChips.mqtt  = chip(lineA, "sc-t2");
+  hdrChips.radio = chip(lineA, "sc-radio");
+  hdrChips.part  = chip(lineB, "mono sc-t3");
   hdrChips.freq  = chip(lineB, "mono sc-t3");
   hdrChips.floor = chip(lineB, "mono sc-floor sc-t2");
   hdrChips.up    = chip(lineB, "mono sc-up");
@@ -2092,6 +2099,7 @@ function renderStatusChips(err) {
     setHdrChip(hdrChips.freq, null);
     setHdrChip(hdrChips.floor, null);
     setHdrChip(hdrChips.wifi, null);
+    setHdrChip(hdrChips.mqtt, null);
     setHdrChip(hdrChips.up, null);
     return;
   }
@@ -2112,6 +2120,16 @@ function renderStatusChips(err) {
   setHdrChip(hdrChips.wifi,
     sys.sta_connected ? ("Wi-Fi " + (sys.sta_ssid || "?")) : "AP only",
     sys.sta_connected ? "ok" : "warn");
+
+  /* Only when MQTT is switched on. A chip reading "MQTT off" on the majority of
+     boxes that never enable it is noise, not status — and this row has to earn
+     every pixel. Enabled but not connected is worth shouting about, though:
+     that is the state where Home Assistant has silently stopped hearing presses.
+     A firmware without the field at all (older build) also shows nothing. */
+  var mq = sys.mqtt;
+  if (!mq || !mq.enabled) setHdrChip(hdrChips.mqtt, null);
+  else setHdrChip(hdrChips.mqtt, mq.connected ? "MQTT" : "MQTT offline",
+                  mq.connected ? "ok" : "bad");
 
   tickUptimeChip();
 }

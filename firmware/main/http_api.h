@@ -16,7 +16,7 @@
  *
  * The server is started AFTER Wi-Fi (it binds the LWIP stack) and BEFORE
  * db_ota_mark_valid(), so an image that cannot serve its own UI never confirms
- * itself as good and gets rolled back on the next reset (PLAN.md §12).
+ * itself as good and gets rolled back on the next reset.
  */
 #ifndef DB_HTTP_API_H
 #define DB_HTTP_API_H

@@ -663,18 +663,21 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 .canvas { display: block; touch-action: none; background: var(--sunk); }
 /* Zoom / fit controls above the canvas. */
 /* ------------------------------------------------------------ graph toolbar --
-   ONE row: ➕ Add node hard left, the Map|List switch and the canvas zoom
-   controls hard right. `margin-left: auto` on the first right-hand item does
-   the pushing, so removing the zoom controls (List view, or below 900 px where
-   there is no canvas at all) closes up with no gap and without moving the view
-   switch — the switch is anchored to the right edge, not to the zoom bar.
+   ONE row: ➕ Add node and the Map|List switch TOGETHER on the left, the canvas
+   zoom controls pushed right. The switch belongs beside the button because both
+   are things you do to the graph; floating it to the far edge separated the two
+   controls you use most and left a lake of empty space between them.
 
-   Below 900 px both right-hand groups are gone and the row is just the one
+   `margin-left: auto` therefore lives on the zoom slot, not on the switch. When
+   the slot is empty (List view, or below 900 px where there is no canvas) it is
+   display:none and the left group simply stays left — no gap, nothing moves.
+
+   Below 900 px the switch and zoom are both gone and the row is just the one
    primary button, which stretches to full width there so it reads as a
    deliberate primary action rather than a toolbar missing its contents. */
 .toolbar { gap: .5rem; align-items: center; }
-.toolbar > .btn.primary { flex: 1 1 auto; }
-.graph-viewswitch { margin-left: auto; }
+.toolbar > .btn.primary { flex: 1 1 auto; }   /* full width when alone (<900 px) */
+.zoomslot { margin-left: auto; }
 .zoomslot { display: flex; gap: .4rem; align-items: center; }
 .zoomslot:empty { display: none; }             /* no gap when there is no canvas */
 .zoomslot .btn.small { min-width: 2.4rem; padding: .35rem .6rem; min-height: var(--tap); }
@@ -1001,6 +1004,10 @@ body.recovery main { padding-bottom: calc(1.5rem + env(safe-area-inset-bottom));
 @media (min-width: 900px) {
   .statuschips { display: flex; }             /* back after the 720 px squeeze */
   .graph-viewswitch { display: flex; }        /* hidden below this width */
+  /* Once the switch is beside it, the button must stop stretching — otherwise it
+     eats the row and pushes the switch to the far edge, which is the layout this
+     replaced. */
+  .toolbar > .btn.primary { flex: 0 0 auto; }
   /* The toolbar now has right-hand contents, so the primary button stops
      stretching and sits at its natural width on the left. */
   .toolbar > .btn.primary { flex: 0 0 auto; }

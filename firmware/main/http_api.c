@@ -51,7 +51,7 @@
  * the secret for. This is the single rule most easily broken by a well-meant
  * "just add the field so the form can prefill" change: do not.
  *
- * DIFFERENCE FROM THE REFERENCE FIRMWARE (deliberate, PLAN.md §12): there is no
+ * DIFFERENCE FROM THE REFERENCE FIRMWARE (deliberate, the design notes): there is no
  * per-request origin gate. That box refused management over its softAP; this one
  * must be reachable identically on the softAP and the LAN, because the softAP is
  * frequently the only network a doorbell in a hallway ever sees.
@@ -352,6 +352,16 @@ static esp_err_t api_system_get(httpd_req_t *req)
      * string is a contract owned by wifi_mgr — never reworded here. */
     cJSON_AddStringToObject(root, "wifi_mode", db_wifi_mode_str());
 
+    /* MQTT was reachable only as a config field, so the UI could say whether the
+     * bridge was ENABLED but never whether it had actually connected — which is
+     * the half that matters when Home Assistant has gone quiet. */
+    {
+        cJSON *m = cJSON_AddObjectToObject(root, "mqtt");
+        cJSON_AddBoolToObject(m, "enabled", s_cfg->mqtt_enabled);
+        cJSON_AddBoolToObject(m, "connected", db_mqtt_connected());
+        cJSON_AddStringToObject(m, "host", s_cfg->mqtt_host);
+    }
+
     char ip[16];
     db_wifi_sta_ip(ip);
     cJSON_AddBoolToObject(root, "sta_connected", db_wifi_sta_connected());
@@ -451,7 +461,7 @@ static esp_err_t api_radio_get(httpd_req_t *req)
 }
 
 /* POST /api/radio — any subset of the GET shape; reconfigures the chip live and
- * persists, so the setting survives a reboot (PLAN.md §3.5: radio parameters are
+ * persists, so the setting survives a reboot (the design notes radio parameters are
  * configuration, never constants). */
 static esp_err_t api_radio_post(httpd_req_t *req)
 {
@@ -517,7 +527,7 @@ static esp_err_t api_radio_post(httpd_req_t *req)
 /* ------------------------------------------------------------------ diagnostics */
 
 /*
- * The hard requirement of PLAN.md §7: every failure mode is a distinct, named,
+ * The hard requirement of the design notes every failure mode is a distinct, named,
  * separately-reported state, so the UI can explain a fault instead of rendering
  * a dead page. Enumerating the enum (rather than hand-listing states here) means
  * a new diagnostic shows up in the API the moment db_diag.h gains it.
@@ -790,7 +800,7 @@ static esp_err_t api_signal_transmit(httpd_req_t *req, uint16_t id)
 
 /*
  * POST /api/signals/virtual — synthesize an EV1527 signal to pair one of the
- * user's OWN receivers to (PLAN.md §6.3). id20 == 0 draws a random address.
+ * user's OWN receivers to. id20 == 0 draws a random address.
  *
  * THE DUPLICATE RULE, AND WHY IT IS NOT A FLAT REFUSAL. Two stored signals with
  * the same protocol+address+button are genuinely ambiguous to db_signals_match()

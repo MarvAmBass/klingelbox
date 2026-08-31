@@ -10,7 +10,7 @@
  *   - recovery-portal settings (Tasmota-style config AP when nothing connects)
  *   - MQTT broker + Home Assistant discovery settings
  *   - the default OTA URL
- *   - the radio parameters (§3.5 of PLAN.md: frequency, modulation, data rate and
+ *   - the radio parameters (§3.5 of the design notes frequency, modulation, data rate and
  *     bandwidth are CONFIG, never constants sprinkled through the code) plus the
  *     transmit repeat policy
  *
@@ -100,7 +100,7 @@ typedef struct {
     /* ---- OTA ---- */
     char     ota_url[DB_STR_URL];        /* last/default update URL (optional) */
 
-    /* ---- radio (PLAN.md §3.5) ----
+    /* ---- radio ----
      * Stored as plain integers on purpose: db_config.h must not drag the CC1101
      * driver into every translation unit that reads config. radio_modulation
      * holds a cc1101_modulation_t value (0 = CC1101_MOD_ASK_OOK); rf_service

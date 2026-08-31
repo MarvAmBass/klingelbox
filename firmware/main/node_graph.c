@@ -1892,7 +1892,7 @@ void db_graph_node_defaults(db_node_t *node, db_node_type_t type)
 
     /* Transmit policy mirrors db_config's defaults: real receivers integrate
      * several copies of a frame before they act, so one replay is routinely
-     * ignored (PLAN.md §13, M4). */
+     * ignored. */
     node->repeats = 6;
     node->gap_us  = 8000;
 
