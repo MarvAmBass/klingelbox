@@ -1,0 +1,111 @@
+name: Pages
+
+# Publish the docs/ folder to GitHub Pages — the documentation site plus the
+# browser flasher at https://marvambass.github.io/klingelbox/flasher/.
+#
+# docs/ is a Jekyll site: docs/_config.yml pulls in just-the-docs as a
+# `remote_theme`, and the pages carry front matter. It therefore has to be BUILT,
+# not merely uploaded — uploading docs/ verbatim would publish index.md as raw
+# Markdown. actions/jekyll-build-pages@v1 is the official action that runs the same
+# github-pages gem environment (including jekyll-remote-theme) that the older
+# "deploy from a branch" mode used, so the rendered output is identical while the
+# deployment itself uses the modern Pages-from-Actions flow.
+#
+# The flasher is deliberately unaffected by all this: docs/flasher/index.html has no
+# front matter, so Jekyll copies it — along with flasher.js, lib/ and
+# firmware/<tag>/*.bin — through to _site untouched.
+#
+# The build job guards on docs/ existing, so this workflow is a harmless no-op until
+# the docs tree lands.
+#
+# ONE-TIME REPO SETUP: Settings -> Pages -> Source must be set to "GitHub Actions".
+# Leaving it on "Deploy from a branch" makes the deploy step fail with a 404 and lets
+# the branch-based builder publish instead, silently ignoring this workflow.
+#
+# Note the trigger is EVERY push to main, not a docs/** path filter: flasher-sync.yml
+# commits the mirrored firmware back into docs/flasher/firmware/ and that commit must
+# re-deploy the site, and a path filter is one refactor away from silently excluding it.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# deploy-pages authenticates via OIDC, hence id-token: write. contents stays
+# read-only — this workflow never writes to the repository.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment; don't cancel an in-progress one, since a
+# half-finished Pages deployment would leave the site in an undefined state.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build docs site (Jekyll)
+    runs-on: ubuntu-latest
+    outputs:
+      present: ${{ steps.detect.outputs.present }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect docs/
+        id: detect
+        run: |
+          if [ -d docs ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::docs/ not present yet — skipping Pages build."
+          fi
+
+      # Sets the site's base_url/url for the project-page URL prefix
+      # (/klingelbox), which just-the-docs needs to emit working asset links.
+      - name: Configure Pages
+        if: steps.detect.outputs.present == 'true'
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Build with Jekyll
+        if: steps.detect.outputs.present == 'true'
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./_site
+
+      # Belt and braces: a Jekyll misconfiguration that swallowed the flasher would
+      # otherwise only be noticed by someone trying to flash a board.
+      - name: Verify the flasher survived the build
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          missing=0
+          for f in _site/flasher/index.html _site/flasher/flasher.js; do
+            if [ ! -f "$f" ]; then echo "::error::$f missing from the built site"; missing=1; fi
+          done
+          if [ ! -f _site/flasher/firmware/manifest.json ]; then
+            echo "::warning::_site/flasher/firmware/manifest.json missing — the flasher will show an empty firmware list until flasher-sync runs"
+          fi
+          exit "$missing"
+
+      - name: Upload Pages artifact
+        if: steps.detect.outputs.present == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build
+    if: needs.build.outputs.present == 'true'
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

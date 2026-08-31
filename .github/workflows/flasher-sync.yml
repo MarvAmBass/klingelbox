@@ -1,0 +1,215 @@
+name: flasher-sync
+
+# Mirrors release firmware into the GitHub Pages tree for the browser flasher
+# (docs/flasher/, served at https://marvambass.github.io/klingelbox/flasher/).
+#
+# ---------------------------------------------------------------------------
+# WHY THIS MIRROR EXISTS AT ALL — the one thing to understand before touching it:
+#
+# api.github.com sends CORS headers, so the flasher page can *list* releases from
+# the browser. But GITHUB RELEASE-ASSET DOWNLOADS SEND NO CORS HEADERS
+# (github.com redirects to objects.githubusercontent.com, and neither responds with
+# Access-Control-Allow-Origin), so a browser page simply cannot fetch the .bin
+# itself — the request dies in preflight/opaque-response land no matter how the
+# fetch is written. There is no header, proxy trick or fetch mode that fixes this
+# from the page side.
+#
+# The flasher therefore only ever flashes SAME-ORIGIN copies: files served from the
+# very Pages site the page itself is served from. This workflow is what maintains
+# those copies, under docs/flasher/firmware/<tag>/, together with a manifest.json
+# carrying size and sha256 for each image so the page can verify a download before
+# writing a single byte to the device.
+# ---------------------------------------------------------------------------
+#
+# Triggers: every published release, plus workflow_dispatch for backfill (a fresh
+# Pages deployment, or repairing the tree after history surgery). Both paths run the
+# same idempotent sync: keep the newest $KEEP stable releases that carry a full
+# image, prune the rest, regenerate the manifest, commit only if something actually
+# changed.
+#
+# Ordering caveat: release.yml *builds* the .bins on the same tag push and takes a
+# while, so on the release trigger this job first waits for the full image to appear
+# on the release before syncing.
+#
+# NOTE: the mirror commit deliberately does NOT carry "[skip ci]" — pages.yml
+# triggers on pushes to main, and skipping it would leave the site advertising
+# firmware it does not actually serve. ci.yml also runs on the push; it is green and
+# comparatively cheap.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write # the mirror is committed back to the default branch
+
+# Serialise runs: two syncs pushing to the default branch at once would race.
+concurrency:
+  group: flasher-sync
+  cancel-in-progress: false
+
+env:
+  KEEP: "3"
+  FULL_ASSET: klingelbox-esp32s3-full.bin
+  FW_DIR: docs/flasher/firmware
+  # Commit authorship for the mirror commits.
+  COMMIT_NAME: "Marvin (MarvAmBass)"
+  COMMIT_EMAIL: "MarvAmBass@users.noreply.github.com"
+
+jobs:
+  sync:
+    name: mirror release firmware into docs/flasher
+    runs-on: ubuntu-latest
+    steps:
+      # The commit goes to the default branch regardless of what ref the triggering
+      # event points at (a release event checks out the tag, which is not a branch
+      # and cannot be pushed to).
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Wait for release assets (release trigger only)
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # release.yml is building the images right now; poll until the full image
+          # is attached (or give up after ~40 min and let a later workflow_dispatch
+          # backfill it — the page shows such a release as "not yet available" in
+          # the meantime rather than offering a broken download).
+          for i in $(seq 1 40); do
+            if gh release view "$TAG" --json assets -q '.assets[].name' | grep -qx "$FULL_ASSET"; then
+              echo "assets are up"; exit 0
+            fi
+            echo "waiting for $FULL_ASSET on $TAG ($i/40) ..."; sleep 60
+          done
+          echo "::warning::$FULL_ASSET never appeared on $TAG; syncing whatever exists"
+
+      - name: Download the newest releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Newest-first stable releases (drafts and prereleases skipped), keeping the
+          # first $KEEP that actually carry a full image. Assets are re-downloaded even
+          # for tags already in the tree — cheap, and it self-heals a corrupted or
+          # hand-edited mirror.
+          mkdir -p "$FW_DIR"
+          kept=0
+          : > /tmp/kept-tags
+          while read -r tag; do
+            [ "$kept" -ge "$KEEP" ] && break
+            if ! gh release view "$tag" --json assets -q '.assets[].name' | grep -qx "$FULL_ASSET"; then
+              echo "skipping $tag: no $FULL_ASSET attached"
+              continue
+            fi
+            echo "syncing $tag"
+            rm -rf "$FW_DIR/$tag"
+            mkdir -p "$FW_DIR/$tag"
+            gh release download "$tag" \
+              --pattern "$FULL_ASSET" \
+              --dir "$FW_DIR/$tag"
+            gh release view "$tag" --json tagName,publishedAt \
+              -q '[.tagName, .publishedAt] | @tsv' >> /tmp/kept-tags
+            kept=$((kept + 1))
+          done < <(gh release list --limit 30 \
+                     --json tagName,isDraft,isPrerelease \
+                     -q '.[] | select(.isDraft or .isPrerelease | not) | .tagName')
+
+      - name: Prune and regenerate manifest.json
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          # Manifest shape is the flasher contract: every path is relative to
+          # docs/flasher/firmware/ (the manifest's own directory), so the page can
+          # fetch it with a plain relative URL and stay same-origin.
+          python3 - <<'EOF'
+          import hashlib, json, os, shutil
+          from datetime import datetime, timezone
+
+          fw_dir = os.environ["FW_DIR"]
+          full_name = os.environ["FULL_ASSET"]
+          keep = int(os.environ["KEEP"])
+          repo = os.environ["REPO"]
+
+          kept = []  # [(tag, published_at)] newest first, from the download step
+          try:
+              with open("/tmp/kept-tags") as fh:
+                  kept = [line.rstrip("\n").split("\t") for line in fh if line.strip()]
+          except FileNotFoundError:
+              pass
+          kept_tags = {tag for tag, _ in kept}
+
+          # Prune: any per-tag directory not in the kept set goes. Old firmware kept
+          # forever would grow the Pages artifact (and the git history) without bound.
+          for name in sorted(os.listdir(fw_dir)):
+              path = os.path.join(fw_dir, name)
+              if os.path.isdir(path) and name not in kept_tags:
+                  print(f"pruning {path}")
+                  shutil.rmtree(path)
+
+          def describe(tag, filename):
+              path = os.path.join(fw_dir, tag, filename)
+              if not os.path.isfile(path):
+                  return None
+              with open(path, "rb") as fh:
+                  digest = hashlib.sha256(fh.read()).hexdigest()
+              return {
+                  # Path relative to docs/flasher/firmware/ — what the page fetches.
+                  "path": f"{tag}/{filename}",
+                  "size": os.path.getsize(path),
+                  "sha256": digest,
+              }
+
+          releases = []
+          for tag, published_at in kept:  # already newest first
+              full = describe(tag, full_name)
+              if not full:
+                  continue  # nothing the flasher can flash
+              releases.append({
+                  "version": tag,
+                  "date": published_at,
+                  "full": full,
+                  "notes_url": f"https://github.com/{repo}/releases/tag/{tag}",
+              })
+
+          out = os.path.join(fw_dir, "manifest.json")
+          # Idempotence: if nothing but the "generated" stamp would change, keep the
+          # existing file so the commit step below sees a clean tree and skips.
+          try:
+              with open(out) as fh:
+                  old = json.load(fh)
+          except (FileNotFoundError, ValueError):
+              old = None
+          if old and old.get("keep") == keep and old.get("releases") == releases:
+              print(f"{out} unchanged (ignoring timestamp); leaving as is")
+          else:
+              manifest = {
+                  "generated": datetime.now(timezone.utc)
+                               .isoformat(timespec="seconds").replace("+00:00", "Z"),
+                  "keep": keep,
+                  "releases": releases,
+              }
+              with open(out, "w") as fh:
+                  json.dump(manifest, fh, indent=2)
+                  fh.write("\n")
+              print(f"wrote {out} with {len(releases)} release(s)")
+          EOF
+
+      - name: Commit if anything changed
+        run: |
+          git add -A "$FW_DIR"
+          if git diff --cached --quiet; then
+            echo "mirror already up to date; nothing to commit"
+            exit 0
+          fi
+          # Deliberately NOT "[skip ci]": the Pages deploy triggers on this push and
+          # must run so the site actually serves the new firmware.
+          git -c user.name="$COMMIT_NAME" -c user.email="$COMMIT_EMAIL" \
+              commit -m "flasher: sync release firmware into docs/flasher"
+          # The asset wait above can leave this checkout many minutes stale; replay the
+          # mirror commit on top of whatever landed since.
+          git -c user.name="$COMMIT_NAME" -c user.email="$COMMIT_EMAIL" \
+              pull --rebase origin "${{ github.event.repository.default_branch || github.ref_name }}"
+          git push

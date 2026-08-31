@@ -31,6 +31,9 @@
  *   POST /api/wifi                       the wizard's save; reboots
  *   POST /api/ota | /api/ota/webui       update from a URL
  *   POST /api/ota/upload | /api/ota/webui/upload   raw .bin in the body
+ *   GET  /api/update                     cached "is there a newer release?"
+ *   POST /api/update/check               {"force":true} — async re-query
+ *   POST /api/update/install             {"webui":true} — OTA from the release
  *
  * FOUR HANDLERS, NOT FORTY. ESP-IDF's httpd matches literal URIs unless
  * `httpd_uri_match_wildcard` is enabled, and it has no path-parameter support at
@@ -90,6 +93,7 @@
 #include "rf_frame.h"
 #include "rf_service.h"
 #include "signal_store.h"
+#include "update_check.h"
 #include "wifi_mgr.h"
 
 #define LE_HOSTNAME_CMP_MAX 64
@@ -1697,6 +1701,96 @@ fail:
     return ESP_OK;
 }
 
+/* ------------------------------------------------------------------ update check
+ *
+ * The read side of update_check.h. All three routes answer from the RAM cache,
+ * so none of them ever waits on GitHub: /api/update/check merely ASKS for a
+ * refresh and returns the same object the GET returns, with `checking` true
+ * while the fetch task runs. A UI polls the GET (cheaply, locally) until
+ * `checking` goes false — it must never poll /api/update/check itself, which is
+ * why the rate limit lives in update_check.c rather than being a UI convention.
+ *
+ * `checked_at_s` is device-uptime seconds, the SAME monotonic clock as an
+ * event's `ts_s`, so the UI can render "checked 3 minutes ago" with the machinery
+ * it already has. 0 means "never checked".
+ */
+static esp_err_t api_update_get(httpd_req_t *req)
+{
+    db_update_status_t st;
+    db_update_get(&st);
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "valid", st.valid);
+    cJSON_AddBoolToObject(o, "checking", st.checking);
+    cJSON_AddBoolToObject(o, "update_available", st.update_available);
+    cJSON_AddStringToObject(o, "current", st.current);
+    cJSON_AddStringToObject(o, "latest", st.latest);
+    cJSON_AddStringToObject(o, "published_at", st.published_at);
+    cJSON_AddStringToObject(o, "html_url", st.html_url);
+    cJSON_AddStringToObject(o, "app_url", st.app_url);
+    cJSON_AddStringToObject(o, "webui_url", st.webui_url);
+    cJSON_AddStringToObject(o, "error", st.error);
+    cJSON_AddNumberToObject(o, "checked_at_s", (double)(st.checked_at_us / 1000000));
+    /* The client cannot know the cache policy otherwise, and a UI that shows a
+     * disabled "Check" button needs to say for how long. */
+    cJSON_AddNumberToObject(o, "min_interval_s", (double)DB_UPDATE_MIN_INTERVAL_S);
+    cJSON_AddBoolToObject(o, "sta_connected", db_wifi_sta_connected());
+    return send_json(req, o, "200 OK");
+}
+
+static esp_err_t api_update_check(httpd_req_t *req)
+{
+    cJSON *j = read_json(req);
+    if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
+    bool force = false;
+    json_bool(j, "force", &force);
+    cJSON_Delete(j);
+
+    /* 503, not 409: the request is correct and the endpoint exists, the box
+     * simply has no uplink — the same reading api_signal_transmit gives a
+     * missing radio, and what the UI keys its explanation off. */
+    if (!db_wifi_sta_connected())
+        return send_error(req, "503 Service Unavailable",
+                          "not on the home Wi-Fi — an update check needs internet access");
+
+    esp_err_t err = db_update_check(force);
+    if (err == ESP_ERR_INVALID_STATE)
+        return send_error(req, "503 Service Unavailable",
+                          "not on the home Wi-Fi — an update check needs internet access");
+    if (err != ESP_OK)
+        return send_esp_err(req, err, "could not start the update check");
+    return api_update_get(req);
+}
+
+static esp_err_t api_update_install(httpd_req_t *req)
+{
+    cJSON *j = read_json(req);
+    if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
+    bool webui = false;
+    json_bool(j, "webui", &webui);
+    cJSON_Delete(j);
+
+    if (!db_wifi_sta_connected())
+        return send_error(req, "503 Service Unavailable",
+                          "the home Wi-Fi is down — use the browser upload instead");
+
+    const char *emsg = NULL;
+    esp_err_t err = db_update_install(webui, &emsg);
+    if (err == ESP_ERR_NOT_FOUND)
+        return send_error(req, "409 Conflict", emsg ? emsg : "no such asset in the release");
+    if (err != ESP_OK)
+        return send_error(req, "409 Conflict",
+                          emsg ? emsg : "no update is available to install");
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    cJSON_AddBoolToObject(o, "webui", webui);
+    cJSON_AddStringToObject(o, "status", webui
+        ? "web UI update started; the device reboots to remount it"
+        : "firmware update started; the device reboots on success");
+    return send_json(req, o, "200 OK");
+}
+
 /* ------------------------------------------------------------------ routers */
 
 static esp_err_t get_router(httpd_req_t *req)
@@ -1720,6 +1814,7 @@ static esp_err_t get_router(httpd_req_t *req)
     if (uri_is(u, "/api/config"))         return api_config_get(req);
     if (uri_is(u, "/api/ap"))             return api_ap_get(req);
     if (uri_is(u, "/api/wifi/scan"))      return api_wifi_scan(req);
+    if (uri_is(u, "/api/update"))         return api_update_get(req);
     return send_error(req, "404 Not Found", "no such endpoint");
 }
 
@@ -1734,6 +1829,9 @@ static esp_err_t post_router(httpd_req_t *req)
     if (uri_is(u, "/api/ota/upload"))       return api_ota_upload(req, false);
     if (uri_is(u, "/api/ota/webui"))        return api_ota_url(req, true);
     if (uri_is(u, "/api/ota"))              return api_ota_url(req, false);
+
+    if (uri_is(u, "/api/update/install"))   return api_update_install(req);
+    if (uri_is(u, "/api/update/check"))     return api_update_check(req);
 
     if (uri_is(u, "/api/system/hostname"))  return api_system_hostname(req);
     if (uri_is(u, "/api/restart"))          return api_restart(req);

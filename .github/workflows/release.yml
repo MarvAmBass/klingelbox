@@ -1,0 +1,275 @@
+name: Release
+
+# Triggered by pushing a version tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+# or manually via workflow_dispatch against a tag that already exists (useful to
+# re-cut assets after a CI hiccup without moving the tag).
+#
+# Produces and attaches to the GitHub Release (ESP-IDF v5.3.1, target esp32s3,
+# 16 MB layout — partitions.csv):
+#
+#   klingelbox-esp32s3-full.bin — MERGED image, flashed at offset 0x0. This is what
+#       the browser flasher (docs/flasher/) and a bench `esptool.py write_flash 0x0`
+#       write. Contains bootloader + partition table + otadata + app + web-UI SPIFFS.
+#   klingelbox.bin              — the app image ALONE, for POST /api/ota. Must never
+#       be flashed at offset 0x0; it is not a bootable flash image.
+#   storage.bin                 — the web-UI SPIFFS image, for POST /api/ota/webui.
+#   manifest.json               — size + sha256 for each of the above, plus the flash
+#       parameters and the reserved NVS window, so consumers (flasher, scripts) can
+#       verify a download without guessing.
+#
+# ---------------------------------------------------------------------------
+# Versioning: the tag must MATCH firmware/CMakeLists.txt, it does not override it.
+#
+# PROJECT_VER is set with a plain `set(PROJECT_VER "x.y.z")` before project(), which
+# means a `-DPROJECT_VER=...` on the command line would simply be overwritten by that
+# line — deriving the version from the tag is therefore not actually possible without
+# editing the file during the build, and a build tree that disagrees with a developer's
+# local `idf.py build` is worse than a hard error. So this workflow asserts that the
+# tag and PROJECT_VER agree and fails loudly otherwise. PROJECT_VER is what
+# esp_app_get_description()->version reports through GET /api/system, so a mismatch
+# would mean a device claiming a version that no release ever shipped.
+# ---------------------------------------------------------------------------
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and release (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+env:
+  IDF_VERSION: v5.3.1
+
+jobs:
+  firmware:
+    name: Build ESP32-S3 release images
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      # On workflow_dispatch github.ref is the branch the workflow was launched from,
+      # so check out the requested tag explicitly. On a tag push both are the tag.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve tag and verify it matches PROJECT_VER
+        id: version
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          case "$TAG" in
+            v*) VERSION="${TAG#v}" ;;
+            *)  echo "::error::tag '$TAG' does not start with 'v'"; exit 1 ;;
+          esac
+          # Single source of truth: set(PROJECT_VER "x.y.z") in firmware/CMakeLists.txt.
+          PROJECT_VER="$(sed -n 's/^[[:space:]]*set(PROJECT_VER[[:space:]]*"\([^"]*\)".*/\1/p' \
+                          firmware/CMakeLists.txt | head -n1)"
+          if [ -z "$PROJECT_VER" ]; then
+            echo "::error::could not read PROJECT_VER from firmware/CMakeLists.txt"; exit 1
+          fi
+          if [ "$PROJECT_VER" != "$VERSION" ]; then
+            echo "::error::tag $TAG implies version $VERSION but firmware/CMakeLists.txt" \
+                 "sets PROJECT_VER=$PROJECT_VER. Bump PROJECT_VER and re-tag —" \
+                 "the device reports PROJECT_VER via GET /api/system."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $TAG (PROJECT_VER=$PROJECT_VER)"
+
+      # Same cache as ci.yml: only the managed component downloads are worth caching,
+      # the toolchain itself comes from the prebuilt espressif/idf docker image.
+      - name: Cache managed components
+        uses: actions/cache@v4
+        with:
+          path: firmware/managed_components
+          key: idf-${{ env.IDF_VERSION }}-components-${{ hashFiles('firmware/main/idf_component.yml') }}
+          restore-keys: |
+            idf-${{ env.IDF_VERSION }}-components-
+
+      # Release images are the 16 MB layout only (partitions.csv, the default
+      # sdkconfig.defaults). The 4 MB ESP32-S3 Zero layout is a build-from-source
+      # configuration and is verified on every push by ci.yml, not shipped here —
+      # the two would need different merged images and different flasher entries.
+      - name: Build firmware (ESP-IDF ${{ env.IDF_VERSION }}, esp32s3, 16 MB)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ env.IDF_VERSION }}
+          target: esp32s3
+          path: firmware
+
+      # esptool ships inside the ESP-IDF container, but this step runs on the runner
+      # itself, so install it via pip.
+      #
+      # The <5 pin is load-bearing: esptool 5 dropped the `esptool.py` entry point and
+      # renamed `merge_bin` to `merge-bin` with dashed flags. Pinning to the 4.x line
+      # keeps this step matching the syntax ESP-IDF 5.3.1 itself uses.
+      - name: Install esptool
+        run: python3 -m pip install --upgrade "esptool>=4.7,<5"
+
+      # -----------------------------------------------------------------------
+      # The merged image.
+      #
+      # The explicit offset list below IS the contract the browser flasher relies on,
+      # so it is cross-checked against the offsets ESP-IDF actually recorded for this
+      # build and fails loudly on any drift (new partition, moved offset, unexpected
+      # segment).
+      #
+      # --flash_size/--flash_mode/--flash_freq make merge_bin stamp the bootloader
+      # header here, on the build host (16 MB / DIO / 80 MHz), so the flasher can write
+      # with "keep" and never re-stamp it.
+      #
+      # CRITICAL: the merge must NEVER include an nvs segment. Nothing is listed at
+      # 0x9000, so merge_bin leaves 0x9000..0xf000 as 0xFF padding — and that gap is
+      # exactly where the browser flasher injects its generated NVS config seed (Wi-Fi
+      # credentials etc.) before writing. Merging an nvs image here would overwrite
+      # that seed with an empty partition and silently break first-boot provisioning.
+      # The step after this one verifies the gap really is 0xFF in the produced file.
+      # -----------------------------------------------------------------------
+      - name: Merge flashable image and collect OTA images
+        working-directory: firmware
+        run: |
+          BUILD=build
+          mkdir -p ../dist
+          python3 - "$BUILD" <<'PY'
+          import json, os, sys
+          build = sys.argv[1]
+          args = json.load(open(os.path.join(build, "flasher_args.json")))
+          recorded = {int(off, 16): os.path.normpath(f)
+                      for off, f in args["flash_files"].items()}
+          expected = {
+              0x0:      "bootloader/bootloader.bin",
+              0x8000:   "partition_table/partition-table.bin",
+              0xf000:   "ota_data_initial.bin",
+              0x20000:  "klingelbox.bin",
+              0x420000: "storage.bin",
+          }
+          if recorded != expected:
+              sys.exit("flasher_args.json disagrees with the explicit merge list:\n"
+                       f"  recorded: { {hex(k): v for k, v in sorted(recorded.items())} }\n"
+                       f"  expected: { {hex(k): v for k, v in sorted(expected.items())} }")
+          assert 0x9000 not in recorded, "nvs segment must never be merged (flasher gap)"
+          print("flasher_args.json offsets match the explicit merge list")
+          PY
+          esptool.py --chip esp32s3 merge_bin -o ../dist/klingelbox-esp32s3-full.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 16MB \
+            0x0      "$BUILD/bootloader/bootloader.bin" \
+            0x8000   "$BUILD/partition_table/partition-table.bin" \
+            0xf000   "$BUILD/ota_data_initial.bin" \
+            0x20000  "$BUILD/klingelbox.bin" \
+            0x420000 "$BUILD/storage.bin"
+          # App-only image for POST /api/ota, and the web-UI image for
+          # POST /api/ota/webui. Stable names — the on-device updater and the docs
+          # link to releases/latest/download/<name>.
+          cp "$BUILD/klingelbox.bin" ../dist/klingelbox.bin
+          cp "$BUILD/storage.bin"    ../dist/storage.bin
+          ls -l ../dist
+
+      # Direct assertion of the property the flasher depends on, rather than trusting
+      # that "we did not list nvs" implies "the bytes are 0xFF".
+      - name: Verify the NVS window is untouched 0xFF padding
+        run: |
+          python3 - <<'PY'
+          import sys
+          START, END = 0x9000, 0xf000
+          with open("dist/klingelbox-esp32s3-full.bin", "rb") as fh:
+              fh.seek(START)
+              gap = fh.read(END - START)
+          if len(gap) != END - START:
+              sys.exit(f"merged image is too short: only {len(gap)} bytes at {START:#x}")
+          if gap.strip(b"\xff"):
+              bad = next(i for i, b in enumerate(gap) if b != 0xFF)
+              sys.exit(f"merged image has non-0xFF data at {START + bad:#x} — an nvs "
+                       "segment leaked into the merge; the browser flasher's config "
+                       "seed would be overwritten")
+          print(f"{START:#x}..{END:#x} is 0xFF padding — flasher NVS gap intact")
+          PY
+
+      # Sizes + sha256 so a download can be verified without a second round trip.
+      - name: Generate manifest.json
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from datetime import datetime, timezone
+
+          images = [
+              ("klingelbox-esp32s3-full.bin", "0x0",
+               "Merged full image: bootloader + partition table + otadata + app + "
+               "web-UI SPIFFS. Flash at offset 0x0."),
+              ("klingelbox.bin", None,
+               "App image only, for POST /api/ota. Never flash at offset 0x0."),
+              ("storage.bin", None,
+               "Web-UI SPIFFS image, for POST /api/ota/webui."),
+          ]
+          assets = []
+          for name, offset, purpose in images:
+              path = os.path.join("dist", name)
+              with open(path, "rb") as fh:
+                  digest = hashlib.sha256(fh.read()).hexdigest()
+              entry = {"name": name, "size": os.path.getsize(path), "sha256": digest,
+                       "purpose": purpose}
+              if offset:
+                  entry["offset"] = offset
+              assets.append(entry)
+
+          manifest = {
+              "generated": datetime.now(timezone.utc)
+                           .isoformat(timespec="seconds").replace("+00:00", "Z"),
+              "version": os.environ["VERSION"],
+              "tag": os.environ["TAG"],
+              "target": "esp32s3",
+              "idf_version": os.environ.get("IDF_VERSION", "v5.3.1"),
+              "flash": {"size": "16MB", "mode": "dio", "freq": "80m"},
+              # Deliberately left as 0xFF in the merged image so the browser flasher
+              # can inject a generated NVS config seed there before writing.
+              "nvs_gap": {"offset": "0x9000", "size": "0x6000"},
+              "assets": assets,
+          }
+          with open("dist/manifest.json", "w") as fh:
+              json.dump(manifest, fh, indent=2)
+              fh.write("\n")
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-esp32s3
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: firmware
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-esp32s3
+          path: release
+
+      - name: List release assets
+        run: ls -l release
+
+      # generate_release_notes lets GitHub assemble the changelog from the commits and
+      # PRs since the previous tag; tag_name is passed explicitly so the manual
+      # workflow_dispatch path targets the right tag instead of the launching branch.
+      - name: Create Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.firmware.outputs.tag }}
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

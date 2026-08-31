@@ -61,6 +61,7 @@
 #include "ota.h"
 #include "rf_service.h"
 #include "signal_store.h"
+#include "update_check.h"
 #include "wifi_mgr.h"
 
 static const char *TAG = "klingelbox";
@@ -257,7 +258,10 @@ void app_main(void)
     db_dns_start();
     mdns_start(&s_cfg);
 
-    /* 7-8. services */
+    /* 7-8. services. db_update_init() only records the running version and
+     * creates its mutex — it touches no network, and the first GitHub fetch
+     * happens when the UI or a REST caller asks for it. */
+    db_update_init();
     db_http_start(&s_cfg);
     db_mqtt_start(&s_cfg);
 

@@ -42,7 +42,9 @@ CONFIG_LWIP_DHCPS=y
 
 # ---- lwIP -----------------------------------------------------------------
 CONFIG_LWIP_MAX_SOCKETS=12
-CONFIG_LWIP_SO_RCVTIMEO=y
+# (CONFIG_LWIP_SO_RCVTIMEO was dropped upstream — SO_RCVTIMEO is always
+#  available in IDF 5.x. Setting it here only produced an 'unknown kconfig
+#  symbol' warning, which CI now treats as a failure.)
 CONFIG_LWIP_SO_REUSE=y
 CONFIG_LWIP_IPV4=y
 

@@ -1,0 +1,253 @@
+---
+title: MQTT & Home Assistant
+layout: default
+nav_order: 5
+---
+
+# MQTT & Home Assistant
+{: .no_toc }
+
+Every press, in both directions, on topics a human can type.
+{: .fs-5 .fw-300 }
+
+<details open markdown="block">
+  <summary>On this page</summary>
+  {: .text-delta }
+- TOC
+{:toc}
+</details>
+
+---
+
+## Setup
+
+MQTT is off by default. Turn it on with `POST /api/config`, or in the web UI:
+
+```json
+{ "mqtt": { "enabled": true, "host": "192.168.1.10", "port": 1883,
+            "user": "klingelbox", "password": "…",
+            "base_topic": "klingelbox",
+            "homeassistant": true, "discovery_prefix": "homeassistant" } }
+```
+
+| Setting | Default | Notes |
+|---|---|---|
+| `host` / `port` | — / `1883` | No TLS. Trusted-LAN appliance. |
+| `user` / `password` | empty | Optional. Passwords are never read back — `GET /api/config` reports only `has_pass`. |
+| `base_topic` | `klingelbox` | The `<base>` in every topic below. |
+| `homeassistant` | `true` | Publish MQTT discovery. |
+| `discovery_prefix` | `homeassistant` | Only change it if your HA install did. |
+
+An empty string in a `POST` means "leave unchanged", so you can update the host without
+re-sending the password.
+
+{: .note }
+> Write the broker password under the key **`password`**. `pass` is accepted as an alias,
+> because the two config endpoints once disagreed and the mismatch failed *silently* — the
+> request succeeded and the key was quietly dropped.
+
+## Topic map
+
+`<base>` is `base_topic`, `klingelbox` by default. `<slug>` is a slug of the signal's name
+— `Front door` becomes `front_door`.
+
+| Topic | Direction | Retained | Payload |
+|---|---|---|---|
+| `<base>/status` | publish | **yes** | `online` / `offline`. Also the Last-Will. |
+| `<base>/button/<slug>/state` | publish | no | One recognised press. [Trigger JSON](#the-trigger-payload). |
+| `<base>/button/<slug>/press` | **subscribe** | — | Any message transmits that signal. |
+| `<base>/trigger/<suffix>` | **subscribe** | — | Any message fires the `source.virtual` node with that topic suffix. |
+| `<base>/unknown/state` | publish | no | An **unregistered** burst. Trigger JSON. |
+| `<base>/unknown` | publish | **yes** | The last unregistered burst, so you can look it up later. |
+| `<base>/event` | publish | no | Every node firing, plus system events. |
+| `<base>/<suffix>` | publish | no | A `sink.mqtt` node's own topic, when it has one set. |
+| `<base>/radio` | publish | **yes** | [Radio telemetry](#radio-telemetry). |
+
+### Why presses are not retained and telemetry is
+
+Retention answers one question: *what should a subscriber that just connected be told?*
+
+For radio telemetry the honest answer is "the last reading". For a doorbell press it is
+**nothing** — a press is a moment, not a condition. A retained press payload would ring
+every chime in the house every time Home Assistant restarts.
+
+The one exception is `<base>/unknown` (retained) alongside `<base>/unknown/state` (not).
+The unretained topic is the event; the retained one exists so you can *see* the code of the
+remote you are about to learn, even hours later.
+
+### Slugs, not ids
+
+Topics are addressed by a slug of the signal name, not its numeric id, because
+`klingelbox/button/front_door/press` is a topic you can type into `mosquitto_pub` and an
+automation someone can still read in six months.
+
+Names are not unique, and slugging collapses more of them together (`Front door` and
+`front-door!` both become `front_door`), so collisions are resolved deterministically with
+an `_<id>` suffix. Home Assistant `unique_id`s, by contrast, are keyed on the **numeric
+signal id**, so renaming a signal renames the entity instead of orphaning it and creating a
+second one.
+
+## The trigger payload
+
+Every press payload says **what caused it**, not merely that something happened:
+
+```json
+{
+  "signal_id": 1,
+  "label": "Front door",
+  "fingerprint": "5487745f",
+  "rssi_dbm": -31,
+  "repeats": 4,
+  "decoded": { "protocol": "ev1527", "id": 681562, "button": 8 },
+  "node": { "id": 7, "name": "Proxy to HA" },
+  "ts_s": 1756600000
+}
+```
+
+| Field | Notes |
+|---|---|
+| `signal_id` | `0` for a burst matching no stored signal. Normal behind a `source.any_rf` proxy. |
+| `label` | Signal name, node name, or `"unknown"`. |
+| `fingerprint` | Identity of the waveform. This is what identifies an *undecodable* remote. |
+| `rssi_dbm` | Signal strength. Real presses land around −24 to −42 dBm; noise, −91 to −97. |
+| `repeats` | How many copies of the frame arrived in the burst. |
+| `decoded` | `null` when no decoder recognised it — a supported state, not an error. |
+| `node` | The graph node that published this, or `null`. |
+
+## Radio telemetry
+
+`<base>/radio`, retained, refreshed every 10 seconds:
+
+```json
+{ "present": true, "rssi_dbm": -96, "signals": 4,
+  "last_press": "Front door", "last_press_id": 1,
+  "last_press_rssi_dbm": -31, "last_press_ago_s": 42 }
+```
+
+This is the diagnostic that answers "why did nothing ring?", which on a 433 MHz box is
+almost always one of two things: **no radio** (`present: false` — check the wiring) or
+**too much noise** (an `rssi_dbm` that sits far above the −96 dBm-ish floor means something
+nearby is transmitting continuously and drowning your remote).
+
+## Home Assistant discovery
+
+With `homeassistant: true`, the box announces itself under `<discovery_prefix>/…`. Every
+payload carries the same `device` block keyed on identifiers derived from the **MAC
+address** — not the hostname, because the hostname is user-editable and renaming the box
+must move the device, not fork it. So everything lands as **one HA device** with one page
+and one availability state.
+
+### What appears
+
+| Entity | Type | For |
+|---|---|---|
+| *(per signal)* "Front door pressed" | **device trigger** | Receiving. Fires on each press. |
+| *(per signal)* "Front door" | `button` | Transmitting. Pressing it replays the signal. |
+| *(per virtual node with a topic)* | `button` | Firing a `source.virtual` from the dashboard. |
+| "Unregistered remote pressed" | **device trigger** | Any burst matching no stored signal. |
+| "Last unknown code" | `sensor` (diagnostic) | The fingerprint of the last unknown burst, with decode and RSSI as attributes. |
+| "Radio RSSI" | `sensor` (diagnostic) | Live noise floor, dBm. |
+| "Radio" | `binary_sensor` (diagnostic) | Is a CC1101 actually there. |
+
+### Why device triggers and not binary sensors
+
+HA offers two plausible shapes for a momentary button: a `binary_sensor` that goes on and
+must be reset, or a device trigger.
+
+The binary sensor is a trap. The reset can be lost — a dropped connection, a reboot
+mid-press — and the entity then sits `on` forever, and every automation has to be written
+against a state edge rather than an event.
+
+A device trigger (`device_automation`, `automation_type: "trigger"`) is HA's native
+momentary event: it needs no reset, cannot get stuck, and appears directly in the
+automation editor as *"Front door pressed"* under this device.
+
+Each stored signal is therefore announced **twice**, as two genuinely different things: a
+trigger for *receiving*, and a `button` entity for *transmitting*.
+
+### Deleting a signal
+
+Deleting a signal publishes an empty retained discovery payload, which is how MQTT
+discovery says "forget this entity". Without that, a deleted signal would leave a
+permanently unavailable entity behind that only a manual purge removes.
+
+## Recipes
+
+### Ring the chime from Home Assistant
+
+Add a `source.virtual` node with topic `chime`, link it to a `sink.transmit`, then:
+
+```yaml
+action:
+  - service: mqtt.publish
+    data:
+      topic: klingelbox/trigger/chime
+      payload: ""
+```
+
+Or press the auto-created `button` entity. Or, if you would rather transmit a stored signal
+directly by name:
+
+```sh
+mosquitto_pub -h 192.168.1.10 -t klingelbox/button/front_door/press -m ''
+```
+
+### Automate on a doorbell press
+
+In the HA automation editor, pick the Klingelbox device and choose the
+*"Front door pressed"* trigger. No YAML needed.
+
+By hand, if you prefer the raw topic:
+
+```yaml
+trigger:
+  - platform: mqtt
+    topic: klingelbox/button/front_door/state
+action:
+  - service: notify.mobile_app
+    data:
+      message: >-
+        Doorbell ({{ trigger.payload_json.rssi_dbm }} dBm,
+        {{ trigger.payload_json.repeats }} repeats)
+```
+
+### See every remote in the neighbourhood
+
+Add a `source.any_rf` node linked to a `sink.mqtt`, then watch:
+
+```sh
+mosquitto_sub -h 192.168.1.10 -t 'klingelbox/#' -v
+```
+
+The retained `klingelbox/unknown` topic and the "Last unknown code" sensor both hold the
+fingerprint of the most recent unregistered burst — which is exactly what you want to read
+before deciding whether to learn it.
+
+### Presence of the box itself
+
+`<base>/status` is retained and is also the Last-Will, so it flips to `offline` when the
+box drops off the network without saying goodbye. Every discovered entity uses it as its
+availability topic, so an unplugged Klingelbox greys out in HA rather than showing stale
+values.
+
+## Troubleshooting
+
+**Nothing appears in Home Assistant.**
+Check `<base>/status` says `online` — if not, the box is not connected to the broker at
+all (wrong host, wrong credentials). Then check `discovery_prefix` matches your HA install
+(`homeassistant` unless you changed it), and that HA's MQTT integration has discovery
+enabled.
+
+**Entities appear but are greyed out.**
+That is the availability topic doing its job: the box is not currently connected. It will
+come back on its own.
+
+**A press fires twice.**
+Almost certainly a `source.any_rf` node *and* a `source.button` node both reaching the same
+sink. A recognised burst legitimately fires both — see
+[the note in Automations](automations.html#sourceany_rf).
+
+**Renaming a signal changed its topic.**
+Yes — topics follow the slug of the name. HA entities do not, because their `unique_id` is
+keyed on the numeric signal id. If you have automations written against a raw topic string,
+they will need updating; automations built on the device trigger will not.

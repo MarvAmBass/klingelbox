@@ -1,3 +1,9 @@
+---
+title: REST API
+layout: default
+nav_order: 6
+---
+
 # doorbell433 REST API
 
 The contract between `firmware/main/http_api.c` and `firmware/webui/`. Both are
@@ -235,3 +241,61 @@ succeeded and the key was dropped.) Reads report only `has_pass`.
 
 All reboot on success. The app image and the web UI are separate partitions: an
 app OTA leaves the old UI in place until the UI is updated too.
+
+---
+
+## Update check
+
+"Is there a newer release?" — asked of the GitHub Releases API of
+`MarvAmBass/klingelbox`, compared against `esp_app_get_description()->version`.
+Answered entirely from a RAM cache, so **no route here ever waits on GitHub**.
+
+### `GET /api/update`
+```json
+{ "valid": true, "checking": false, "update_available": true,
+  "current": "0.1.0", "latest": "v0.2.0", "published_at": "2026-08-30T09:12:44Z",
+  "html_url": "https://github.com/MarvAmBass/klingelbox/releases/tag/v0.2.0",
+  "app_url": "https://github.com/.../download/v0.2.0/klingelbox.bin",
+  "webui_url": "https://github.com/.../download/v0.2.0/storage.bin",
+  "error": "", "checked_at_s": 1180, "min_interval_s": 21600,
+  "sta_connected": true }
+```
+* `valid` — a check has *completed* at least once. Everything but `current` is
+  meaningless until it is true.
+* `checking` — a fetch is in flight. Poll **this** endpoint until it clears;
+  never poll `/api/update/check`.
+* `error` — `""` when the last check succeeded. A failed check keeps the
+  previous good result visible and only sets this.
+* `checked_at_s` — device-uptime seconds, the same monotonic clock as an event's
+  `ts_s`. `0` means never checked.
+* `app_url` / `webui_url` — the `klingelbox.bin` and `storage.bin` release
+  assets. Either may be `""` if that release did not publish one.
+
+Versions are compared **numerically**, component by component, tolerating a
+missing leading `v` and any `-rc` / `+build` suffix. `0.10.0` is newer than
+`0.9.0`; a textual comparison gets that backwards.
+
+### `POST /api/update/check` — `{"force":true}` (optional)
+Starts an asynchronous re-query and returns the `GET /api/update` object
+immediately (usually with `"checking": true`).
+
+**503** when the STA is down — the box cannot reach the internet over its own
+softAP alone.
+
+GitHub allows 60 unauthenticated requests per hour per IP, so a check is refused
+(and the cached answer returned, still `200`) when the previous one is younger
+than `min_interval_s` — 6 hours. `force` shortens that to a 60 second floor. It
+is never an error to ask too often; you simply get the cache.
+
+### `POST /api/update/install` — `{"webui":true}` (optional)
+Starts an OTA from the URL the check discovered, via the same machinery as
+`POST /api/ota`. Returns `{"ok":true,"webui":false,"status":"..."}` and the box
+reboots.
+
+`webui` selects **which** image, it does not add a second one: only one update
+of any kind may run at a time and each ends in a reboot. Install the firmware,
+let the box come back, then install the web UI.
+
+* **409** — no check has completed, no update is available, the release carries
+  no asset of that kind, or another update is already running.
+* **503** — the STA is not connected; use `POST /api/ota/upload` instead.

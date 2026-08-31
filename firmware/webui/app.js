@@ -407,6 +407,9 @@ function onTabEnter(name, resumed) {
       break;
     case "settings":
       buildSettings();
+      /* The release status is the one thing on this (build-once) tab that can
+         change on its own; null when the firmware has no update check. */
+      if (updateRefresh) updateRefresh();
       break;
     case "diagnostics":
       buildDiagnostics();
@@ -571,14 +574,20 @@ function renderHeader(err) {
 
 function txAvailable() { return !S.txBlock; }
 
-function transmit(signalId, btn, msgNode) {
+/* `opts` is optional and exists so the pairing burst (a longer repeat train
+   with its own wording) still goes through THIS function rather than growing a
+   second transmit path that would have to re-learn what a 409/503 means:
+     .body    extra transmit parameters, e.g. { repeats: 20, gap_us: 8000 }
+     .sending / .sent / .ok   wording for a non-default use */
+function transmit(signalId, btn, msgNode, opts) {
+  opts = opts || {};
   if (!txAvailable()) { if (msgNode) setMsg(msgNode, S.txBlock, "err"); return Promise.resolve(); }
   var old = btn ? btn.textContent : null;
-  if (btn) { btn.disabled = true; btn.textContent = "Sending…"; }
+  if (btn) { btn.disabled = true; btn.textContent = opts.sending || "Sending…"; }
   if (msgNode) setMsg(msgNode, "");
-  return postJSON("/api/signals/" + signalId + "/transmit", {}).then(function () {
-    if (btn) { btn.textContent = "Sent ✓"; setTimeout(function () { btn.textContent = old; btn.disabled = false; }, 1400); }
-    if (msgNode) setMsg(msgNode, "Transmitted. This only confirms the pulses left the radio -- it cannot know a receiver reacted.", "ok");
+  return postJSON("/api/signals/" + signalId + "/transmit", opts.body || {}).then(function () {
+    if (btn) { btn.textContent = opts.sent || "Sent ✓"; setTimeout(function () { btn.textContent = old; btn.disabled = false; }, 1400); }
+    if (msgNode) setMsg(msgNode, opts.ok || "Transmitted. This only confirms the pulses left the radio -- it cannot know a receiver reacted.", "ok");
   }).catch(function (e) {
     if (btn) { btn.textContent = old; btn.disabled = false; }
     if (e.status === 503 || e.status === 409) {
@@ -963,6 +972,68 @@ function renderSignals(err) {
   });
 }
 
+/*
+ * The pairing panel of a SYNTHESIZED signal.
+ *
+ * Written after a real report of "the virtual signal is broken". It was not:
+ * a synthesized signal is a brand-new address, so no receiver on the band
+ * answers to it until one has been TAUGHT it, and the user's chime was paired
+ * to a different address entirely. The explanation existed only on the
+ * creation form, which is the one screen you are no longer looking at by the
+ * time you tap Transmit and nothing happens.
+ *
+ * The order of the steps is the whole feature: the receiver has to be listening
+ * BEFORE the code goes out, and almost everyone tries it the other way round.
+ */
+var PAIR_REPEATS = 20;    /* ~20 x 36 ms ≈ 0.7 s: long enough that a receiver
+                             that just entered learning mode cannot miss it,
+                             short enough to stay an inline request like every
+                             other transmit. */
+var PAIR_GAP_US = 8000;
+
+function pairPanel(sig) {
+  var box = el("div", "note");
+  add(box, el("b", null, "Pair with a receiver"));
+
+  var steps = el("ol");
+  steps.style.margin = ".45rem 0 .55rem";
+  steps.style.paddingLeft = "1.25rem";
+
+  var s1 = el("li");
+  add(s1, el("span", null, "Put your receiver into "), el("b", null, "learning mode"),
+      el("span", null, " — usually hold its button until it beeps or its LED blinks."));
+  var s2 = el("li");
+  add(s2, el("span", null, "Tap "), el("b", null, "Pair now"),
+      el("span", null, " below within a few seconds."));
+  var s3 = el("li", null, "The receiver stores this code and rings for it from then on.");
+  add(steps, s1, s2, s3);
+  add(box, steps);
+
+  add(box, el("div", "small muted",
+    "This code is new — nothing responds to it until a receiver has learned it. " +
+    "That is expected."));
+
+  var msg = el("div", "formmsg");
+  var row = el("div", "formfoot");
+  var b = el("button", "btn primary", "🔗 Pair now");
+  b.type = "button";
+  b.disabled = !txAvailable();
+  if (!txAvailable()) b.title = S.txBlock;
+  b.addEventListener("click", function () {
+    transmit(sig.id, b, msg, {
+      body: { repeats: PAIR_REPEATS, gap_us: PAIR_GAP_US },
+      sending: "Pairing…",
+      sent: "Sent ✓",
+      ok: "Code sent " + PAIR_REPEATS + " times. If the receiver was in learning mode it " +
+          "has stored it — test it with Transmit below. If not, put it back into learning " +
+          "mode and tap Pair now again."
+    });
+  });
+  add(row, b, msg);
+  add(box, row);
+  return box;
+}
+
 function openSignalSheet(id) {
   var sh = openSheet("Signal", null);
   add(sh.body, el("div", "empty", "Loading…"));
@@ -982,6 +1053,10 @@ function openSignalSheet(id) {
         "No decoder claimed this waveform. That is a fully supported state: the exact pulse " +
         "timings are stored and replay works normally. Only the human-readable identity is missing."));
     }
+
+    /* Above every other control, because it is the answer to the question a
+       user has already formed by the time they open this sheet. */
+    if (sig.origin === "synthesized") add(sh.body, pairPanel(sig));
 
     /* confidence meter */
     if (typeof sig.confidence === "number") {
@@ -1029,6 +1104,15 @@ function openSignalSheet(id) {
       add(wh, wf);
       add(wh, el("span", "hint",
         "High = carrier on, low = carrier off. This is what gets replayed, verbatim, on transmit."));
+      /* Why a virtual signal does not look like a captured one. Read as a bug
+         otherwise -- and it has been. */
+      if (sig.origin === "synthesized") {
+        add(wh, el("span", "hint",
+          "A synthesized frame carries its ~9 ms sync gap up front, so it has one pulse more " +
+          "than the same code captured off the air (50 vs 49). A capture can never contain that " +
+          "gap: it is longer than the 8 ms idle threshold, so it is exactly what ENDS the " +
+          "recording. The two are the same code."));
+      }
       add(sh.body, wh);
     }
 
@@ -2310,6 +2394,173 @@ function sectionRadio() {
   return s;
 }
 
+/*
+ * The one place a "the box downloads and flashes it itself" request becomes UI.
+ *
+ * Shared by the URL form and by the update-check Install buttons on purpose:
+ * both start the SAME background OTA in ota.c and both end in a reboot, so they
+ * must confirm the same way, use the same in-flight wording and give the same
+ * recovery hint. A second implementation would inevitably drift from this one.
+ */
+function startOta(path, payload, what, btn, msgNode, lines) {
+  return confirmSheet("Update the " + what + "?", lines, "Update").then(function (ok) {
+    if (!ok) return;
+    btn.disabled = true;
+    setMsg(msgNode, "Downloading and flashing… this can take a minute.");
+    return postJSON(path, payload).then(function () {
+      setMsg(msgNode, "Flashed. The box is rebooting — reload this page in a few seconds.", "ok");
+    }).catch(function (e) { setMsg(msgNode, e.message, "err"); })
+      .then(function () { btn.disabled = false; });
+  });
+}
+
+/*
+ * "Is there a newer release?" -- GET /api/update, POST /api/update/check.
+ *
+ * HIDES ITSELF ON 404 (rule 3 of the file header): a firmware built before this
+ * endpoint existed has no update check, and the rest of the update section --
+ * URL and browser upload -- must keep working on it untouched.
+ *
+ * The check itself is asynchronous on the box (a TLS fetch from GitHub), so the
+ * button POSTs /api/update/check and then this polls the cheap local GET until
+ * `checking` clears. The POST is never polled: the firmware rate-limits it
+ * because GitHub allows only 60 anonymous requests an hour per address.
+ */
+var updateRefresh = null;   /* set once Settings is built; null = no such endpoint */
+
+function updateCheckBlock() {
+  var wrap = el("div", "hidden");
+  add(wrap, el("h3", null, "Newer release"));
+  add(wrap, el("p", "hint",
+    "Asks GitHub for the newest published release. The answer is cached for a few hours — " +
+    "GitHub rate-limits anonymous requests, so checking is deliberately not automatic."));
+
+  var chips = el("div", "chiprow");
+  var info = el("div");
+  info.style.marginTop = ".4rem";
+  var msg = el("div", "formmsg");
+  var row = el("div", "btnrow");
+  row.style.marginTop = ".6rem";
+
+  var checkBtn = el("button", "btn", "Check for updates");
+  checkBtn.type = "button";
+  var appBtn = el("button", "btn primary hidden", "Install firmware");
+  appBtn.type = "button";
+  var uiBtn = el("button", "btn hidden", "Install web UI");
+  uiBtn.type = "button";
+  add(row, checkBtn, appBtn, uiBtn);
+  add(wrap, chips, info, row, msg);
+
+  var last = null;
+
+  function show(btn, on) {
+    if (on) btn.classList.remove("hidden"); else btn.classList.add("hidden");
+  }
+
+  function render(st) {
+    last = st;
+    wrap.classList.remove("hidden");
+    clear(chips);
+    clear(info);
+
+    add(chips, el("span", "chip mono", "running " + (st.current || "?")));
+    if (st.checking) {
+      add(chips, el("span", "chip", "checking…"));
+    } else if (st.valid) {
+      add(chips, el("span", "chip mono", "latest " + (st.latest || "?")));
+      add(chips, st.update_available ? el("span", "chip warn", "update available")
+                                     : el("span", "chip ok", "up to date"));
+    } else if (!st.error) {
+      add(chips, el("span", "chip", "not checked yet"));
+    }
+
+    if (st.error) add(info, el("div", "note warn", st.error));
+
+    if (st.valid && st.html_url) {
+      var a = el("a", "small", "Release notes for " + (st.latest || "the newest release") + " ↗");
+      a.href = st.html_url;
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      /* No <a> anywhere else in this UI, so it carries its own colour rather
+         than a stylesheet rule that would exist for one link. */
+      a.style.color = "var(--accent)";
+      add(info, a);
+    }
+    if (st.valid && st.checked_at_s) {
+      add(info, el("div", "hint", "Checked " + agoText(st.checked_at_s) + "."));
+    }
+    /* The box downloads the image itself, so no home network means no check and
+       no install -- the browser upload below is the answer in that case. */
+    if (st.sta_connected === false) {
+      add(info, el("div", "note",
+        "The box is not on a home network, so it cannot reach GitHub. Upload an image from " +
+        "this device instead — that path needs no internet on the box at all."));
+    }
+
+    checkBtn.disabled = !!st.checking || st.sta_connected === false;
+    checkBtn.textContent = st.checking ? "Checking…" : "Check for updates";
+    show(appBtn, !!(st.update_available && st.app_url));
+    show(uiBtn, !!(st.update_available && st.webui_url));
+  }
+
+  function refresh() {
+    return api("/api/update").then(function (st) {
+      render(st);
+      return st;
+    }).catch(function (e) {
+      stopPoll("update");
+      /* 404: this firmware predates the update check. Say nothing, show nothing. */
+      if (e.status === 404) { wrap.remove(); updateRefresh = null; return null; }
+      setMsg(msg, e.message, "err");
+      return null;
+    });
+  }
+
+  /* The polled variant: it retires its own timer the moment the box says the
+     fetch has finished, so this never outlives one check. */
+  function tick() {
+    refresh().then(function (st) { if (!st || !st.checking) stopPoll("update"); });
+  }
+
+  checkBtn.addEventListener("click", function () {
+    setMsg(msg, "");
+    checkBtn.disabled = true;
+    checkBtn.textContent = "Checking…";
+    postJSON("/api/update/check", { force: true }).then(function (st) {
+      render(st);
+      /* The fetch runs on the box; poll the local status until it settles. */
+      if (st.checking) poll("update", 2000, tick);
+    }).catch(function (e) {
+      setMsg(msg, e.message, "err");
+      checkBtn.disabled = false;
+      checkBtn.textContent = "Check for updates";
+    });
+  });
+
+  function install(webui, btn) {
+    if (!last) return;
+    var url = webui ? last.webui_url : last.app_url;
+    startOta("/api/update/install", { webui: webui },
+      (webui ? "web UI" : "firmware") + " to " + (last.latest || "the newest release"),
+      btn, msg,
+      [url,
+       "The box downloads and flashes it, then reboots. Do not power it off.",
+       webui ? "The current web UI is erased first; the firmware and your signals are untouched."
+             : "Only the app is replaced. Update the web UI as a second step once the box is back."]);
+  }
+  appBtn.addEventListener("click", function () { install(false, appBtn); });
+  uiBtn.addEventListener("click", function () { install(true, uiBtn); });
+
+  /* Settings is built exactly once, but this block's answer can change while
+     the box runs (a check finishes on the device, or the STA comes back), so
+     re-entering the tab re-reads it. */
+  updateRefresh = function () {
+    refresh().then(function (st) { if (st && st.checking) poll("update", 2000, tick); });
+  };
+  updateRefresh();
+  return wrap;
+}
+
 function sectionFirmware() {
   var s = section("Firmware & web UI update",
     "Two separate images: the app, and this web UI. Updating one leaves the other alone.");
@@ -2319,7 +2570,11 @@ function sectionFirmware() {
     "The app image and the web UI live in different partitions. After an app update the old " +
     "UI is still being served until you update it too — that is normal, not a failure."));
 
+  /* --- is there a newer release? --- */
+  add(body, updateCheckBlock());
+
   /* --- from a URL --- */
+  add(body, el("div", "divider"));
   add(body, el("h3", null, "From a URL"));
   var urlIn = inputEl("url", "", { placeholder: "https://.../doorbell433.bin" });
   urlIn.type = "url";
@@ -2333,17 +2588,8 @@ function sectionFirmware() {
   function urlUpdate(path, what, btn) {
     var u = trimOf(urlIn);
     if (!u) { setMsg(urlMsg, "Enter the image URL first.", "err"); return; }
-    confirmSheet("Update the " + what + " from this URL?",
-      [u, "The box downloads and flashes it, then reboots. Do not power it off."],
-      "Update").then(function (ok) {
-      if (!ok) return;
-      btn.disabled = true;
-      setMsg(urlMsg, "Downloading and flashing… this can take a minute.");
-      postJSON(path, { url: u }).then(function () {
-        setMsg(urlMsg, "Flashed. The box is rebooting — reload this page in a few seconds.", "ok");
-      }).catch(function (e) { setMsg(urlMsg, e.message, "err"); })
-        .then(function () { btn.disabled = false; });
-    });
+    startOta(path, { url: u }, what + " from this URL", btn, urlMsg,
+      [u, "The box downloads and flashes it, then reboots. Do not power it off."]);
   }
   appBtn.addEventListener("click", function () { urlUpdate("/api/ota", "firmware", appBtn); });
   uiBtn.addEventListener("click", function () { urlUpdate("/api/ota/webui", "web UI", uiBtn); });

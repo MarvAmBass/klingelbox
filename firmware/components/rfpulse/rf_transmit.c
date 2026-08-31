@@ -230,7 +230,10 @@ esp_err_t rf_transmit_init(const rf_transmit_cfg_t *cfg)
     s_tx.pin = cfg->pin;
 
     {
-        rmt_copy_encoder_config_t enc_cfg = { 0 };
+        /* Empty struct in IDF 5.3 — it has no fields at all, so `{ 0 }`
+         * is an excess initializer and warns. `{}` is what the ESP-IDF
+         * examples use for exactly this type. */
+        rmt_copy_encoder_config_t enc_cfg = {};
         err = rmt_new_copy_encoder(&enc_cfg, &s_tx.encoder);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "rmt_new_copy_encoder failed: %s", esp_err_to_name(err));

@@ -17,6 +17,7 @@ idf_component_register(
         "http_api.c"         # REST + web UI serving
         "mqtt_bridge.c"      # MQTT + Home Assistant discovery
         "ota.c"              # dual-slot OTA + rollback
+        "update_check.c"     # "is there a newer release?" against GitHub
     INCLUDE_DIRS "."
     REQUIRES
         cc1101              # CC1101 chip driver          (components/cc1101)

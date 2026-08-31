@@ -1,0 +1,46 @@
+# GitHub Pages / Jekyll config for the Klingelbox documentation site.
+# Published by .github/workflows/pages.yml, NOT by the branch builder:
+# Settings -> Pages -> Source must be "GitHub Actions" (the repo is already
+# configured that way, build_type=workflow).
+#
+# The two modes are mutually exclusive — with "Deploy from a branch" selected,
+# actions/deploy-pages fails with a 404 and the branch builder publishes instead.
+# Actions mode was chosen because the workflow runs the same github-pages Jekyll
+# environment the branch builder would, and additionally verifies that the
+# flasher's files survive into _site before deploying. A silently un-deployed
+# flasher is exactly the failure worth guarding against.
+
+title: Klingelbox
+description: >-
+  A 433 MHz doorbell server on an ESP32-S3: capture, decode, replay and route
+  doorbell signals locally, with MQTT and Home Assistant — and no cloud.
+
+# just-the-docs is pulled in as a remote theme so no Gemfile/bundle step is
+# required on GitHub Pages. It gives an automatic sidebar built from each page's
+# `nav_order` front matter.
+remote_theme: just-the-docs/just-the-docs
+
+aux_links:
+  "GitHub repository":
+    - "https://github.com/MarvAmBass/klingelbox"
+aux_links_new_tab: true
+
+# In-page mermaid diagrams (these also render natively on github.com).
+mermaid:
+  version: "9.1.6"
+
+search_enabled: true
+color_scheme: dark
+heading_anchors: true
+
+# NOTE on docs/API.md: it carries no YAML front matter, so Jekyll treats it as a
+# static file and serves it verbatim rather than rendering it into the theme.
+# It is therefore linked from these pages via its GitHub blob URL, where it
+# renders properly. Do not "fix" this by editing API.md — it is owned elsewhere.
+
+# The flasher is a standalone app, not a themed page: index.html has no front
+# matter, so Jekyll copies it (and flasher.js, lib/, firmware/) through as-is.
+# The vendored bundle lives in `lib/`, NOT `vendor/`, because Jekyll excludes
+# `vendor/` by default and the bundle must actually be published.
+exclude:
+  - flasher/README.md

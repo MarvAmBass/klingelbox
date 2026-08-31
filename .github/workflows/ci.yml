@@ -1,0 +1,330 @@
+name: CI
+
+# Continuous integration for Klingelbox (ESP-IDF v5.3.1, target esp32s3).
+#
+#   * host-tests — the plain-gcc logic tests in firmware/host-test/. NO ESP-IDF is
+#                  involved by design: rf_frame.c / rf_decode.c / rf_ev1527.c must stay
+#                  free of IDF and FreeRTOS headers, and this job failing to compile is
+#                  itself the layering test (see firmware/host-test/Makefile). It runs
+#                  first because it takes seconds while the firmware build takes minutes.
+#   * flasher-checks — a plain `node --check` over the browser flasher sources. The
+#                  flasher is served straight from docs/ with no build step, so a
+#                  syntax error would otherwise reach the published page unnoticed.
+#   * firmware   — builds the real firmware TWICE, once per supported flash layout:
+#                    16mb — the N16R8 dev board          (partitions.csv, 2 MB app slots)
+#                     4mb — the ESP32-S3 Zero            (partitions-4mb.csv, 1.5 MB slots)
+#                  The 4 MB build is the whole point of the matrix: the Zero layout is easy
+#                  to outgrow silently, so CI keeps it honest on every push. ESP-IDF hard-
+#                  errors when the app no longer fits its slot; the explicit fit report
+#                  below additionally prints the remaining headroom so a slow creep toward
+#                  the limit is visible long before it becomes a build failure.
+#
+# Both firmware variants also fail on compiler warnings in FIRST-PARTY code (see the
+# "Fail on compiler warnings" step for why this is a log scan rather than a blanket
+# -Werror).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IDF_VERSION: v5.3.1
+
+jobs:
+  host-tests:
+    name: Host logic tests (gcc, no IDF)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build toolchain
+        run: sudo apt-get update && sudo apt-get install -y build-essential
+
+      # `make test` builds test_rf_decode from the rfpulse sources and runs it.
+      # The binary asserts on every vector and prints its check count (1176 at the
+      # time of writing); a non-zero exit fails the job.
+      - name: Build and run host tests
+        working-directory: firmware/host-test
+        run: make test
+
+  # Lightweight checks for the browser flasher (docs/flasher/). Guarded on the
+  # directory existing so CI stays green until the flasher tree lands, then enforces
+  # automatically. Only the top-level sources are checked — docs/flasher/lib/ holds a
+  # vendored third-party bundle (esptool-js) that is not ours to fix.
+  flasher-checks:
+    name: Flasher JS checks (docs/flasher)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect docs/flasher
+        id: detect
+        run: |
+          if [ -d docs/flasher ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::docs/flasher not present yet — skipping flasher checks."
+          fi
+
+      - name: Set up Node.js
+        if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax-check the flasher sources
+        if: steps.detect.outputs.present == 'true'
+        run: |
+          shopt -s nullglob
+          files=(docs/flasher/*.js docs/flasher/*.mjs)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::docs/flasher exists but contains no .js/.mjs sources"; exit 1
+          fi
+          for f in "${files[@]}"; do
+            echo "node --check $f"
+            # index.html loads flasher.js with type="module"; node --check treats a
+            # bare .js as CommonJS, so retry as an ES module before calling it a
+            # failure (import/export at top level is legal in the browser here).
+            node --check "$f" \
+              || node --input-type=module --check < "$f" \
+              || { echo "::error file=$f::syntax error"; exit 1; }
+          done
+
+  firmware:
+    name: Firmware (${{ matrix.name }} flash)
+    runs-on: ubuntu-latest
+    needs: host-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The 16 MB board: plain sdkconfig.defaults, partitions.csv.
+          - name: "16mb"
+            defaults: "sdkconfig.defaults"
+            partitions: "partitions.csv"
+            build_dir: "build-16mb"
+            sdkconfig: "sdkconfig.16mb"
+            log: "build-16mb.log"
+            # Only this variant is what release.yml merges, so only this variant
+            # cross-checks the flash offsets the browser flasher depends on.
+            check_offsets: "true"
+          # The ESP32-S3 Zero: the 4 MB overrides are layered ON TOP of the base
+          # defaults, exactly as documented in firmware/sdkconfig.defaults.4mb.
+          - name: "4mb"
+            defaults: "sdkconfig.defaults;sdkconfig.defaults.4mb"
+            partitions: "partitions-4mb.csv"
+            build_dir: "build-4mb"
+            sdkconfig: "sdkconfig.4mb"
+            log: "build-4mb.log"
+            check_offsets: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      # The ESP-IDF toolchain itself arrives as a prebuilt docker image
+      # (espressif/idf:<version>), so there is nothing to cache for it. What IS
+      # worth caching is the IDF component manager's download of the managed
+      # dependencies (main/idf_component.yml -> espressif__mdns), which otherwise
+      # hits the component registry on every single build.
+      #
+      # Both matrix legs share one key because the payload is identical; the second
+      # leg to finish logs a benign "Cache already exists" warning instead of saving.
+      - name: Cache managed components
+        uses: actions/cache@v4
+        with:
+          path: firmware/managed_components
+          key: idf-${{ env.IDF_VERSION }}-components-${{ hashFiles('firmware/main/idf_component.yml') }}
+          restore-keys: |
+            idf-${{ env.IDF_VERSION }}-components-
+
+      # Each variant gets its own build directory AND its own sdkconfig, so the two
+      # legs can never contaminate each other's configuration. sdkconfig is
+      # gitignored, so CI always regenerates it from the defaults files — which is
+      # precisely what makes this matrix meaningful.
+      #
+      # `bash -c "set -o pipefail && ... | tee"` is deliberate: without pipefail the
+      # pipeline would report tee's exit status and a failing build would go green.
+      - name: Build firmware (ESP-IDF ${{ env.IDF_VERSION }}, esp32s3)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ env.IDF_VERSION }}
+          target: esp32s3
+          path: firmware
+          command: >-
+            bash -c "set -o pipefail && idf.py -B '${{ matrix.build_dir }}'
+            -DSDKCONFIG='${{ matrix.sdkconfig }}'
+            -DSDKCONFIG_DEFAULTS='${{ matrix.defaults }}'
+            build 2>&1 | tee '${{ matrix.log }}'"
+
+      # Warnings-as-errors, scoped to OUR code.
+      #
+      # Why not simply -DEXTRA_CFLAGS=-Werror: in ESP-IDF that flag is applied to
+      # every component, including the several hundred that ship with IDF itself.
+      # A future IDF point release emitting one new warning in its own sources would
+      # then break this repo's CI for a reason nobody here can fix. Scanning the build
+      # log and failing only on warnings whose file path is under firmware/main/,
+      # components/cc1101/ or components/rfpulse/ gives the same discipline over the
+      # code we own without that hostage situation. managed_components/ is excluded
+      # for the same reason (third-party, e.g. espressif__mdns).
+      - name: Fail on compiler warnings (first-party sources)
+        working-directory: firmware
+        run: |
+          LOG="${{ matrix.log }}"
+          if [ ! -f "$LOG" ]; then
+            echo "::error::build log $LOG missing — did the build step change?"; exit 1
+          fi
+          # idf.py colourises output; strip ANSI escapes before matching.
+          sed -r 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOG" > /tmp/build-clean.log
+          grep -E 'warning:' /tmp/build-clean.log \
+            | grep -Ev 'managed_components' \
+            | grep -E '(^|/)(main|components/(cc1101|rfpulse))/[^ ]*:[0-9]+:' \
+            > /tmp/first-party-warnings.txt || true
+          if [ -s /tmp/first-party-warnings.txt ]; then
+            echo "::error::compiler warnings in first-party sources (${{ matrix.name }} build):"
+            cat /tmp/first-party-warnings.txt
+            while IFS= read -r line; do echo "::warning::$line"; done < /tmp/first-party-warnings.txt
+            exit 1
+          fi
+          echo "No first-party compiler warnings."
+
+      # ESP-IDF already hard-errors if the app outgrows its OTA slot, so this step is
+      # about VISIBILITY: it prints how much room is left for this layout. The 4 MB
+      # Zero has 1.5 MB app slots and a 512 KB web-UI partition, and crossing 90% is
+      # the moment to start caring — long before the build breaks.
+      #
+      # Two different kinds of measurement, deliberately:
+      #   * the app image is as large as the code, so its size vs. the slot IS the
+      #     headroom;
+      #   * storage.bin is a SPIFFS image and is ALWAYS exactly the partition size
+      #     (mkspiffs formats the whole partition), so comparing it to the partition
+      #     would report 100% forever. Its real headroom is the size of the web UI
+      #     *content* going into it, so that is what is measured — with the same
+      #     source-directory choice main/CMakeLists.txt makes.
+      - name: Report partition headroom (${{ matrix.name }})
+        working-directory: firmware
+        env:
+          BUILD_DIR: ${{ matrix.build_dir }}
+          CSV: ${{ matrix.partitions }}
+        run: |
+          python3 - <<'PY'
+          import os, sys
+
+          build = os.environ["BUILD_DIR"]
+          csv = os.environ["CSV"]
+          failed = False
+
+          # Minimal partition-table parse: Name,Type,SubType,Offset,Size,Flags
+          sizes = {}
+          with open(csv) as fh:
+              for line in fh:
+                  line = line.split("#", 1)[0].strip()
+                  if not line:
+                      continue
+                  cols = [c.strip() for c in line.split(",")]
+                  if len(cols) >= 5 and cols[4]:
+                      sizes[cols[0]] = int(cols[4], 0)
+
+          def report(label, used, cap, tight_hint=True):
+              global failed
+              pct = 100.0 * used / cap
+              print(f"{label:<20} {used:>8} / {cap:>8} bytes  ({pct:5.1f}% used, "
+                    f"{cap - used} free)")
+              if used > cap:
+                  print(f"::error::{label} does not fit the {csv} layout")
+                  failed = True
+              elif pct > 90.0 and tight_hint:
+                  print(f"::warning::{label} is at {pct:.1f}% of its partition in "
+                        f"{csv} — the 4 MB ESP32-S3 Zero layout is the tight one")
+
+          app = os.path.join(build, "klingelbox.bin")
+          if os.path.isfile(app):
+              report("app (ota_0)", os.path.getsize(app), sizes["ota_0"])
+          else:
+              print(f"::error::{app} was not produced by the build")
+              failed = True
+
+          storage = os.path.join(build, "storage.bin")
+          if os.path.isfile(storage):
+              # Sanity check that the build really used the partition table we parsed.
+              actual, expected = os.path.getsize(storage), sizes["storage"]
+              if actual != expected:
+                  print(f"::error::storage.bin is {actual} bytes but {csv} declares "
+                        f"{expected} — the build used a different partition table")
+                  failed = True
+              else:
+                  print(f"storage.bin matches the {csv} `storage` partition "
+                        f"({expected} bytes, SPIFFS images always fill it)")
+          else:
+              print(f"::error::{storage} was not produced by the build")
+              failed = True
+
+          # Same source-directory choice as main/CMakeLists.txt.
+          webui = "webui" if os.path.isfile("webui/index.html") else "main/www"
+          content = 0
+          for root, _dirs, files in os.walk(webui):
+              for name in files:
+                  content += os.path.getsize(os.path.join(root, name))
+          print(f"(web UI content from {webui}/)")
+          # ~90% is where SPIFFS metadata overhead starts to bite, so the same
+          # threshold is a reasonable alarm here too.
+          report("web UI content", content, sizes["storage"])
+
+          sys.exit(1 if failed else 0)
+          PY
+
+      # The browser flasher and release.yml both hard-code the flash offsets of the
+      # 16 MB layout. Catching drift here — on a PR — is far cheaper than catching it
+      # while cutting a release. The nvs assertion is the important one: nvs must never
+      # become part of a merged image (see release.yml for the full explanation).
+      - name: Cross-check flash offsets against the flasher contract
+        if: matrix.check_offsets == 'true'
+        working-directory: firmware
+        env:
+          BUILD_DIR: ${{ matrix.build_dir }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          build = os.environ["BUILD_DIR"]
+          args = json.load(open(os.path.join(build, "flasher_args.json")))
+          recorded = {int(off, 16): os.path.normpath(f)
+                      for off, f in args["flash_files"].items()}
+          expected = {
+              0x0:      "bootloader/bootloader.bin",
+              0x8000:   "partition_table/partition-table.bin",
+              0xf000:   "ota_data_initial.bin",
+              0x20000:  "klingelbox.bin",
+              0x420000: "storage.bin",
+          }
+          if recorded != expected:
+              sys.exit("flasher_args.json disagrees with the flasher contract:\n"
+                       f"  recorded: { {hex(k): v for k, v in sorted(recorded.items())} }\n"
+                       f"  expected: { {hex(k): v for k, v in sorted(expected.items())} }")
+          assert 0x9000 not in recorded, "nvs must never be flashed (browser-flasher gap)"
+          print("flash offsets match the flasher contract")
+          PY
+
+      # Short-retention build output, so a failing PR can be inspected without
+      # reproducing the whole IDF build locally.
+      - name: Upload build output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-${{ matrix.name }}
+          path: |
+            firmware/${{ matrix.build_dir }}/*.bin
+            firmware/${{ matrix.build_dir }}/*.map
+            firmware/${{ matrix.build_dir }}/flasher_args.json
+            firmware/${{ matrix.log }}
+          if-no-files-found: warn
+          retention-days: 7
