@@ -8,6 +8,10 @@
  *   <base>/button/<slug>/press         SUBSCRIBED: any message transmits <slug>
  *   <base>/trigger/<suffix>            SUBSCRIBED: fires the SOURCE_VIRTUAL node
  *                                      whose topic suffix this is
+ *   <base>/switch/<suffix>/set         SUBSCRIBED: ON/OFF/1/0/true/false (or
+ *                                      {"state":"ON"}) moves the LOGIC_SWITCH
+ *                                      node(s) carrying this suffix
+ *   <base>/switch/<suffix>/state       "ON"/"OFF", RETAINED — the position
  *   <base>/unknown/state               an UNREGISTERED burst, JSON, NOT retained
  *   <base>/unknown                     last unregistered burst, JSON, RETAINED
  *   <base>/event                       every node firing + system events, JSON
@@ -18,7 +22,19 @@
  * subscriber that just connected be told?". For radio telemetry the honest answer
  * is the last reading; for a doorbell press it is *nothing*, because a press is a
  * moment, not a condition. A retained press payload would ring every chime in the
- * house every time Home Assistant restarts.
+ * house every time Home Assistant restarts. A SWITCH POSITION is a condition, and
+ * the most important one on the box to get right — so it is retained, republished
+ * on every connect, and republished again whenever it moves. A switch is the one
+ * thing here a user can be actively wrong about ("I turned the inside bell off"),
+ * and a stale toggle in a dashboard is exactly that kind of wrong.
+ *
+ * ONE SWITCH ENTITY PER TOPIC, NOT PER NODE. Several logic.switch nodes may carry
+ * the same topic suffix on purpose — that is how one Home Assistant toggle gates
+ * the outside bell's chain and the garden light's chain together. Announcing an
+ * entity per NODE would put two toggles in the dashboard that always move as one
+ * and command each other, which reads as a bug. So the topic is the unit of
+ * identity here: the state published is ON if ANY node on that topic conducts,
+ * and a set command moves every one of them.
  *
  * WHY DEVICE TRIGGERS. HA's MQTT integration offers two plausible shapes for a
  * button: a binary_sensor that goes on and must be reset, or a device trigger.
@@ -71,6 +87,7 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>            /* strcasecmp, for the switch payload vocabulary */
 #include <time.h>
 
 #include "cJSON.h"
@@ -162,6 +179,37 @@ static int           s_sub_count;
 static uint16_t s_ann_virt[DB_NODE_MAX];
 static int      s_ann_virt_count;
 
+/*
+ * Live <base>/switch/<suffix>/set subscriptions — one per DISTINCT topic across
+ * the LOGIC_SWITCH nodes, never one per node (see the file header).
+ *
+ * `node_id` is only the first node found on that topic, used to name the Home
+ * Assistant entity; `count` is how many share it, which is what the entity says
+ * about itself. Neither is used for routing: a set command is applied to every
+ * node with the suffix, by db_graph_switch_set_topic().
+ *
+ * Unlike the trigger subscriptions this deliberately IGNORES `enabled`. On a
+ * switch node that flag IS the position, so filtering on it would unsubscribe
+ * every switch the moment it was turned off — and nothing could ever turn one
+ * back on again.
+ */
+typedef struct {
+    char     suffix[DB_NODE_TOPIC_MAX];
+    uint16_t node_id;
+    uint8_t  count;
+} db_mqtt_switch_t;
+static db_mqtt_switch_t s_sw[DB_NODE_MAX];
+static int              s_sw_count;
+
+/* Announced switch topics, so one that goes away has its retained discovery AND
+ * its retained state cleared instead of haunting the broker for ever. */
+static char s_ann_sw[DB_NODE_MAX][DB_NODE_TOPIC_MAX];
+static int  s_ann_sw_count;
+/* Whether the announced set carries HA discovery configs. Turning discovery off
+ * must clear those configs ONCE, without also clearing the retained states,
+ * which stay true whether or not anyone is running Home Assistant. */
+static bool s_ann_sw_ha;
+
 /* The shared entities have been cleared for a discovery-off config. Latched so a
  * box that never had discovery on does not re-publish the same four empty
  * retained payloads on every single reconnect. */
@@ -176,6 +224,8 @@ typedef enum {
     MSG_PRESS,        /* a stored signal was recognized                         */
     MSG_TRANSMIT,     /* <base>/button/<slug>/press arrived                     */
     MSG_FIRE,         /* <base>/trigger/<suffix> arrived                        */
+    MSG_SET_SWITCH,   /* <base>/switch/<suffix>/set arrived                     */
+    MSG_SWITCH_STATE, /* a switch moved elsewhere: republish the retained state */
     MSG_EVENT,        /* a node fired / a system event                          */
     MSG_STOP,
 } db_mqtt_msg_kind_t;
@@ -262,6 +312,14 @@ static void topic_of(char *out, size_t outsz, const char *suffix)
 static void button_topic(char *out, size_t outsz, const char *slug, const char *leaf)
 {
     snprintf(out, outsz, "%s/button/%s/%s", s_base, slug, leaf);
+}
+
+/* <base>/switch/<suffix>/set | .../state. The suffix is the user's own topic
+ * field, so it may legitimately contain '/' — which is why the set subscription
+ * cannot be a wildcard the way <base>/button/+/press is. */
+static void switch_topic(char *out, size_t outsz, const char *suffix, const char *leaf)
+{
+    snprintf(out, outsz, "%s/switch/%s/%s", s_base, suffix, leaf);
 }
 
 static void disc_topic(char *out, size_t outsz, const char *component, const char *object)
@@ -483,6 +541,132 @@ static void announce_virtual_button(const db_node_t *n)
     char dt[DB_MQTT_DISC_MAX];
     disc_topic(dt, sizeof(dt), "button", object);
     pub_json(dt, d, 1, 1);
+}
+
+/*
+ * The object_id / unique_id fragment for a switch topic. Derived from the topic
+ * SUFFIX and not from a node id, because the topic is what the entity is: rename
+ * the node and the toggle keeps its identity, point two nodes at the same suffix
+ * and they share one toggle. A suffix that slugifies to nothing (say "///") falls
+ * back to the node, so an entity is still addressable rather than silently
+ * dropped.
+ */
+static void switch_object(char *out, size_t outsz, const db_mqtt_switch_t *sw)
+{
+    char slug[DB_MQTT_SLUG_MAX];
+    slugify(sw->suffix, slug, sizeof(slug));
+    if (slug[0]) snprintf(out, outsz, "sw_%s", slug);
+    else         snprintf(out, outsz, "sw_node%u", (unsigned)sw->node_id);
+}
+
+/*
+ * A native Home Assistant `switch` entity — the whole point of the feature. Not
+ * a template, not a light, not a binary_sensor with a companion button: a real
+ * toggle, with a command topic HA writes and a retained state topic it reads
+ * back, which is what makes "turn the outside bell off" an automation anyone can
+ * write in the UI.
+ *
+ * optimistic is left OFF (the default when a state_topic is given) on purpose:
+ * HA waits to see the box confirm the move on the retained state topic, so a
+ * toggle that did not reach a box which is offline snaps back instead of lying.
+ */
+static void announce_switch(const db_mqtt_switch_t *sw)
+{
+    const db_node_t *n = db_graph_node(sw->node_id);
+
+    cJSON *d = cJSON_CreateObject();
+    if (!d) return;
+
+    /* One node on the topic: the node's own name. Several: still one toggle, and
+     * it must say so, or a user wonders which of their three switches it is. */
+    char name[DB_NODE_NAME_MAX + 24];
+    const char *base = (n && n->name[0]) ? n->name : sw->suffix;
+    /* The explicit precision is not decoration: `base` may be a topic suffix
+     * (48 bytes) rather than a node name (32), and without it gcc cannot prove
+     * the " (N paths)" tail fits and -Werror=format-truncation trips — the same
+     * reasoning as slug_table_build(). */
+    if (sw->count > 1)
+        snprintf(name, sizeof(name), "%.40s (%u paths)", base, (unsigned)sw->count);
+    else
+        snprintf(name, sizeof(name), "%.50s", base);
+    cJSON_AddStringToObject(d, "name", name);
+
+    char object[DB_MQTT_SLUG_MAX + 12];
+    switch_object(object, sizeof(object), sw);
+
+    char buf[DB_MQTT_SLUG_MAX + 80];
+    snprintf(buf, sizeof(buf), "%s_%s", s_dev_uid, object);
+    cJSON_AddStringToObject(d, "unique_id", buf);
+    snprintf(buf, sizeof(buf), "%s_%s", s_dev_slug, object);
+    cJSON_AddStringToObject(d, "object_id", buf);
+
+    char t[DB_MQTT_TOPIC_MAX];
+    switch_topic(t, sizeof(t), sw->suffix, "set");
+    cJSON_AddStringToObject(d, "command_topic", t);
+    switch_topic(t, sizeof(t), sw->suffix, "state");
+    cJSON_AddStringToObject(d, "state_topic", t);
+    cJSON_AddStringToObject(d, "payload_on", "ON");
+    cJSON_AddStringToObject(d, "payload_off", "OFF");
+    cJSON_AddStringToObject(d, "state_on", "ON");
+    cJSON_AddStringToObject(d, "state_off", "OFF");
+    cJSON_AddStringToObject(d, "icon", "mdi:toggle-switch-outline");
+    add_availability(d);
+    add_device(d);
+
+    char dt[DB_MQTT_DISC_MAX];
+    disc_topic(dt, sizeof(dt), "switch", object);
+    pub_json(dt, d, 1, 1);
+}
+
+/*
+ * Clear the retained discovery config of a switch topic, and — when `gone` — the
+ * retained STATE with it.
+ *
+ * The two are separate because the two reasons to retire are separate. A topic
+ * no node carries any more must leave NOTHING behind, state included, or the
+ * next subscriber is told the position of a switch that does not exist. Home
+ * Assistant discovery merely being switched off is not that: the topic is still
+ * live, still commandable from mosquitto_pub, and its retained state is still
+ * the truth — only the HA entity goes.
+ */
+static void retire_switch(const char *suffix, bool gone)
+{
+    db_mqtt_switch_t sw = { .node_id = 0, .count = 0 };
+    strlcpy(sw.suffix, suffix, sizeof(sw.suffix));
+
+    char object[DB_MQTT_SLUG_MAX + 12];
+    switch_object(object, sizeof(object), &sw);
+    char dt[DB_MQTT_DISC_MAX];
+    disc_topic(dt, sizeof(dt), "switch", object);
+    pub(dt, "", 1, 1);
+
+    if (gone) {
+        char t[DB_MQTT_TOPIC_MAX];
+        switch_topic(t, sizeof(t), suffix, "state");
+        pub(t, "", 1, 1);
+    }
+    ESP_LOGI(TAG, "retired %s for switch '%s'",
+             gone ? "discovery and state" : "discovery", suffix);
+}
+
+/*
+ * The retained position of every switch topic, in one pass.
+ *
+ * ON if ANY node on the topic conducts — db_graph_switch_topic_state() owns that
+ * rule and the reasoning behind it. Published on every connect, after any graph
+ * change, and whenever a switch moves, which between them are all the moments a
+ * subscriber could otherwise be holding a stale answer.
+ */
+static void publish_switch_states(void)
+{
+    char t[DB_MQTT_TOPIC_MAX];
+    for (int i = 0; i < s_sw_count; i++) {
+        bool found = false;
+        bool on = db_graph_switch_topic_state(s_sw[i].suffix, &found);
+        if (!found) continue;
+        switch_topic(t, sizeof(t), s_sw[i].suffix, "state");
+        pub(t, on ? "ON" : "OFF", 1, 1);
+    }
 }
 
 /*
@@ -820,18 +1004,16 @@ static void publish_event(uint8_t ev_kind, const db_trigger_t *t, uint16_t node_
 /* ---- announce: discovery + subscriptions ---------------------------------- */
 
 /* Reconcile the <base>/trigger/<suffix> subscriptions against the graph. The
- * broker forgets subscriptions across a disconnect, so s_resub_all makes the
- * next pass treat the table as empty and re-subscribe everything. */
-static void sync_trigger_subs(void)
+ * broker forgets subscriptions across a disconnect, so `resub` makes the pass
+ * treat the table as empty and re-subscribe everything. */
+static void sync_trigger_subs(bool resub)
 {
     char t[DB_MQTT_TOPIC_MAX];
     const db_node_t *nodes = db_graph_nodes();
     int n = db_graph_node_count();
 
-    if (s_resub_all) {
-        s_resub_all = false;
+    if (resub)
         s_sub_count = 0;   /* the broker dropped them; nothing to unsubscribe */
-    }
 
     /* Drop subscriptions whose node is gone, disabled, or no longer virtual. */
     for (int i = 0; i < s_sub_count;) {
@@ -870,6 +1052,69 @@ static void sync_trigger_subs(void)
 }
 
 /*
+ * The same job for <base>/switch/<suffix>/set, with two deliberate differences.
+ *
+ * IT COLLAPSES BY TOPIC. The table holds distinct suffixes, not nodes, so three
+ * switch nodes named "Outside bell" with one shared topic produce one
+ * subscription, one entity and one retained state.
+ *
+ * IT IGNORES `enabled`. On a switch node that flag is the POSITION, so dropping
+ * the subscription when it is false would strand every switch in the off
+ * position with no way back — the one bug this whole feature must not have.
+ */
+static void sync_switch_subs(bool resub)
+{
+    char t[DB_MQTT_TOPIC_MAX];
+    const db_node_t *nodes = db_graph_nodes();
+    int n = db_graph_node_count();
+
+    if (resub)
+        s_sw_count = 0;
+
+    /* Drop subscriptions whose topic no longer belongs to any switch node. */
+    for (int i = 0; i < s_sw_count;) {
+        bool still = false;
+        for (int j = 0; j < n && nodes && !still; j++) {
+            if (nodes[j].type != DB_NODE_LOGIC_SWITCH || !nodes[j].topic[0]) continue;
+            still = (strcmp(nodes[j].topic, s_sw[i].suffix) == 0);
+        }
+        if (still) {
+            i++;
+        } else {
+            switch_topic(t, sizeof(t), s_sw[i].suffix, "set");
+            esp_mqtt_client_unsubscribe(s_client, t);
+            ESP_LOGI(TAG, "unsubscribed %s", t);
+            s_sw[i] = s_sw[--s_sw_count];
+        }
+    }
+
+    /* Rebuild the naming/count metadata and subscribe to anything new. */
+    for (int i = 0; i < s_sw_count; i++) { s_sw[i].node_id = 0; s_sw[i].count = 0; }
+
+    for (int j = 0; j < n && nodes; j++) {
+        if (nodes[j].type != DB_NODE_LOGIC_SWITCH) continue;
+        if (!nodes[j].topic[0]) continue;   /* UI/REST only, by the user's choice */
+
+        int slot = -1;
+        for (int i = 0; i < s_sw_count; i++)
+            if (strcmp(s_sw[i].suffix, nodes[j].topic) == 0) { slot = i; break; }
+
+        if (slot < 0) {
+            if (s_sw_count >= DB_NODE_MAX) continue;
+            slot = s_sw_count++;
+            strlcpy(s_sw[slot].suffix, nodes[j].topic, DB_NODE_TOPIC_MAX);
+            s_sw[slot].node_id = 0;
+            s_sw[slot].count   = 0;
+            switch_topic(t, sizeof(t), nodes[j].topic, "set");
+            esp_mqtt_client_subscribe(s_client, t, 0);
+            ESP_LOGI(TAG, "subscribed %s -> node %u", t, nodes[j].id);
+        }
+        if (!s_sw[slot].node_id) s_sw[slot].node_id = nodes[j].id;
+        if (s_sw[slot].count < 255) s_sw[slot].count++;
+    }
+}
+
+/*
  * Re-resolve every slug, retire what disappeared, publish the current discovery
  * set, and re-sync the trigger subscriptions. Run on every (re)connect (retained
  * discovery must survive a broker restart, which loses it) and after any signal
@@ -881,6 +1126,11 @@ static void announce(void)
     slug_table_build();
 
     bool ha = s_cfg->mqtt_homeassistant;
+    /* Read once and clear once: BOTH subscription tables were dropped by the
+     * broker, and whichever ran second would otherwise see the flag already
+     * cleared and keep a table the broker no longer honours. */
+    bool resub = s_resub_all;
+    s_resub_all = false;
 
     /* Anything we announced under a slug that no longer resolves to the same
      * signal — deleted, renamed, or shuffled by collision resolution. */
@@ -917,7 +1167,31 @@ static void announce(void)
         strlcpy(s_ann_slug[i], s_slug[i], DB_MQTT_SLUG_MAX);
     }
 
-    sync_trigger_subs();
+    sync_trigger_subs(resub);
+
+    /*
+     * Switches. The subscriptions are reconciled whether or not HA discovery is
+     * on — a switch must stay controllable from a plain mosquitto_pub even for a
+     * user who has no Home Assistant at all — while only the ENTITY is optional.
+     * The retained state goes out either way, for the same reason.
+     */
+    sync_switch_subs(resub);
+    for (int i = 0; i < s_ann_sw_count; i++) {
+        bool still = false;
+        for (int j = 0; j < s_sw_count && !still; j++)
+            still = (strcmp(s_ann_sw[i], s_sw[j].suffix) == 0);
+        /* Gone for good: take the state with it. Still live but discovery has
+         * just been turned off: take only the entity. */
+        if (!still)              retire_switch(s_ann_sw[i], true);
+        else if (!ha && s_ann_sw_ha) retire_switch(s_ann_sw[i], false);
+    }
+    s_ann_sw_count = 0;
+    for (int j = 0; j < s_sw_count; j++) {
+        if (ha) announce_switch(&s_sw[j]);
+        strlcpy(s_ann_sw[s_ann_sw_count++], s_sw[j].suffix, DB_NODE_TOPIC_MAX);
+    }
+    s_ann_sw_ha = ha;
+    publish_switch_states();
 
     /* Virtual-source buttons: announce the live set, retire the rest. */
     for (int i = 0; i < s_ann_virt_count; i++) {
@@ -937,8 +1211,8 @@ static void announce(void)
     }
 
     publish_radio_state();
-    ESP_LOGI(TAG, "announced %d signal(s), %d virtual trigger(s)%s",
-             s_slug_count, s_sub_count, ha ? "" : " (HA discovery off)");
+    ESP_LOGI(TAG, "announced %d signal(s), %d virtual trigger(s), %d switch topic(s)%s",
+             s_slug_count, s_sub_count, s_sw_count, ha ? "" : " (HA discovery off)");
 }
 
 /* ---- inbound commands (executed on OUR task, never the event task) --------- */
@@ -1018,6 +1292,93 @@ static void handle_fire(const char *suffix)
              esp_err_to_name(err));
 }
 
+/*
+ * "Is this payload asking for ON or for OFF?"
+ *
+ * DELIBERATELY GENEROUS. This topic is the seam between the box and every other
+ * piece of software in a user's house: Home Assistant sends ON/OFF, a Node-RED
+ * inject node sends true/false, a shell one-liner sends 1/0, and a template that
+ * forgot its value_template sends {"state":"ON"}. Refusing any of those would
+ * present as "the switch does not work" with nothing in the log to explain it,
+ * so all of them are accepted and anything genuinely unreadable is REPORTED
+ * rather than silently treated as one position or the other.
+ *
+ * Returns false when the payload means nothing, leaving *on untouched.
+ */
+static bool switch_payload(const char *payload, bool *on)
+{
+    if (!payload) return false;
+    while (*payload == ' ' || *payload == '\t' ||
+           *payload == '\r' || *payload == '\n') payload++;
+
+    /* {"state":"ON"} and friends: pull the value out and fall through to the
+     * plain-word rules below, so JSON never gets its own second vocabulary. */
+    char jbuf[24];
+    if (*payload == '{') {
+        cJSON *j = cJSON_Parse(payload);
+        if (!j) return false;
+        cJSON *v = cJSON_GetObjectItem(j, "state");
+        if (!v) v = cJSON_GetObjectItem(j, "on");
+        if (!v) v = cJSON_GetObjectItem(j, "value");
+        bool got = false;
+        if (cJSON_IsBool(v))        { *on = cJSON_IsTrue(v); cJSON_Delete(j); return true; }
+        if (cJSON_IsNumber(v))      { *on = (v->valuedouble != 0); cJSON_Delete(j); return true; }
+        if (cJSON_IsString(v) && v->valuestring) {
+            strlcpy(jbuf, v->valuestring, sizeof(jbuf));
+            payload = jbuf;
+            got = true;
+        }
+        cJSON_Delete(j);
+        if (!got) return false;
+    }
+
+    if (strcasecmp(payload, "ON") == 0 || strcasecmp(payload, "true") == 0 ||
+        strcasecmp(payload, "1") == 0  || strcasecmp(payload, "open") == 0) {
+        *on = true;
+        return true;
+    }
+    if (strcasecmp(payload, "OFF") == 0 || strcasecmp(payload, "false") == 0 ||
+        strcasecmp(payload, "0") == 0   || strcasecmp(payload, "close") == 0) {
+        *on = false;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * <base>/switch/<suffix>/set arrived. Moves EVERY switch node carrying that
+ * suffix — the "one toggle, N switches" case the feature exists for — and then
+ * publishes the resulting position back, retained.
+ *
+ * The state is republished even when nothing moved. A subscriber that sent ON to
+ * a switch already ON has still asked a question, and answering it costs one
+ * retained publish while leaving it unanswered is how a dashboard toggle ends up
+ * stuck mid-animation.
+ */
+static void handle_switch_set(const char *suffix, const char *payload)
+{
+    bool on = false;
+    if (!switch_payload(payload, &on)) {
+        ESP_LOGW(TAG, "switch '%s': payload '%s' means neither ON nor OFF — ignored",
+                 suffix, payload ? payload : "");
+        return;
+    }
+
+    int matched = db_graph_switch_set_topic(suffix, on);
+    if (!matched) {
+        ESP_LOGW(TAG, "switch command for unknown topic '%s'", suffix);
+        return;
+    }
+
+    db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0, "MQTT: switch \"%s\" %s",
+                   suffix, on ? "ON" : "OFF");
+
+    char t[DB_MQTT_TOPIC_MAX];
+    switch_topic(t, sizeof(t), suffix, "state");
+    pub(t, on ? "ON" : "OFF", 1, 1);
+    ESP_LOGI(TAG, "MQTT switch '%s' -> %s (%d node(s))", suffix, on ? "ON" : "OFF", matched);
+}
+
 /* ---- the bridge task ------------------------------------------------------ */
 
 static void bridge_task(void *arg)
@@ -1052,6 +1413,12 @@ static void bridge_task(void *arg)
             break;
         case MSG_FIRE:
             handle_fire(m.arg);
+            break;
+        case MSG_SET_SWITCH:
+            handle_switch_set(m.arg, m.text);
+            break;
+        case MSG_SWITCH_STATE:
+            publish_switch_states();
             break;
         case MSG_EVENT:
             trigger_enrich(&m.trig);
@@ -1114,6 +1481,27 @@ static void route_inbound(const char *topic, int tlen, const char *data, int dle
         if (!suffix[0] || strlen(suffix) >= DB_MQTT_ARG_MAX) return;
         m.kind = MSG_FIRE;
         strlcpy(m.arg, suffix, sizeof(m.arg));   /* payload deliberately ignored */
+        post(&m);
+        return;
+    }
+
+    /* "<base>/switch/<suffix>/set". The suffix may itself contain '/', so the
+     * split is on the LAST separator, exactly as the button/press route does —
+     * and for the same reason it cannot be a '+' wildcard subscription. Unlike a
+     * trigger, the payload is the whole point here and is carried across. */
+    if (strncmp(rest, "switch/", 7) == 0) {
+        char *suffix = rest + 7;
+        char *leaf = strrchr(suffix, '/');
+        if (!leaf || strcmp(leaf, "/set") != 0) return;
+        *leaf = '\0';
+        if (!suffix[0] || strlen(suffix) >= DB_MQTT_ARG_MAX) return;
+        m.kind = MSG_SET_SWITCH;
+        strlcpy(m.arg, suffix, sizeof(m.arg));
+        if (dlen > 0) {
+            int n = dlen < (int)sizeof(m.text) - 1 ? dlen : (int)sizeof(m.text) - 1;
+            memcpy(m.text, data, (size_t)n);
+            m.text[n] = '\0';
+        }
         post(&m);
     }
 }
@@ -1279,6 +1667,9 @@ void db_mqtt_stop(void)
     s_ann_count = 0;
     s_ann_virt_count = 0;
     s_sub_count = 0;
+    s_sw_count = 0;
+    s_ann_sw_count = 0;
+    s_ann_sw_ha = false;
     s_shared_retired = false;
     ESP_LOGI(TAG, "stopped");
 }
@@ -1311,6 +1702,11 @@ void db_mqtt_on_signals_changed(void)
 void db_mqtt_on_graph_changed(void)
 {
     post_simple(MSG_ANNOUNCE);
+}
+
+void db_mqtt_on_switch_changed(void)
+{
+    post_simple(MSG_SWITCH_STATE);
 }
 
 void db_mqtt_sink(const db_node_t *node, const db_trigger_t *trig, void *ctx)

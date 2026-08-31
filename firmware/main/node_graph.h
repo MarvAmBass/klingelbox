@@ -1,10 +1,11 @@
 /*
  * node_graph.h - The routing engine: sources -> logic -> sinks.
  *
- * ...with one node type that is deliberately both ends at once. A 433 MHz
- * SIGNAL can be received or sent, so DB_NODE_SIGNAL has an input (transmit it)
- * and an output (it was heard). Everything else in this file is still strictly
- * left-to-right.
+ * EVERY NODE IS STRICTLY LEFT-TO-RIGHT. There was briefly one exception — a
+ * single DB_NODE_SIGNAL with a port at each end — and it is gone: a node whose
+ * behaviour depended on how the walk entered it is a node nobody can read off
+ * the screen. A 433 MHz signal can be received or sent, so it gets TWO node
+ * types, DB_NODE_SIGNAL_RX and DB_NODE_SIGNAL_TX, sharing one signal pool.
  *
  * This is what turns "a button was pressed" into "these chimes ring". Users
  * think in terms of wiring things together — this button rings that chime, these
@@ -69,23 +70,21 @@ extern "C" {
  */
 typedef enum {
     /*
-     * DB_NODE_SIGNAL — one stored 433 MHz signal, with BOTH ports.
+     * DB_NODE_SIGNAL_RX — "Signal receiver". One stored 433 MHz signal, heard.
      *
-     *          in o-[ Front door / EV1527 0xA685A ]-o out
+     *                    [ Front door / EV1527 0xA685A ]-o out
      *
-     *   in  -> transmit this signal (repeats / gap_us apply)
-     *   out -> fires when this signal is heard on air
+     * OUTPUT ONLY. It fires when its signal_id is recognized on air, and that
+     * is the whole of it. It transmits nothing, ever, on any path — which is
+     * what makes rx(A) -> ... -> tx(A) a loop the user can SEE rather than a
+     * loop the engine has to defend against from the inside.
      *
-     * A signal is not inherently an input or an output; it is a thing that can
-     * be received or sent. This node type says so. It replaces the old
-     * source.button (input only) and sink.transmit (output only), whose split
-     * made "ring my chime when this virtual trigger fires" wireable but
-     * "recognize the code my own box sends" not.
-     *
-     * It sits at slot 0, where source.button was, so every stored button node
-     * migrates by doing nothing at all.
+     * It sits at slot 0 — where source.button sat, and then the two-ported
+     * DB_NODE_SIGNAL — so the common stored node migrates by doing nothing at
+     * all. See migrate_nodes() in node_graph.c for how a v2 `signal` node is
+     * sorted into rx or tx by the links already attached to it.
      */
-    DB_NODE_SIGNAL = 0,
+    DB_NODE_SIGNAL_RX = 0,
 
     /* ---- sources: things that start a chain ---- */
     DB_NODE_SOURCE_GPIO = 1,   /* a wired button on a GPIO (see below)       */
@@ -102,17 +101,107 @@ typedef enum {
     DB_NODE_LOGIC_REPEAT,      /* auto-repeat: ring again, N times, spaced    */
 
     /* ---- sinks: things that act ---- */
-    /* RETIRED, NEVER REUSED. Slot 7 was sink.transmit; its behaviour is now the
-     * input side of DB_NODE_SIGNAL. The hole is deliberate: sink.mqtt keeps
+    /* RETIRED, NEVER REUSED. Slot 7 was sink.transmit; its behaviour is now
+     * DB_NODE_SIGNAL_TX (slot 11). The hole is deliberate: sink.mqtt keeps
      * slot 8 so that only ONE slot has to be remapped when a v1 blob is loaded,
      * and a stray 7 arriving from anywhere else must never silently become a
      * different node type. There is no wire name for it, so the REST API cannot
      * produce one. */
     DB_NODE__RETIRED_TRANSMIT = 7,
     DB_NODE_SINK_MQTT = 8,     /* publish an event                           */
+    /*
+     * DB_NODE_SINK_MONITOR — a sink that ACTS ON NOTHING.
+     *
+     * It records that it was reached and that is the whole of it: no radio, no
+     * broker, no GPIO. Drop one anywhere in a chain and the UI can show a lamp
+     * that lights when it fires plus a rolling ten-minute timeline of when it
+     * did — which is what makes a graph debuggable without ringing anything.
+     *
+     * Appended at the end of the enum, never inserted, so no stored blob moves
+     * and no migration is owed. `window_ms` is borrowed for how long the
+     * indicator stays lit per hit (see below); the hit ring itself lives in RAM
+     * in node_graph.c and is never persisted.
+     */
+    DB_NODE_SINK_MONITOR = 9,
+
+    /*
+     * DB_NODE_LOGIC_SWITCH — a switch in the wire.
+     *
+     *          in o-[ Outside bell        ON ]-o out
+     *
+     * Every other type in this enum is a source, a transform or a sink. This one
+     * sits IN a wire and decides whether it conducts: while it is ON an event
+     * passes straight through untouched, while it is OFF nothing gets past it.
+     * Until it existed the only way to stop a path was to delete the link, which
+     * is destructive and cannot be automated.
+     *
+     * ITS POSITION IS `enabled`. Not a second flag beside it — the SAME one. A
+     * disabled node is already skipped by traverse(), which is precisely
+     * "blocks", so a switch that is off and a node that is disabled are one idea
+     * and not two overlapping ones. That also means no new struct field, and
+     * therefore no change to the on-flash layout of db_node_t and no migration.
+     *
+     * The catch that comes with it is flash wear: the nodes blob is rewritten in
+     * full on every mutation, so a Home Assistant automation flapping a switch
+     * would write NVS on every toggle. The switch path therefore does NOT save
+     * synchronously — see db_graph_switch_set() and switch_save_service() in
+     * node_graph.c. RAM is authoritative, flash catches up when things go quiet.
+     *
+     * `topic` is reused as the MQTT suffix, exactly as SOURCE_VIRTUAL reuses it:
+     * <base>/switch/<topic>/set is subscribed and <base>/switch/<topic>/state is
+     * published retained. SEVERAL SWITCH NODES MAY SHARE ONE TOPIC — that is the
+     * feature, not an accident: one Home Assistant toggle then gates several
+     * paths at once. Nothing here or in mqtt_bridge.c may assume topic
+     * uniqueness.
+     *
+     * Appended at the end of the enum (slot 7 stays the retired hole), so no
+     * stored blob moves and no migration is owed.
+     */
+    DB_NODE_LOGIC_SWITCH = 10,
+
+    /*
+     * DB_NODE_SIGNAL_TX — "Signal sender". One stored 433 MHz signal, sent.
+     *
+     *          in o-[ Upstairs chime / EV1527 0x1D3F0 ]
+     *
+     * INPUT ONLY. Reaching it — over a link, or by firing it directly — puts
+     * its signal_id on the air, `repeats` copies `gap_us` apart. There is no
+     * second meaning and no context to check: a tx node asked to act sends.
+     *
+     * THE PAIR IS THE POINT. The old unified DB_NODE_SIGNAL did both jobs and
+     * chose between them by whether the traversal STARTED at it, because
+     * without that test every reception would instantly re-transmit what it had
+     * just heard. That flag is deleted, not moved: with one job per type the
+     * ports say which way events travel, and a signal that needs both
+     * directions is two nodes, wired however the user means them.
+     *
+     * Appended at the next free slot — 7 is the retired sink.transmit hole, 9
+     * is the monitor and 10 the switch — so no stored blob moves.
+     */
+    DB_NODE_SIGNAL_TX = 11,
 
     DB_NODE__COUNT
 } db_node_type_t;
+
+/* ---- monitor (visualizer) sink ----
+ *
+ * DEBUG TELEMETRY, RAM ONLY. A monitor's hits are never written to flash: a
+ * doorbell that logged every press to NVS would wear the part out for data
+ * nobody reads a minute later, which is the same reasoning event_log.h gives.
+ *
+ * Two independent bounds, both enforced on insert. The retention window is what
+ * the UI draws; the per-node cap is what stops a chatty band from turning a
+ * debug node into a memory cost. Whichever bites first, bites.
+ */
+#define DB_MONITOR_RETENTION_S 600   /* the ten minutes the timeline shows     */
+#define DB_MONITOR_HITS        64    /* hits kept per monitor node             */
+
+/* How long the indicator stays lit after a hit, in SECONDS on the wire. Stored
+ * in the shared `window_ms` field — no new struct field, so the on-flash layout
+ * of db_node_t is untouched. */
+#define DB_MONITOR_HOLD_MIN_S  1u
+#define DB_MONITOR_HOLD_MAX_S  60u
+#define DB_MONITOR_HOLD_DEF_S  3u
 
 typedef enum { DB_GROUP_ANY = 0, DB_GROUP_ALL } db_group_mode_t;
 
@@ -122,7 +211,10 @@ typedef struct {
     bool     enabled;
     char     name[DB_NODE_NAME_MAX];
 
-    /* DB_NODE_SIGNAL: which stored signal this node both listens for and sends. */
+    /* SIGNAL_RX: the stored signal this node listens for.
+     * SIGNAL_TX: the stored signal this node sends.
+     * ONE POOL, TWO TYPES — the same signal_id may legitimately appear on an rx
+     * node, on a tx node, or on several of each. */
     uint16_t signal_id;
 
     /* SOURCE_GPIO — an OPTIONAL wired button, fully configured from the web UI.
@@ -139,7 +231,7 @@ typedef struct {
     bool     gpio_active_low;
     uint16_t gpio_debounce_ms;
 
-    /* DB_NODE_SIGNAL: how the frame goes out. Real receivers usually require
+    /* DB_NODE_SIGNAL_TX: how the frame goes out. Real receivers usually require
      * several consistent copies before acting, so repeats is not cosmetic.
      *
      * LOGIC_REPEAT borrows `repeats` for a different but honestly named job: how
@@ -184,13 +276,17 @@ typedef struct {
     uint32_t window_ms;
     uint8_t  group_mode;                /* db_group_mode_t */
 
-    /* Topic suffix, used by two node types:
+    /* Topic suffix, used by three node types:
      *   SINK_MQTT     - published to as <base>/<topic> when the node fires.
      *   SOURCE_VIRTUAL- SUBSCRIBED to as <base>/trigger/<topic>; any message
      *                   arriving there fires the node. This is what makes a
      *                   virtual input reachable from Home Assistant, Node-RED or
      *                   a shell one-liner, with no RF involved at all.
-     * Empty on a SOURCE_VIRTUAL means "not MQTT-triggerable" (UI/REST only). */
+     *   LOGIC_SWITCH  - SUBSCRIBED to as <base>/switch/<topic>/set, and its
+     *                   position published retained on <base>/switch/<topic>/state.
+     *                   Deliberately NOT unique: several switch nodes may carry
+     *                   the same topic so that one HA toggle gates all of them.
+     * Empty on a SOURCE_VIRTUAL or a LOGIC_SWITCH means "no MQTT" (UI/REST only). */
     char     topic[DB_NODE_TOPIC_MAX];
 
     /* UI canvas position. Stored so a layout survives a reboot; ignored by the
@@ -251,17 +347,65 @@ void db_graph_node_defaults(db_node_t *node, db_node_type_t type);
 void db_graph_set_transmit_handler(db_sink_fn fn, void *ctx);
 void db_graph_set_mqtt_handler(db_sink_fn fn, void *ctx);
 
+/* ---- monitor readout ----
+ *
+ * Copy up to `max` hit timestamps for one DB_NODE_SINK_MONITOR node, NEWEST
+ * FIRST, in esp_timer microseconds — the same clock esp_timer_get_time()
+ * returns, so a caller reports ages by subtraction and needs no wall clock. The
+ * box may have no time source at all, which is precisely why this is not epoch
+ * seconds. Anything older than DB_MONITOR_RETENTION_S is already gone. Returns
+ * how many were written; 0 for any other node type. */
+int db_graph_monitor_hits(uint16_t node_id, int64_t *out_us, int max);
+
+/* The indicator hold of a monitor node in seconds, defaulted and clamped to
+ * DB_MONITOR_HOLD_MIN_S..MAX_S. One place decides it, so the value the API
+ * reports is the value the UI lights by. */
+uint16_t db_graph_monitor_hold_s(const db_node_t *n);
+
+/* ---- logic.switch --------------------------------------------------------
+ *
+ * The position of a switch node is its `enabled` flag (see DB_NODE_LOGIC_SWITCH
+ * above). These are the ONLY writers that a Home Assistant automation can reach,
+ * so they are also the only ones that must not put the flash under it.
+ *
+ * RAM IS AUTHORITATIVE, FLASH CATCHES UP. A change takes effect on the very next
+ * traversal, and the blob is written back once the position has been stable for
+ * a while — never once per toggle. A reboot therefore comes up in the last
+ * settled position rather than a position nobody chose, and the box re-publishes
+ * that position retained on connect, so Home Assistant is never left showing a
+ * switch the box is not actually in.
+ */
+
+/* Set one switch node by id. ESP_ERR_NOT_FOUND if there is no such node,
+ * ESP_ERR_INVALID_ARG if it is not a DB_NODE_LOGIC_SWITCH. */
+esp_err_t db_graph_switch_set(uint16_t node_id, bool on);
+
+/* Set EVERY switch node carrying `topic` — the "one HA toggle, N switches" case.
+ * Returns how many nodes it moved (0 = no switch node has that topic). */
+int db_graph_switch_set_topic(const char *topic, bool on);
+
+/*
+ * The position to report for `topic`, and whether any switch node carries it.
+ *
+ * ANY-OF, deliberately. Nodes sharing a topic can only diverge by someone moving
+ * one of them from the UI, and the question Home Assistant is really asking is
+ * "can anything get through?". Reporting ON while one path conducts is honest;
+ * an ALL-of rule would show OFF while the inside bell still rang.
+ */
+bool db_graph_switch_topic_state(const char *topic, bool *found_out);
+
 /* ---- entry points that start a traversal ---- */
 
 /*
  * An RF burst arrived. Fires:
- *   - every enabled DB_NODE_SIGNAL node bound to trig->signal_id (when non-zero), and
+ *   - every enabled DB_NODE_SIGNAL_RX node bound to trig->signal_id (when
+ *     non-zero), and
  *   - every enabled SOURCE_ANY_RF node, ALWAYS — including for bursts that match
  *     no stored signal.
  *
- * A signal node reached this way is acting as an INPUT: its output side fires
- * and the walk continues into its children. It does NOT transmit — see
- * node_act() in node_graph.c for why a heard code must not re-send itself.
+ * DB_NODE_SIGNAL_TX nodes are never started by a burst, whatever they are bound
+ * to. That is the split doing its job: a heard code cannot re-send itself
+ * because the node that heard it has no transmit side to reach.
  *
  * SOURCE_ANY_RF is the "proxy everything to MQTT" primitive: wire one to a
  * sink.mqtt and Home Assistant sees every press on the band, registered or not.
@@ -277,7 +421,12 @@ void db_graph_on_rf(const db_trigger_t *trig);
  * path. */
 void db_graph_on_wired(uint16_t node_id);
 
-/* Fire one node directly (a SOURCE_VIRTUAL from the UI, or a test-fire). */
+/* Fire one node directly (a SOURCE_VIRTUAL from the UI, or a test-fire).
+ *
+ * A traversal simply STARTS at the node; nothing about it is special-cased any
+ * more, so what firing does is just what that node does. On a SIGNAL_RX that is
+ * "pretend this code was heard" — its output fires and nothing goes on air. On
+ * a SIGNAL_TX it is a transmit, exactly as an inbound link would have caused. */
 esp_err_t db_graph_fire_node(uint16_t node_id);
 
 /* ---- wired inputs ----

@@ -35,10 +35,6 @@
   --warn-bg: #fbeedd;
   --bad: #bd3a27;
   --bad-bg: #fbe6e2;
-  /* The fourth node group. A signal node has both ports and belongs to neither
-     the source nor the sink family, so it needs a colour of its own rather than
-     borrowing one and reading as the wrong kind of node at a glance. */
-  --signal: #7a3fb8;
   --chip: #edf0f5;
   --shadow: 0 1px 2px rgba(20, 30, 50, .07), 0 6px 18px rgba(20, 30, 50, .05);
   --shadow-lift: 0 8px 34px rgba(15, 22, 38, .22);
@@ -66,7 +62,6 @@
     --warn-bg: #33240f;
     --bad: #e8705d;
     --bad-bg: #3a1d17;
-    --signal: #b98ae6;
     --chip: #232b36;
     --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 6px 18px rgba(0, 0, 0, .3);
     --shadow-lift: 0 8px 34px rgba(0, 0, 0, .6);
@@ -90,7 +85,6 @@
   --warn-bg: #33240f;
   --bad: #e8705d;
   --bad-bg: #3a1d17;
-  --signal: #b98ae6;
   --chip: #232b36;
   --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 6px 18px rgba(0, 0, 0, .3);
   --shadow-lift: 0 8px 34px rgba(0, 0, 0, .6);
@@ -396,6 +390,47 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 .wave .mid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 4; }
 .wave-cap { font-size: .74rem; color: var(--muted); font-family: var(--mono); margin-top: .3rem; }
 
+/* ------------------------------------------------------ monitor (💡) node --
+   A Monitor node's whole value is what it LOOKS like, so its two pieces are
+   styled to be read at a glance rather than studied: a lamp that glows, and a
+   ten-minute strip.
+
+   The lamp FADES rather than snapping. A hard on/off at 1 Hz reads as a
+   flickering fault light; a ~350 ms ease makes the same event read as a pulse.
+   Both the colour and the glow are transitioned, and both are dropped under
+   prefers-reduced-motion, where an instant state change is the kinder one. */
+.lamp {
+  flex: none; display: inline-block; width: .7rem; height: .7rem; border-radius: 999px;
+  background: var(--line); border: 1px solid var(--line);
+  transition: background-color .35s ease, box-shadow .35s ease, border-color .35s ease;
+}
+.lamp.on {
+  background: var(--ok); border-color: var(--ok);
+  box-shadow: 0 0 0 .18rem var(--ok-bg), 0 0 .55rem var(--ok);
+}
+.lamp-lg { width: .9rem; height: .9rem; }
+@media (prefers-reduced-motion: reduce) { .lamp { transition: none; } }
+
+/* The strip. viewBox width is the retention in SECONDS and the aspect ratio is
+   not preserved, so it stretches to whatever it is given — 328 px inside a card
+   on a 360 px phone, wider on a laptop — and never overflows. Which is exactly
+   why the axis labels below are HTML: SVG text in here would be stretched
+   horizontally along with the marks. */
+.montl { margin-top: .45rem; }
+.montl-head { display: flex; align-items: center; gap: .4rem; margin-bottom: .2rem; }
+.montl-svg {
+  display: block; width: 100%; height: 26px;
+  background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+.montl-grid { stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.montl-hit { fill: var(--accent); }
+.montl-axis {
+  display: flex; justify-content: space-between; gap: .4rem;
+  font-size: .68rem; color: var(--muted); font-family: var(--mono); margin-top: .18rem;
+}
+.montl-axis > span:nth-child(2) { text-align: center; }
+.montl-empty { font-size: .74rem; color: var(--muted); margin-top: .1rem; }
+
 /* ------------------------------------------------------------------- meter -- */
 .meter { height: .5rem; border-radius: 999px; background: var(--sunk); overflow: hidden; }
 .meter > i { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
@@ -446,11 +481,15 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 
 /* ------------------------------------------------------------- node graph -- */
 .nodecard { border-left: 4px solid var(--line); }
-.nodecard.g-signal { border-left-color: var(--signal); }
 .nodecard.g-source { border-left-color: var(--ok); }
 .nodecard.g-logic  { border-left-color: var(--warn); }
 .nodecard.g-sink   { border-left-color: var(--accent); }
 .nodecard.off { opacity: .6; }
+/* A Switch that is OFF is not out of service — it is a working node doing its
+   job, and its job is to block. So it keeps full contrast (fading it would say
+   "ignore me" about the one node the user just went and changed) and instead
+   wears the red edge that everything downstream of it has inherited. */
+.nodecard.swoff { border-left-color: var(--bad); }
 .node-type { font-size: .7rem; font-weight: 700; text-transform: uppercase;
   letter-spacing: .04em; color: var(--muted); }
 .linkgroup { display: flex; flex-direction: column; gap: .35rem; }
@@ -489,10 +528,16 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 .canvas.panning { cursor: grabbing; }
 .canvas .lnk { fill: none; stroke: var(--muted); stroke-width: 1.6; opacity: .8; }
 .canvas .nbox { fill: var(--panel); stroke: var(--line); stroke-width: 1.5; }
-.canvas .nbox.g-signal { stroke: var(--signal); }
 .canvas .nbox.g-source { stroke: var(--ok); }
 .canvas .nbox.g-logic  { stroke: var(--warn); }
 .canvas .nbox.g-sink   { stroke: var(--accent); }
+/* Any node the engine will not enter — a Switch turned OFF, or a node disabled
+   by hand. Dashed outline and a faded interior, matching the broken wires that
+   leave it, so "nothing gets past here" reads off the picture without hovering
+   anything. The badges stay at full strength: the I/O that turns it back on
+   must not be the hardest thing on the box to see. */
+.canvas .nbox.off { stroke-dasharray: 4 4; opacity: .55; }
+.canvas g.node.off .ntitle, .canvas g.node.off .ntype { opacity: .55; }
 .canvas .ntitle { fill: var(--text); font-size: 12px; font-weight: 650;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
 .canvas .ntype { fill: var(--muted); font-size: 9px;
@@ -515,8 +560,76 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 .canvas .lnk-hit:hover + .lnk { stroke: var(--bad); opacity: 1; }
 .canvas .lnk { pointer-events: none; }
 .canvas .lnk.tmp { stroke: var(--accent); stroke-dasharray: 5 4; opacity: 1; }
+/* A wire that carries nothing, because a node at one of its ends is switched
+   off. Drawn BROKEN, not merely dimmed: a dashed line with wide gaps is what a
+   cut wire looks like in any diagram, and it survives a colourblind reader and
+   a phone screen in sunlight, neither of which a hue change does. The map is
+   the reason to look at the map — a blocked path has to be visibly blocked. */
+.canvas .lnk.blocked { stroke: var(--bad); stroke-dasharray: 3 7; opacity: .55; }
 .canvas.linking { cursor: crosshair; }
 .canvas.linking g.node .nbox { stroke-dasharray: 4 3; }
+
+/* ---- the badges on a node box ----
+   ONE shape for all of them, because several visual languages on a 168-unit box
+   is what turns a node into a toolbar. Each is a filled disc with a border and a
+   centred glyph, right-aligned in a strip inside the top edge: ✕ always
+   outermost at (NW-26, 14), the type's own badge — ▶, 💡 or a switch's I/O — at (NW-56, 14),
+   both drawn at r 9 under an r 13 transparent hit disc (the .port-grab trick).
+   renderCanvas() carries the arithmetic that keeps them off the ports. */
+.canvas .nhit { fill: transparent; cursor: pointer; }
+.canvas .nbadge { fill: var(--chip); stroke: var(--line); stroke-width: 1;
+  transition: fill .2s ease, stroke .2s ease; }
+.canvas .nbadge-gl { font-size: 9px; font-weight: 700; pointer-events: none;
+  user-select: none; -webkit-user-select: none; }
+
+/* ✕ — quiet at rest so a canvas of eight nodes is not eight red buttons, and
+   unmistakably destructive under the pointer. Colour only: pointer-events never
+   change, so nothing depends on hovering first on a touch laptop. */
+.canvas .nbadge-gl.ndel { fill: var(--muted); }
+.canvas g.node:hover .nbadge.ndel { fill: var(--bad-bg); stroke: var(--bad); }
+.canvas g.node:hover .nbadge-gl.ndel { fill: var(--bad); }
+
+/* ▶ — on a Signal sender this transmits on air from one click, so it is
+   coloured and outlined at rest rather than waiting for a hover to look like a
+   button. It wears the same treatment on the types whose ▶ is harmless: one
+   glyph, one affordance, and the tooltip is what says which direction. */
+.canvas .nbadge.nfire { fill: var(--ok-bg); stroke: var(--ok); stroke-width: 1.5; }
+.canvas .nbadge-gl.nfire { fill: var(--ok); }
+.canvas g.node:hover .nbadge.nfire { fill: var(--ok); }
+.canvas g.node:hover .nbadge-gl.nfire { fill: var(--accent-text); }
+/* Momentary flash when it is clicked: the eye is on the node, not on the
+   message line under the toolbar. */
+.canvas .nbadge.nfire.fired { fill: var(--ok); stroke: var(--ok); transition: fill .08s ease; }
+.canvas .nbadge.nfire.fired + .nbadge-gl.nfire { fill: var(--accent-text); }
+/* Unavailable — no signal bound, or no radio. Greyed rather than removed, so
+   the node still shows that it HAS a play action; clicking says why. */
+.canvas .nbadge.nfire.off,
+.canvas g.node:hover .nbadge.nfire.off { fill: var(--sunk); stroke: var(--line); }
+.canvas .nbadge-gl.nfire.off,
+.canvas g.node:hover .nbadge-gl.nfire.off { fill: var(--muted); }
+
+/* 💡 — the same badge, but a readout rather than a button: no hit disc, no
+   hover state. Dark at rest, lit on .on, and faded between the two (a slower
+   ease than the buttons use) so a hit reads as a pulse and not a flicker.
+   Mirrors .lamp above, which is the same indicator on the list card. */
+.canvas .nbadge.nlamp { fill: var(--sunk); stroke: var(--line); stroke-width: 1.5;
+  transition: fill .35s ease, stroke .35s ease; }
+/* I / O — a Switch's position, and a button. Both states are SOLID and coloured
+   at rest: this is the one badge whose current value is the information, so it
+   must never depend on a hover, and OFF must not read as "unavailable" the way
+   the greyed ▶ does. Green conducting, red blocking, the same two colours the
+   card chip and the wires after it use. */
+.canvas .nbadge.nsw { stroke-width: 1.5; }
+.canvas .nbadge.nsw.on  { fill: var(--ok);  stroke: var(--ok); }
+.canvas .nbadge.nsw.off { fill: var(--bad); stroke: var(--bad); }
+.canvas .nbadge-gl.nsw { fill: var(--accent-text); }
+.canvas g.node:hover .nbadge.nsw { stroke: var(--text); }
+/* Momentary confirmation on click, before the graph reload redraws it. */
+.canvas .nbadge.nsw.fired { stroke: var(--text); stroke-width: 2.5; }
+.canvas .nbadge.nlamp.on { fill: var(--ok); stroke: var(--ok); }
+@media (prefers-reduced-motion: reduce) {
+  .canvas .nbadge { transition: none; }
+}
 
 /* ---------------------------------------------------------- diagnostics -- */
 .diag { display: flex; flex-direction: column; gap: .5rem; }

@@ -90,6 +90,19 @@ void db_mqtt_on_signals_changed(void);
 void db_mqtt_on_graph_changed(void);
 
 /*
+ * A logic.switch moved from the UI or the REST API. Re-publishes the RETAINED
+ * <base>/switch/<topic>/state of every switch topic, so Home Assistant shows the
+ * position the box is actually in rather than the one it was last told about.
+ *
+ * Cheap and idempotent: it republishes all of them rather than tracking which
+ * one moved, because a graph holds at most DB_NODE_MAX nodes and getting this
+ * wrong means a stale toggle in somebody's dashboard. Not needed for a change
+ * that ARRIVED over MQTT — the bridge publishes that itself — and a no-op when
+ * MQTT is disabled or not started.
+ */
+void db_mqtt_on_switch_changed(void);
+
+/*
  * Node-graph MQTT sink. Matches db_sink_fn, so app_main registers it with
  * db_graph_set_mqtt_handler(db_mqtt_sink, NULL).
  *

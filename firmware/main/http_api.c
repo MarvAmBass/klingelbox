@@ -23,6 +23,7 @@
  *   DEL  /api/graph/nodes/<id>           delete (drops its links)
  *   POST /api/graph/nodes/<id>/fire      test-fire
  *   POST|DEL /api/graph/links            {"from":1,"to":2}
+ *   GET  /api/monitor                    every sink.monitor node + its recent hits
  *   GET  /api/gpio/available             pins offerable for a wired button
  *   GET  /api/events?since=<serial>      recent activity, newest first
  *   GET  /api/config   POST /api/config  non-secret configuration
@@ -962,10 +963,12 @@ static esp_err_t api_learn_accept(httpd_req_t *req)
  * below skips NULL entries for exactly that reason.
  */
 static const char *const NODE_TYPES[DB_NODE__COUNT] = {
-    /* One stored 433 MHz signal, with both ports: link INTO it to transmit that
-     * signal, link OUT of it to act on hearing it. Replaces the old
-     * source.button (in only) and sink.transmit (out only). */
-    [DB_NODE_SIGNAL]         = "signal",
+    /* One stored 433 MHz signal, in one direction each. signal.rx has an OUTPUT
+     * only and fires when that code is heard; signal.tx has an INPUT only and
+     * sends it when reached. Both name the same signal_id pool, so a code you
+     * both listen for and send is two nodes. */
+    [DB_NODE_SIGNAL_RX]      = "signal.rx",
+    [DB_NODE_SIGNAL_TX]      = "signal.tx",
     [DB_NODE_SOURCE_GPIO]    = "source.gpio",
     [DB_NODE_SOURCE_VIRTUAL] = "source.virtual",
     /* Wildcard: fires on every received burst, matched or not. It carries no
@@ -977,7 +980,15 @@ static const char *const NODE_TYPES[DB_NODE__COUNT] = {
      * apart. Named "repeat" and not "loop" because a loop in this engine means a
      * cycle in the wiring, which the graph refuses to walk. */
     [DB_NODE_LOGIC_REPEAT]   = "logic.repeat",
+    /* A switch in the wire: passes events while ON, blocks them while OFF. Its
+     * position is the node's own `enabled` flag — see node_graph.h — so a client
+     * reads it from there and moves it with POST .../switch, which is the one
+     * write path that does not put the flash under a Home Assistant automation. */
+    [DB_NODE_LOGIC_SWITCH]   = "logic.switch",
     [DB_NODE_SINK_MQTT]      = "sink.mqtt",
+    /* Watches a chain and acts on nothing: no radio, no broker. Its hits are
+     * read back from GET /api/monitor, not from this object. */
+    [DB_NODE_SINK_MONITOR]   = "sink.monitor",
 };
 
 static bool node_type_from_str(const char *s, db_node_type_t *out)
@@ -1048,7 +1059,7 @@ static void node_apply_json(db_node_t *n, const cJSON *j)
     if (json_bool(j, "gpio_active_low", &b)) n->gpio_active_low = b;
     if (json_num(j, "gpio_debounce_ms", &d)) n->gpio_debounce_ms = (uint16_t)clampl(d, 0, 2000);
     /* `repeats` means two different things, so it is bounded two different ways.
-     * On a signal node it is how many copies of the frame go out (up to 32 —
+     * On a signal.tx node it is how many copies of the frame go out (up to 32 —
      * cheap receivers want several). On a logic.repeat it is how many times the
      * chain fires in total, and 20 rings is already far past anything anyone
      * wants at their front door. Clamping here as well as in the engine keeps
@@ -1064,6 +1075,13 @@ static void node_apply_json(db_node_t *n, const cJSON *j)
         n->window_ms = (uint32_t)(clampd(d, 0.0, 6000.0) * 1000.0);
     else if (json_num(j, "window_ms", &d))
         n->window_ms = (uint32_t)clampl(d, 0, 6000000);
+    /* On a monitor the same field is the indicator hold, and 100 minutes of a
+     * lamp staying lit is not a setting anyone wants. Clamped after the general
+     * bound so the value echoed back is the value the UI will light by. */
+    if (n->type == DB_NODE_SINK_MONITOR && n->window_ms != 0)
+        n->window_ms = (uint32_t)clampl((double)n->window_ms / 1000.0,
+                                        (long)DB_MONITOR_HOLD_MIN_S,
+                                        (long)DB_MONITOR_HOLD_MAX_S) * 1000u;
     if (json_str(j, "group_mode", &s))
         n->group_mode = (uint8_t)(strcmp(s, "all") == 0 ? DB_GROUP_ALL : DB_GROUP_ANY);
     if (json_str(j, "topic", &s)) trim_copy(s, n->topic, sizeof(n->topic));
@@ -1088,6 +1106,59 @@ static esp_err_t api_graph_get(httpd_req_t *req)
         cJSON_AddNumberToObject(l, "from", ll[i].from);
         cJSON_AddNumberToObject(l, "to", ll[i].to);
         cJSON_AddItemToArray(links, l);
+    }
+    return send_json(req, root, "200 OK");
+}
+
+/*
+ * GET /api/monitor — every sink.monitor node and when it last fired.
+ *
+ * ONE CALL FOR THE WHOLE GRAPH, not one per node. The UI polls this about once
+ * a second to drive a lamp, and a per-node endpoint would multiply that by
+ * however many monitors someone dropped onto the canvas while debugging — which
+ * is exactly when they place the most.
+ *
+ * `hits` and `now_s` are DEVICE-UPTIME SECONDS from the same clock, newest
+ * first. The box may have no time source at all (no SNTP, no RTC), so an epoch
+ * timestamp would be a lie on a cold boot; ages come out of one subtraction
+ * instead, and a client needs nothing synchronized to draw the timeline.
+ *
+ * An empty `nodes` array is the honest answer when no monitor node exists, and
+ * is what lets the UI tell "this firmware has no monitors" (404) apart from
+ * "you have not added one" (200 with nothing in it).
+ */
+static esp_err_t api_monitor_get(httpd_req_t *req)
+{
+    int64_t now_us = esp_timer_get_time();
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "now_s", (double)(now_us / 1000000));
+    cJSON *arr = cJSON_AddArrayToObject(root, "nodes");
+
+    const db_node_t *nl = db_graph_nodes();
+    int nn = db_graph_node_count();
+    /* 512 bytes on a 10 KB worker stack (see http_api_start), reused per node
+     * rather than one buffer per monitor. On the stack and not static: two
+     * workers may serve this at once, and a shared buffer would let one node's
+     * hits be serialized into another node's array. */
+    int64_t hits[DB_MONITOR_HITS];
+
+    for (int i = 0; i < nn; i++) {
+        if (nl[i].type != DB_NODE_SINK_MONITOR)
+            continue;
+
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddNumberToObject(o, "id", nl[i].id);
+        cJSON_AddStringToObject(o, "name", nl[i].name);
+        cJSON_AddNumberToObject(o, "hold_s", db_graph_monitor_hold_s(&nl[i]));
+        cJSON_AddNumberToObject(o, "retention_s", DB_MONITOR_RETENTION_S);
+
+        int got = db_graph_monitor_hits(nl[i].id, hits, DB_MONITOR_HITS);
+        cJSON *h = cJSON_AddArrayToObject(o, "hits");
+        for (int k = 0; k < got; k++)
+            cJSON_AddItemToArray(h, cJSON_CreateNumber((double)(hits[k] / 1000000)));
+
+        cJSON_AddItemToArray(arr, o);
     }
     return send_json(req, root, "200 OK");
 }
@@ -1195,6 +1266,53 @@ static esp_err_t api_node_fire(httpd_req_t *req, uint16_t id)
     esp_err_t err = db_graph_fire_node(id);
     if (err != ESP_OK) return send_esp_err(req, err, "could not fire the node");
     return send_ok(req);
+}
+
+/*
+ * POST /api/graph/nodes/<id>/switch — `{"on":true}` on a logic.switch node.
+ *
+ * WHY THIS EXISTS RATHER THAN JUST POSTING {"enabled":false}. Both move the same
+ * flag, and the plain node update still works — but it persists synchronously,
+ * the way every other graph mutation does. That is right for a person editing a
+ * node and wrong for the thing this feature is FOR: a Home Assistant automation
+ * flipping a switch, possibly often. This route hands the change to
+ * db_graph_switch_set(), which puts it in RAM at once and lets the graph task
+ * write it back when the position settles (see node_graph.h).
+ *
+ * Answering with the whole node object, not just an ack, is deliberate: `enabled`
+ * IS the position, so the caller gets the new state from the same field it would
+ * have read anyway, and there is no second representation to keep in step.
+ */
+static esp_err_t api_node_switch(httpd_req_t *req, uint16_t id)
+{
+    const db_node_t *cur = db_graph_node(id);
+    if (!cur) return send_error(req, "404 Not Found", "no such node");
+
+    cJSON *j = read_json(req);
+    if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
+    bool on;
+    /* "on" is canonical; "enabled" is accepted because that is the field the
+     * same value is reported in, and a caller that mirrors GET /api/graph back
+     * should not have to learn a second spelling. */
+    if (!json_bool(j, "on", &on) && !json_bool(j, "enabled", &on)) {
+        cJSON_Delete(j);
+        return send_error(req, "400 Bad Request", "on must be true or false");
+    }
+    cJSON_Delete(j);
+
+    esp_err_t err = db_graph_switch_set(id, on);
+    if (err == ESP_ERR_INVALID_ARG)
+        return send_error(req, "409 Conflict",
+                          "that node is not a logic.switch — only a switch has a position");
+    if (err != ESP_OK) return send_esp_err(req, err, "could not move the switch");
+
+    /* Retained state out to the broker straight away, so Home Assistant shows the
+     * position the box is actually in even when the move came from this page. */
+    db_mqtt_on_switch_changed();
+
+    const db_node_t *updated = db_graph_node(id);
+    if (!updated) return send_error(req, "404 Not Found", "no such node");
+    return send_json(req, node_json(updated), "200 OK");
 }
 
 /* Both link routes take {"from":1,"to":2}; DELETE carries it in the body too. */
@@ -1402,6 +1520,14 @@ static esp_err_t api_config_get(httpd_req_t *req)
 
     cJSON *ota = cJSON_AddObjectToObject(root, "ota");
     cJSON_AddStringToObject(ota, "url", s_cfg->ota_url);
+    /* The stable release assets, so the UI can prefill the manual "update from a
+     * URL" fields instead of asking someone to type a GitHub path from memory.
+     * Served rather than hardcoded in the UI so a fork that changes
+     * DB_UPDATE_REPO_SLUG changes what its own web UI offers, with no second
+     * edit. Neither is used by the automatic check, which follows the URLs it
+     * discovers inside the release document. */
+    cJSON_AddStringToObject(ota, "default_url", DB_UPDATE_APP_URL);
+    cJSON_AddStringToObject(ota, "default_webui_url", DB_UPDATE_WEBUI_URL);
 
     return send_json(req, root, "200 OK");
 }
@@ -1696,9 +1822,15 @@ static esp_err_t api_ota_url(httpd_req_t *req, bool webui)
     if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
     const char *url = NULL;
     if (!json_str(j, "url", &url) || !url[0]) {
-        /* The app OTA may fall back to the stored default; the web-UI one has no
-         * sensible default, since it is a different image entirely. */
-        url = webui ? NULL : (s_cfg->ota_url[0] ? s_cfg->ota_url : NULL);
+        /* Both kinds now have a default, because both have a published release
+         * asset (update_check.h). The app falls back to the STORED url first —
+         * that is the one this box was last told to use, and a user who pointed
+         * it at their own build must not have it silently replaced by upstream's
+         * — and only then to the built-in default. The web UI has nothing stored
+         * (it is a different image, and remembering it would need a second config
+         * field), so it goes straight to its default. */
+        url = webui ? DB_UPDATE_WEBUI_URL
+                    : (s_cfg->ota_url[0] ? s_cfg->ota_url : DB_UPDATE_APP_URL);
     }
     if (!url) {
         cJSON_Delete(j);
@@ -1914,6 +2046,7 @@ static esp_err_t get_router(httpd_req_t *req)
     }
     if (uri_is(u, "/api/learn"))          return api_learn_get(req);
     if (uri_is(u, "/api/graph"))          return api_graph_get(req);
+    if (uri_is(u, "/api/monitor"))        return api_monitor_get(req);
     if (uri_is(u, "/api/gpio/available")) return api_gpio_available(req);
     if (uri_is(u, "/api/events"))         return api_events(req);
     if (uri_is(u, "/api/config"))         return api_config_get(req);
@@ -1960,6 +2093,7 @@ static esp_err_t post_router(httpd_req_t *req)
         uint16_t id = path_id(u, "/api/graph/nodes/", tail, sizeof(tail));
         if (id && !tail[0])                   return api_node_update(req, id);
         if (id && strcmp(tail, "/fire") == 0) return api_node_fire(req, id);
+        if (id && strcmp(tail, "/switch") == 0) return api_node_switch(req, id);
         return send_error(req, "404 Not Found", "no such endpoint");
     }
 

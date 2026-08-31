@@ -208,10 +208,77 @@ links as cubic béziers. Dragging a node persists `ui_x`/`ui_y`; tapping one
 opens the *same* editor sheet the list uses, so the two views can never diverge
 in capability.
 
+A node box may carry up to two **badges**. The layout is **one design**, not two
+additions: the ports are the fixed furniture — they sit on the vertical centre
+line at `(0, NH/2)` and `(NW, NH/2)`, the output one hiding a 13-unit
+`.port-grab` disc. The badges get a strip of their own along the **inside of the
+top edge**, right-aligned, and the box grew from `168 × 52` to `168 × 60` to
+give them that strip rather than making them sit on the title.
+
+Every badge is the same shape — a filled disc with a border and a centred glyph,
+so it reads as a button and not as a loose mark. ✕ is always outermost, so its
+position never shifts with the node type; the slot to its left holds whatever
+that type has.
+
+| badge | centre | drawn r | hit r | on |
+|---|---|---|---|---|
+| ▶ act | `(NW-56, 14)` = `(112, 14)` | 9 | 13 | `signal`, `source.virtual` |
+| 💡 lamp | `(NW-56, 14)` = `(112, 14)` | 9 | — (readout, not a button) | `sink.monitor` |
+| ✕ delete | `(NW-26, 14)` = `(142, 14)` | 9 | 13 | every node |
+
+No type carries both ▶ and 💡, so two slots is the whole vocabulary. The
+separations:
+
+| pair | centre-to-centre | combined radii |
+|---|---|---|
+| ✕ ↔ output grab `(NW, NH/2)` = `(168, 30)` | `√(26² + 16²) = 30.5` | `13 + 13 = 26` |
+| ✕ ↔ act badge | `30` | `13 + 13 = 26` |
+| act badge ↔ input port `(0, 30)` | `√(112² + 16²) = 113.1` | `13 + 0` (no grab disc) |
+| ✕ ↔ input port | `√(142² + 16²) = 142.9` | `13 + 0` |
+
+The natural inset corner `(NW-16, 14)` = `(152, 14)` is only **22.6** from the
+output port — a 13-unit hit disc there already overlaps the 13-unit grab — which
+is why ✕ is inset a further ten units instead. Vertically the badges end at
+`y = 27` and the title's cap height starts at `y = 31`, so **no title is
+truncated to make room**: every type keeps the same 22 characters at the same
+`x = 12`, and a node with no badges reads exactly as one with them.
+
+**▶ always means "do this node's own thing, now."** The action follows the type:
+
+| type | ▶ does |
+|---|---|
+| `signal` | `POST /api/signals/{id}/transmit` — sends the code **over the air**, with the node's own `repeats`/`gap_us` |
+| `source.virtual` | `POST /api/graph/nodes/{id}/fire` — fires its output |
+| `source.gpio`, `source.any_rf` | **none** — they are driven by the physical world and a fake press would be a lie |
+| `logic.*`, `sink.mqtt` | **none** — firing a logic node starts a traversal *at* it, and `traverse()` never gates its own start, so ▶ on a Rate limit would push an event through the very node whose job is to block one; ▶ on an MQTT sink would publish a real message with no trigger behind it. Both keep **Test fire** on the list card, where the wording can say what it really is. |
+
+▶ on a `signal` node is **audible** — one click can ring a chime in someone's
+house — so it is drawn as an outlined disc rather than a bare glyph, sits well
+clear of the drag surface, says *OVER THE AIR* in its `title`, and always
+reports back on the canvas message line. Deliberately **no** confirmation: it is
+not destructive, and a dialog on a play button is the wrong trade. It greys out,
+with the reason shown on click, when the node has no bound signal or
+`/api/system` reports no radio.
+
+Two acts, two glyphs, everywhere: **📡 sends a code OUT**, **📥 pretends one came
+IN**. That is why the signal card's simulate button is **📥 Simulate heard** and
+not `▶ Simulate heard` — ▶ is reserved for "do this node's thing", and on a
+signal node that is transmitting, so the same arrow would otherwise mean two
+opposite directions on one screen.
+
+Each interactive one calls `stopPropagation()` + `preventDefault()` on
+`pointerdown` — without it a click drags the node — and acts on `pointerup`, and
+each draws a transparent disc larger than its glyph, exactly as `.port-grab`
+does. While a link drag is in flight they stand aside entirely, so releasing a
+wire over a ✕ completes the link instead of deleting the node. ✕ goes through
+the *same* `confirmSheet` the editor's Delete uses; there is one delete path
+(`deleteNodeConfirmed`), shared by the card, the sheet and the map.
+
 ### Node types
 
 `signal` · `source.gpio` · `source.virtual` · `source.any_rf` ·
-`logic.group` · `logic.throttle` · `logic.repeat` · `sink.mqtt`
+`logic.group` · `logic.throttle` · `logic.repeat` · `sink.mqtt` ·
+`sink.monitor`
 
 * **`signal`** is one stored 433 MHz code and the only type with **both** ports.
   Its **output** fires when that code is heard on air; anything linked into its
@@ -221,7 +288,7 @@ in capability.
   into a 433 MHz button was refused, for a reason nothing on the screen
   explained. It gets its own group, its own colour, its own column in
   `nextPosition()`, and both connector dots on the canvas. Its card button says
-  **▶ Simulate heard**, not *Test fire*: firing a node runs its output, so on
+  **📥 Simulate heard**, not *Test fire*: firing a node runs its output, so on
   this type that means “pretend the code arrived” and deliberately does **not**
   transmit. Sending on demand is the 📡 Transmit button inside the node’s signal
   section.
@@ -236,13 +303,26 @@ in capability.
   `mosquitto_pub` line. The base comes from `GET /api/config`
   (`mqtt.base_topic`) — `klingelbox` appears only as placeholder text before
   that answer arrives. Empty topic is fine: the node still fires from the
-  **Trigger** button and from `POST /api/graph/nodes/{id}/fire`. If MQTT is
+  **▶ Trigger** button and from `POST /api/graph/nodes/{id}/fire`. If MQTT is
   disabled the topic is still settable, with an inline note that it starts
-  working once MQTT is enabled.
+  working once MQTT is enabled. Firing by hand is what this type is *for*, so
+  ▶ Trigger is offered in three places and is the card's **primary** button
+  rather than a muted test affordance: on the list card, at the top of the
+  editor sheet, and as a ▶ hit target on the canvas node.
 * **`source.any_rf`** is a wildcard with no parameters. The editor explains that
   it fires on every burst including unregistered ones, that it fires *in
   addition to* a matching `signal` node (intended, not double-firing), and
   that a `logic.throttle` belongs between it and its sink on a busy band.
+* **`sink.monitor`** is the one node that *does* nothing. It exists to be looked
+  at: a 💡 lamp that lights whenever the chain reaches it and a rolling
+  ten-minute timeline of its hits, drawn as inline SVG in the same style as the
+  waveform plot. The lamp appears on the node's list card **and** on its box on
+  the canvas, so a chain can be watched firing on the map. The strip is on the
+  card as well as in the editor sheet — 26 px tall and full-bleed, so it costs
+  one line and does not crowd anything at 360 px. Data comes from a single
+  `GET /api/monitor` on a named 1 s timer, started only while the Dashboard is
+  visible and only when at least one monitor node exists; a 404 there hides the
+  lamp, the strip and the palette entry together.
 
 ### Recipes
 
@@ -255,6 +335,9 @@ patterns need no special node type — only links:
 * **Proxy the whole band to Home Assistant** — `source.any_rf` → `sink.mqtt`.
 * **Ring the chime from HA** — `source.virtual` (trigger topic) → `signal`.
 * **Stop a stuck button** — `signal` → `logic.throttle` → `signal`.
+* **Test a chain without ringing anything** — `source.virtual` (▶) →
+  `sink.monitor` (💡). Tap ▶ on the card, in the editor or on the canvas node and
+  watch the lamp light and the mark land on the timeline.
 
 ---
 

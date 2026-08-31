@@ -42,12 +42,13 @@
  * wires A -> B -> A therefore gets one warning and a stopped branch instead of a
  * stack overflow. DB_GRAPH_MAX_DEPTH bounds a long acyclic chain on top of that.
  *
- * That guard carries the weight now that DB_NODE_SIGNAL has both ports and a
- * cycle is something a user can draw without meaning to. A -> A is refused
- * outright by db_graph_add_link(); A -> B -> A is walked once and stopped by the
- * mark. What the mark cannot see is a cycle closed OVER THE AIR — signal node A
- * transmits, a receiver echoes it, signal node A hears it and starts a fresh
- * traversal. That one is rf_service's TX echo window's job, not this file's.
+ * A -> A is refused outright by db_graph_add_link(); A -> B -> A is walked once
+ * and stopped by the mark. What the mark cannot see is a cycle closed OVER THE
+ * AIR — a signal.tx sends code A, and a signal.rx bound to code A hears it and
+ * starts a fresh traversal. That one is rf_service's TX echo window's job, not
+ * this file's. The split makes such a loop legible rather than accidental: it
+ * is now two visibly different nodes with a wire between them, not one node
+ * quietly feeding itself.
  *
  * Note what the mark does NOT do. It never stops a node from fanning out to all
  * of its children, and it never stops two different parents from reaching a
@@ -111,12 +112,17 @@ static const char *TAG = "db_graph";
  *        DB_NODE_SIGNAL. Slot 0 is unchanged (see node_graph.h), so the whole
  *        migration is "type 7 becomes type 0"; nothing else moves, and
  *        db_node_t / db_link_t are byte-identical to v1.
+ *   v3 - that consolidation split again, into DB_NODE_SIGNAL_RX (slot 0, where
+ *        the unified type sat) and DB_NODE_SIGNAL_TX (slot 11, appended). Slot 0
+ *        is unchanged AGAIN, so a v2 node is already an rx node; the migration
+ *        only has to spot the ones that were being used as senders, and it reads
+ *        that off the links. db_node_t / db_link_t are still byte-identical.
  *
  * A blob whose version is OLDER than this is migrated on load and written back
  * in the current layout. A blob NEWER than this is refused, because guessing at
  * a layout from the future is how a downgrade eats a user's graph.
  */
-#define DB_GRAPH_VERSION 2u
+#define DB_GRAPH_VERSION 3u
 
 /* At most this many wired inputs. Fixed slots, never compacted: an ISR argument
  * is a slot index, and compacting the table under a live interrupt would point
@@ -162,6 +168,47 @@ static const char *TAG = "db_graph";
 #define DB_REPEAT_DEF_TIMES 3u
 #define DB_REPEAT_DEF_MS    5000u
 
+/* How many monitor nodes may hold a hit ring at once.
+ *
+ * A ring is claimed on a node's FIRST hit, not when the node is created, so a
+ * graph full of idle monitors costs nothing. Eight is well past what anyone
+ * places while debugging one chain, and it bounds the table at 8 * (64 * 8 + 8)
+ * bytes — about 4 KB of BSS, statically allocated like everything else here.
+ * Sizing it to DB_NODE_MAX instead would triple that for slots that would never
+ * be used. Overflow is logged once per node rather than hidden: a monitor whose
+ * lamp never lights is a confusing bug, and the log says why. */
+#define DB_MONITOR_SLOTS 8
+
+/*
+ * How the position of a logic.switch reaches flash.
+ *
+ * The problem this solves is stated in node_graph.h: a switch's position IS the
+ * node's `enabled` flag, the nodes blob is rewritten wholesale on every
+ * mutation, and a Home Assistant automation may flap that flag as fast as it
+ * likes. Saving synchronously the way every other mutation does would put an
+ * NVS write behind every toggle, which is a flash-wear bug waiting for the first
+ * user who wires a switch to a motion sensor.
+ *
+ * So the switch path writes RAM and marks the blob dirty. The graph task flushes
+ * it later, subject to two independent bounds:
+ *
+ *   DEBOUNCE  the position must have been STABLE this long. A run of toggles
+ *             collapses to one write of the final value, and a switch that is
+ *             flapping continuously is never written at all — there is no
+ *             settled position to record.
+ *   MIN_GAP   at least this long since the last switch-driven write, whatever
+ *             the debounce says. This is the hard ceiling: no pattern of
+ *             toggling, however adversarial, can make this path write NVS more
+ *             often than once per interval.
+ *
+ * The cost of both is bounded staleness — a power cut within a couple of minutes
+ * of a toggle comes back in the previous position. That is the right trade: the
+ * box publishes its ACTUAL position retained on every connect, so Home Assistant
+ * is never lied to, and the alternative is a doorbell that wears its flash out.
+ */
+#define DB_SWITCH_SAVE_DEBOUNCE_MS   10000u    /* stable for 10 s              */
+#define DB_SWITCH_SAVE_MIN_GAP_MS   120000u    /* at most one write per 2 min  */
+
 /* ---- persisted layout ---------------------------------------------------- */
 
 typedef struct {
@@ -177,6 +224,18 @@ typedef enum {
     TRIG_NODE,     /* arg = node id (UI/REST/MQTT fire, or a test-fire)          */
     TRIG_WIRED,    /* arg = node id, already debounced                           */
     TRIG_GPIO,     /* arg = GPIO slot index, straight from the ISR               */
+    /*
+     * Nothing to traverse — "look at your clock again".
+     *
+     * The graph task waits on this queue with portMAX_DELAY whenever nothing is
+     * owed, and graph_wait_ticks() is evaluated BEFORE it blocks. So a deadline
+     * that appears while it is already blocked (a switch moving, which arms a
+     * deferred write) would never be noticed: the task would sleep until the
+     * next press, and a position toggled on a quiet box would sit unwritten for
+     * hours. This wakes it so it recomputes the wait. It is not a poll — it is
+     * posted once, by the thing that created the deadline.
+     */
+    TRIG_WAKE,
 } trig_kind_t;
 
 typedef struct {
@@ -246,6 +305,28 @@ static pending_repeat_t s_repeat[DB_REPEAT_SLOTS];
  * one task ever walks the graph, and a walk is never re-entered. */
 static uint8_t s_repeat_hops;
 
+/*
+ * Monitor sinks: when each one was last reached. See node_graph.h for why this
+ * never touches flash.
+ *
+ * Keyed by NODE ID for the same reason the repeat table is: delete_node()
+ * shifts s_nodes[] under us, and an array index would quietly come to mean a
+ * different node. node_id 0 marks a free slot, so no separate count is needed.
+ *
+ * `us` is kept ASCENDING — [0] oldest, [n-1] newest. An ordinary array rather
+ * than a head/tail ring, because every operation this needs is cheaper on a
+ * sorted array: pruning the expired ones is one memmove of at most 512 bytes,
+ * on a path that only runs when a node actually fires, and the readout walks
+ * backwards to produce newest-first without any modular arithmetic.
+ */
+typedef struct {
+    uint16_t node_id;                 /* the monitor node; 0 = free slot     */
+    uint8_t  n;                       /* hits held, <= DB_MONITOR_HITS       */
+    int64_t  us[DB_MONITOR_HITS];     /* esp_timer_get_time(), ascending     */
+} monitor_ring_t;
+
+static monitor_ring_t s_monitor[DB_MONITOR_SLOTS];
+
 /* Wired inputs. pin < 0 means the slot is free. */
 typedef struct {
     int8_t   pin;
@@ -258,6 +339,14 @@ typedef struct {
 
 static gpio_slot_t s_gpio[DB_GPIO_SLOTS];
 static bool        s_isr_service_installed;
+
+/* Deferred persistence of switch positions. See DB_SWITCH_SAVE_* above.
+ *   s_switch_dirty     a switch moved and flash does not know it yet
+ *   s_switch_change_us when it last moved (restarts the debounce)
+ *   s_switch_saved_us  when this path last wrote the blob (0 = not yet) */
+static bool    s_switch_dirty;
+static int64_t s_switch_change_us;
+static int64_t s_switch_saved_us;
 
 /* ---- helpers ------------------------------------------------------------- */
 
@@ -284,14 +373,17 @@ static uint16_t next_free_node_id(void)
 static const char *type_name(uint8_t t)
 {
     switch (t) {
-    case DB_NODE_SIGNAL:         return "signal";
+    case DB_NODE_SIGNAL_RX:      return "signal.rx";
+    case DB_NODE_SIGNAL_TX:      return "signal.tx";
     case DB_NODE_SOURCE_GPIO:    return "source.gpio";
     case DB_NODE_SOURCE_VIRTUAL: return "source.virtual";
     case DB_NODE_SOURCE_ANY_RF:  return "source.any_rf";
     case DB_NODE_LOGIC_GROUP:    return "logic.group";
     case DB_NODE_LOGIC_THROTTLE: return "logic.throttle";
     case DB_NODE_LOGIC_REPEAT:   return "logic.repeat";
+    case DB_NODE_LOGIC_SWITCH:   return "logic.switch";
     case DB_NODE_SINK_MQTT:      return "sink.mqtt";
+    case DB_NODE_SINK_MONITOR:   return "sink.monitor";
     default:                     return "?";   /* incl. the retired slot 7 */
     }
 }
@@ -387,10 +479,19 @@ static int load_blob(const char *key, void *items, size_t item_size, int max,
     return n;
 }
 
-/* Caller holds the lock. */
+/* Caller holds the lock.
+ *
+ * Every path that writes the node array comes through here, which is why the
+ * deferred switch write is cleared here too: an ordinary mutation (a node added,
+ * renamed, deleted) has just persisted the whole array, switch positions
+ * included, so there is nothing left owing. Without this the graph task would
+ * wake later and write an identical blob for nothing. */
 static esp_err_t save_nodes(void)
 {
-    return save_blob(DB_GRAPH_NODES, s_nodes, sizeof(db_node_t), s_node_count);
+    esp_err_t err = save_blob(DB_GRAPH_NODES, s_nodes, sizeof(db_node_t), s_node_count);
+    if (err == ESP_OK)
+        s_switch_dirty = false;
+    return err;
 }
 
 /* Caller holds the lock. */
@@ -411,7 +512,7 @@ static esp_err_t save_links(void)
  *
  *     v1 slot 7 "sink.transmit"  ->  v2 slot 0 DB_NODE_SIGNAL
  *
- * Slot 0 was source.button and is now DB_NODE_SIGNAL, which is exactly why
+ * Slot 0 was source.button and became DB_NODE_SIGNAL, which is exactly why
  * every stored button node needs no work at all — the consolidation was
  * designed around keeping that slot. Everything the migrated node needs is
  * already in the struct: signal_id names the same stored signal, and repeats /
@@ -420,9 +521,29 @@ static esp_err_t save_links(void)
  * looking the same, with one extra input port on the nodes that used to be
  * transmit sinks.
  *
- * ADDING v3: add a `case 2:` below, and let `case 1:` fall INTO it, so a v1
- * blob is carried forward through every step in turn rather than needing its
- * own v1->v3 shortcut. (`case 1:` breaks today only because it is the last one.)
+ * v2 -> v3 splits that unified type back apart, into signal.rx (output only,
+ * still slot 0) and signal.tx (input only, slot 11). Slot 0 not moving is again
+ * what makes the common case free: a stored `signal` node IS an rx node
+ * already, and the only question is which of them were being used the other way
+ * round. The links answer it, because a two-ported node's wiring is the only
+ * record of which port the user actually meant:
+ *
+ *     has an outgoing link   -> signal.rx   (something downstream of it)
+ *     only incoming links    -> signal.tx   (it was the far end of a chain)
+ *     no links at all        -> signal.rx   (slot 0 keeps it, nothing to do)
+ *     BOTH directions        -> signal.rx, and SAY SO
+ *
+ * NOTHING IS INVENTED HERE. The both-directions node is the one case that
+ * genuinely needs two nodes now, and this migration deliberately does not
+ * create the second one or move any link onto it. A migration that rewires a
+ * user's graph is far harder to trust than one that reports: the node is kept
+ * as the receiver it most likely was, and the user is told — in the log for
+ * whoever is watching a console, and as a DB_EV_SYSTEM event naming the node
+ * for the user who is not — that it needs a sender adding.
+ *
+ * ADDING v4: add a `case 3:` below and let `case 2:` fall INTO it, so a v1 blob
+ * is carried forward through every step in turn rather than needing its own
+ * shortcut. (`case 2:` breaks today only because it is the last one.)
  *
  * Caller holds the lock. Returns how many nodes were changed.
  */
@@ -435,10 +556,60 @@ static int migrate_nodes(uint32_t from_version)
         for (int i = 0; i < s_node_count; i++) {
             if (s_nodes[i].type != DB_NODE__RETIRED_TRANSMIT)
                 continue;
-            s_nodes[i].type = DB_NODE_SIGNAL;
+            /* v1's sink.transmit became the two-ported v2 type at slot 0, which
+             * v2 -> v3 below then sorts into rx or tx like any other. */
+            s_nodes[i].type = DB_NODE_SIGNAL_RX;
             changed++;
             ESP_LOGI(TAG, "migrated node %u '%s': sink.transmit -> signal",
                      (unsigned)s_nodes[i].id, s_nodes[i].name);
+        }
+        /* Falls into the v2 -> v3 step, which then sorts these freshly retyped
+         * nodes by their links exactly like any other stored signal node — a v1
+         * sink.transmit only ever had incoming links, so it lands on tx. */
+        __attribute__((fallthrough));
+    case 2:
+        for (int i = 0; i < s_node_count; i++) {
+            /* Slot 0 held the unified `signal` type in v2 and holds signal.rx
+             * now, so this is exactly "every stored signal node". */
+            if (s_nodes[i].type != DB_NODE_SIGNAL_RX)
+                continue;
+
+            bool has_out = false, has_in = false;
+            for (int k = 0; k < s_link_count; k++) {
+                /* A link whose far end no longer exists says nothing about
+                 * which way this node was used — the dangling-link sweep in
+                 * db_graph_init() is about to drop it anyway. */
+                if (s_links[k].from == s_nodes[i].id &&
+                    node_index(s_links[k].to) >= 0)
+                    has_out = true;
+                if (s_links[k].to == s_nodes[i].id &&
+                    node_index(s_links[k].from) >= 0)
+                    has_in = true;
+            }
+
+            if (has_in && has_out) {
+                ESP_LOGW(TAG, "node %u '%s' was wired BOTH ways as a signal node "
+                              "and is now a receiver (signal.rx) only. Its "
+                              "incoming link(s) no longer transmit — add a "
+                              "Signal sender node for that code and wire them "
+                              "into it instead.",
+                         (unsigned)s_nodes[i].id, s_nodes[i].name);
+                db_events_push(DB_EV_SYSTEM, s_nodes[i].signal_id, s_nodes[i].id,
+                               0, 0, "\"%s\" needs a Signal sender",
+                               s_nodes[i].name[0] ? s_nodes[i].name : "signal");
+                continue;   /* stays rx: slot 0, nothing to write */
+            }
+
+            if (has_in) {
+                s_nodes[i].type = DB_NODE_SIGNAL_TX;
+                changed++;
+                ESP_LOGI(TAG, "migrated node %u '%s': signal -> signal.tx "
+                              "(only ever fed by a link)",
+                         (unsigned)s_nodes[i].id, s_nodes[i].name);
+            } else {
+                ESP_LOGI(TAG, "node %u '%s': signal -> signal.rx",
+                         (unsigned)s_nodes[i].id, s_nodes[i].name);
+            }
         }
         break;
     default:
@@ -596,6 +767,261 @@ static int64_t repeat_next_due_us(void)
     return best;
 }
 
+/* ---- monitor sinks ------------------------------------------------------- */
+
+uint16_t db_graph_monitor_hold_s(const db_node_t *n)
+{
+    if (!n)
+        return (uint16_t)DB_MONITOR_HOLD_DEF_S;
+    uint32_t s = n->window_ms / 1000u;
+    if (s == 0)                     s = DB_MONITOR_HOLD_DEF_S;  /* unset */
+    if (s < DB_MONITOR_HOLD_MIN_S)  s = DB_MONITOR_HOLD_MIN_S;
+    if (s > DB_MONITOR_HOLD_MAX_S)  s = DB_MONITOR_HOLD_MAX_S;
+    return (uint16_t)s;
+}
+
+/* Forget everything a monitor node has seen and give its slot back. Caller
+ * holds the lock. Same contract as repeat_cancel_node(), and needed for the
+ * same reason: node ids are reused, so a ring left behind by a deleted node
+ * would surface as somebody else's history. Returns 1 if a slot was freed. */
+static int monitor_clear_node(uint16_t node_id)
+{
+    for (int i = 0; i < DB_MONITOR_SLOTS; i++) {
+        if (s_monitor[i].node_id != node_id)
+            continue;
+        memset(&s_monitor[i], 0, sizeof(s_monitor[i]));
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * Record that a monitor node was reached. Caller holds the lock and is the
+ * graph task.
+ *
+ * PRUNE FIRST, ALWAYS. Anything past the retention window is dropped before the
+ * new hit is stored, so a busy band cannot push ten minutes of history out of
+ * the ring in a few seconds — the oldest thing in the buffer is never older
+ * than the window the UI claims to be showing. The per-node cap is the second
+ * bound and only bites inside the window: past DB_MONITOR_HITS hits in ten
+ * minutes the oldest is dropped, because a lamp and a timeline do not get more
+ * useful past sixty-odd marks.
+ */
+static void monitor_record(const db_node_t *n, int64_t now)
+{
+    int slot = -1, free_slot = -1;
+    for (int i = 0; i < DB_MONITOR_SLOTS; i++) {
+        if (s_monitor[i].node_id == n->id) { slot = i; break; }
+        if (s_monitor[i].node_id == 0 && free_slot < 0) free_slot = i;
+    }
+    if (slot < 0) {
+        if (free_slot < 0) {
+            /* Rate-limited by nature: this only speaks when a monitor fires
+             * that has no ring, and there are at most DB_NODE_MAX of those. */
+            ESP_LOGW(TAG, "monitor '%s': no free slot (max %d monitor nodes "
+                          "record hits at once) - its timeline stays empty",
+                     n->name, DB_MONITOR_SLOTS);
+            return;
+        }
+        slot = free_slot;
+        s_monitor[slot].node_id = n->id;
+        s_monitor[slot].n       = 0;
+    }
+
+    monitor_ring_t *m = &s_monitor[slot];
+    int64_t cutoff = now - (int64_t)DB_MONITOR_RETENTION_S * 1000000;
+
+    int drop = 0;
+    while (drop < m->n && m->us[drop] < cutoff)
+        drop++;
+    if (drop > 0) {
+        memmove(m->us, m->us + drop, (size_t)(m->n - drop) * sizeof(m->us[0]));
+        m->n = (uint8_t)(m->n - drop);
+    }
+    if (m->n >= DB_MONITOR_HITS) {
+        memmove(m->us, m->us + 1, (size_t)(DB_MONITOR_HITS - 1) * sizeof(m->us[0]));
+        m->n = DB_MONITOR_HITS - 1;
+    }
+    m->us[m->n++] = now;
+
+    ESP_LOGD(TAG, "monitor '%s' hit (%u in the last %ds)",
+             n->name, (unsigned)m->n, DB_MONITOR_RETENTION_S);
+}
+
+int db_graph_monitor_hits(uint16_t node_id, int64_t *out_us, int max)
+{
+    if (!out_us || max <= 0)
+        return 0;
+
+    lock();
+    int written = 0;
+    for (int i = 0; i < DB_MONITOR_SLOTS; i++) {
+        if (s_monitor[i].node_id != node_id)
+            continue;
+        const monitor_ring_t *m = &s_monitor[i];
+        /* Expired hits are pruned on insert, so a monitor that stopped firing
+         * would keep reporting stale marks until it fired again. Filter here
+         * too — the readout must never claim something happened inside a window
+         * it did not. */
+        int64_t cutoff = esp_timer_get_time() -
+                         (int64_t)DB_MONITOR_RETENTION_S * 1000000;
+        for (int k = m->n - 1; k >= 0 && written < max; k--) {
+            if (m->us[k] < cutoff)
+                break;              /* ascending, so everything below is older */
+            out_us[written++] = m->us[k];
+        }
+        break;
+    }
+    unlock();
+    return written;
+}
+
+/* ---- logic.switch -------------------------------------------------------- */
+
+/*
+ * Note what is NOT here: any code in node_passes() or traverse() for the switch
+ * type. There does not need to be. traverse() already refuses to enter a node
+ * whose `enabled` is false — and refuses before it even records the link
+ * crossing, so a blocked branch leaves no trace for an ALL-group downstream to
+ * mistake for an arrival. A switch's position being that same flag is exactly
+ * what makes "a switch in the wire" free: OFF is a node the walk does not enter,
+ * which is what "does not conduct" means.
+ */
+
+/* A switch moved. Caller holds the lock. Arms the deferred write; never touches
+ * flash itself.
+ *
+ * The wake-up is not optional. This runs on an HTTP worker or the MQTT bridge
+ * task, while the graph task is asleep on its queue with a timeout it worked out
+ * BEFORE this deadline existed. Without the nudge a box that nobody rings would
+ * keep the new position in RAM only — and lose it to the next power cut, which
+ * is exactly the failure this whole deferred scheme exists to avoid. A full
+ * queue is harmless: the task is plainly awake and will recompute its wait when
+ * it drains. */
+static void switch_mark_dirty(void)
+{
+    s_switch_dirty     = true;
+    s_switch_change_us = esp_timer_get_time();
+
+    if (s_queue) {
+        queued_t q;
+        memset(&q, 0, sizeof(q));
+        q.kind = TRIG_WAKE;
+        xQueueSend(s_queue, &q, 0);
+    }
+}
+
+/* When the pending switch write becomes due, or 0 when nothing is pending.
+ * Caller holds the lock. */
+static int64_t switch_save_due_us(void)
+{
+    if (!s_switch_dirty)
+        return 0;
+    int64_t debounce = s_switch_change_us + (int64_t)DB_SWITCH_SAVE_DEBOUNCE_MS * 1000;
+    int64_t floor_us = s_switch_saved_us
+                           ? s_switch_saved_us + (int64_t)DB_SWITCH_SAVE_MIN_GAP_MS * 1000
+                           : 0;
+    return debounce > floor_us ? debounce : floor_us;
+}
+
+/* Write the graph back if a switch position is owed and both bounds are
+ * satisfied. Caller holds the lock and is the graph task.
+ *
+ * A failed save leaves the dirty flag set on purpose: RAM is already correct, so
+ * the only thing lost is durability, and the next attempt is one interval away
+ * rather than never. */
+static void switch_save_service(int64_t now)
+{
+    int64_t due = switch_save_due_us();
+    if (due == 0 || now < due)
+        return;
+
+    if (save_nodes() == ESP_OK) {
+        s_switch_dirty    = false;
+        s_switch_saved_us = now;
+        ESP_LOGI(TAG, "switch positions written to flash");
+    } else {
+        /* Do not retry in a tight loop against a failing NVS. */
+        s_switch_saved_us = now;
+    }
+}
+
+esp_err_t db_graph_switch_set(uint16_t node_id, bool on)
+{
+    lock();
+    int i = node_index(node_id);
+    if (i < 0) {
+        unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (s_nodes[i].type != DB_NODE_LOGIC_SWITCH) {
+        unlock();
+        return ESP_ERR_INVALID_ARG;
+    }
+    bool changed = (s_nodes[i].enabled != on);
+    if (changed) {
+        s_nodes[i].enabled = on;
+        switch_mark_dirty();
+        ESP_LOGI(TAG, "switch '%s' (node %u) is now %s",
+                 s_nodes[i].name, (unsigned)node_id, on ? "ON" : "OFF");
+    }
+    unlock();
+    return ESP_OK;
+}
+
+int db_graph_switch_set_topic(const char *topic, bool on)
+{
+    if (!topic || !topic[0])
+        return 0;
+
+    lock();
+    int moved = 0, matched = 0;
+    for (int i = 0; i < s_node_count; i++) {
+        if (s_nodes[i].type != DB_NODE_LOGIC_SWITCH)
+            continue;
+        if (strcmp(s_nodes[i].topic, topic) != 0)
+            continue;
+        matched++;
+        if (s_nodes[i].enabled == on)
+            continue;
+        s_nodes[i].enabled = on;
+        moved++;
+    }
+    if (moved)
+        switch_mark_dirty();
+    unlock();
+
+    if (matched)
+        ESP_LOGI(TAG, "switch topic '%s' -> %s (%d node(s), %d moved)",
+                 topic, on ? "ON" : "OFF", matched, moved);
+    return matched;
+}
+
+bool db_graph_switch_topic_state(const char *topic, bool *found_out)
+{
+    if (found_out)
+        *found_out = false;
+    if (!topic || !topic[0])
+        return false;
+
+    lock();
+    bool found = false, any_on = false;
+    for (int i = 0; i < s_node_count; i++) {
+        if (s_nodes[i].type != DB_NODE_LOGIC_SWITCH)
+            continue;
+        if (strcmp(s_nodes[i].topic, topic) != 0)
+            continue;
+        found = true;
+        if (s_nodes[i].enabled)
+            any_on = true;
+    }
+    unlock();
+
+    if (found_out)
+        *found_out = found;
+    return any_on;
+}
+
 /* ---- gating logic -------------------------------------------------------- */
 
 /*
@@ -673,40 +1099,35 @@ static bool node_passes(db_node_t *n, int idx, int64_t now, const db_trigger_t *
 }
 
 /*
- * Perform whatever a node DOES on being reached. Only sinks act — and the input
- * side of a signal node, which is a sink in all but name; sources and logic
+ * Perform whatever a node DOES on being reached. Only sinks act — signal.tx
+ * among them, since transmitting is exactly what a sink does; sources and logic
  * nodes exist to route. Caller holds the lock and is the graph task.
  *
- * `is_start` says the node is where this traversal BEGAN rather than somewhere
- * it arrived over a link. That distinction is what makes DB_NODE_SIGNAL's two
- * ports mean different things:
+ * NO CONTEXT IS CONSULTED. This function is a pure function of the NODE, which
+ * it was not while one DB_NODE_SIGNAL type had to serve both directions: it
+ * took an `is_start` flag and transmitted only when the node had been reached
+ * over a link, because otherwise every reception would have re-sent what it had
+ * just heard. That flag is gone with the type it existed for. signal.rx has no
+ * case here at all — being heard is not an action, it is the start of one — and
+ * signal.tx has one meaning on every path that reaches it.
  *
- *   started here  -> the code was heard on air (or the node was test-fired).
- *                    The node's OUTPUT is what fired; the walk continues into
- *                    its children and nothing is transmitted.
- *   reached by a  -> something upstream is asking for this signal to go out.
- *   link             That is the INPUT, and it transmits.
- *
- * Acting on the start too would turn every signal node into an unrequested
- * repeater: hear the code, immediately say it again. Do not "simplify" this by
- * dropping the flag.
+ * If a future type ever wants to know how it was entered, give it two types
+ * instead. That is the lesson this file already paid for once.
  */
-static void node_act(const db_node_t *n, const db_trigger_t *trig, bool is_start)
+static void node_act(const db_node_t *n, const db_trigger_t *trig)
 {
     switch (n->type) {
-    case DB_NODE_SIGNAL:
-        if (is_start)
-            break;   /* the output side: heard, not asked to send */
+    case DB_NODE_SIGNAL_TX:
         if (!s_transmit.fn) {
             ESP_LOGW(TAG, "node %u '%s' wants to transmit but no handler is "
                           "registered", (unsigned)n->id, n->name);
             return;
         }
-        ESP_LOGI(TAG, "signal transmit: node %u '%s' -> signal %u x%u (from '%s')",
+        ESP_LOGI(TAG, "signal.tx: node %u '%s' -> signal %u x%u (from '%s')",
                  (unsigned)n->id, n->name, (unsigned)n->signal_id, n->repeats,
                  trig->label);
         db_events_push(DB_EV_NODE_FIRED, n->signal_id, n->id, trig->rssi_dbm,
-                       n->repeats, "%s", n->name[0] ? n->name : "signal");
+                       n->repeats, "%s", n->name[0] ? n->name : "signal sender");
         s_transmit.fn(n, trig, s_transmit.ctx);
         break;
 
@@ -721,6 +1142,20 @@ static void node_act(const db_node_t *n, const db_trigger_t *trig, bool is_start
         db_events_push(DB_EV_NODE_FIRED, trig->signal_id, n->id, trig->rssi_dbm,
                        trig->repeats, "%s", n->name[0] ? n->name : "mqtt");
         s_mqtt.fn(n, trig, s_mqtt.ctx);
+        break;
+
+    case DB_NODE_SINK_MONITOR:
+        /* The one sink with no handler and no side effect. It notes the time
+         * and stops — no radio, no broker, nothing injected, which is exactly
+         * what makes it safe to drop into a live chain to see whether that
+         * chain fires.
+         *
+         * Deliberately NOT pushed to the event log either. The event ring holds
+         * 48 entries shared by the whole box, and a monitor left wired to
+         * source.any_rf on a busy band would evict every real event with copies
+         * of "the monitor fired". Its history has a home of its own that the
+         * user asked for: GET /api/monitor. */
+        monitor_record(n, esp_timer_get_time());
         break;
 
     default:
@@ -739,9 +1174,10 @@ static void node_act(const db_node_t *n, const db_trigger_t *trig, bool is_start
  * step aside rather than restart its own run every time it rings. Do not "tidy"
  * this by gating the start.
  *
- * The start node is ALSO the one thing node_act() treats differently, for a
- * related reason: a signal node that a burst just fired is acting as an input,
- * not being asked to send. See node_act().
+ * The start node is otherwise ORDINARY. node_act() used to treat it specially,
+ * because the old two-ported signal type needed to know which of its jobs it
+ * was doing; signal.rx and signal.tx each do one, so nothing downstream of here
+ * cares where the walk began any more.
  *
  * Caller holds the lock and is the graph task.
  */
@@ -774,9 +1210,7 @@ static void traverse(uint16_t start_id, const db_trigger_t *trig)
         if (!n->enabled)
             continue;
 
-        /* `id == start_id` is exactly "this is the start": a node is entered at
-         * most once per traversal, so no later hop can wear the start's id. */
-        node_act(n, trig, id == start_id);
+        node_act(n, trig);
 
         if (depth >= DB_GRAPH_MAX_DEPTH) {
             ESP_LOGW(TAG, "traversal stopped at node %u '%s': depth limit %d "
@@ -1187,10 +1621,11 @@ static void handle_gpio_edge(uint16_t slot_idx)
  * How long to wait on the trigger queue.
  *
  * portMAX_DELAY whenever nothing is owed — an idle box must cost nothing, which
- * has been true of this engine from the start and stays true. Only when a repeat
- * sequence is running does the wait become finite, and then it is exactly the
- * time to the next emission: the task wakes for that ring and for nothing else.
- * No polling interval, no timer task, no second queue.
+ * has been true of this engine from the start and stays true. The wait only
+ * becomes finite when something is actually due: the next emission of a running
+ * repeat sequence, or a switch position waiting to be written back. The task
+ * wakes for those and for nothing else. No polling interval, no timer task, no
+ * second queue.
  *
  * The floor of one tick is what keeps it that way. pdMS_TO_TICKS() truncates, so
  * a remainder shorter than a tick would otherwise become a zero-timeout receive
@@ -1201,6 +1636,11 @@ static TickType_t graph_wait_ticks(void)
 {
     lock();
     int64_t due = repeat_next_due_us();
+    /* Whichever is sooner. A pending switch write must not sit unwritten until
+     * the next press happens to wake the task. */
+    int64_t sw = switch_save_due_us();
+    if (sw != 0 && (due == 0 || sw < due))
+        due = sw;
     unlock();
 
     if (due == 0)
@@ -1226,7 +1666,9 @@ static void graph_task(void *arg)
          * repeat: there is no trigger to handle, only emissions to make. */
         if (!got) {
             lock();
-            repeat_service(esp_timer_get_time());
+            int64_t now = esp_timer_get_time();
+            repeat_service(now);
+            switch_save_service(now);
             unlock();
             continue;
         }
@@ -1249,11 +1691,13 @@ static void graph_task(void *arg)
                     /* The wildcard: every burst, recognized or not. Opt-in — it
                      * does nothing unless the user placed one. */
                     fires = true;
-                } else if (n->type == DB_NODE_SIGNAL &&
+                } else if (n->type == DB_NODE_SIGNAL_RX &&
                            q.trig.signal_id != 0 &&
                            n->signal_id == q.trig.signal_id) {
-                    /* The signal node's OUTPUT side. traverse() starts here, so
-                     * node_act() sees is_start and does not send it back out. */
+                    /* RECEIVERS ONLY. A signal.tx bound to the same code is not
+                     * started by hearing it — it has no output to start from —
+                     * so a heard code cannot re-send itself, structurally,
+                     * rather than because a flag was checked. */
                     fires = true;
                 }
                 if (!fires)
@@ -1292,6 +1736,12 @@ static void graph_task(void *arg)
             handle_gpio_edge(q.arg);
             break;
 
+        case TRIG_WAKE:
+            /* Deliberately nothing. Its whole job was to end the blocking
+             * receive; the service calls below and the next graph_wait_ticks()
+             * do the rest. */
+            break;
+
         default:
             break;
         }
@@ -1301,7 +1751,9 @@ static void graph_task(void *arg)
          * fallen due meanwhile. Serviced here rather than only on the timeout
          * path, so a busy box still rings on time. */
         lock();
-        repeat_service(esp_timer_get_time());
+        int64_t now = esp_timer_get_time();
+        repeat_service(now);
+        switch_save_service(now);
         unlock();
     }
 }
@@ -1371,6 +1823,18 @@ esp_err_t db_graph_init(void)
      * to. Zero at boot too, so this holds however init comes to be called. */
     memset(s_repeat, 0, sizeof(s_repeat));
     s_repeat_hops = 0;
+    /* The graph that has just come off flash IS what flash holds, by definition,
+     * so nothing is owed. Switch nodes come up in the position that was last
+     * written — which the MQTT bridge then publishes retained on connect, so no
+     * subscriber is left believing in a position the box is not in. */
+    s_switch_dirty     = false;
+    s_switch_change_us = 0;
+    s_switch_saved_us  = 0;
+    /* Monitor history goes the same way, and for the same reason: a ring names
+     * a node id, and the graph that has just come off flash is not necessarily
+     * the one that id belonged to. It is RAM-only debug telemetry anyway — a
+     * reload is exactly the moment it stops meaning anything. */
+    memset(s_monitor, 0, sizeof(s_monitor));
 
     /* Write the graph back in the current layout so the next boot reads it
      * directly and the migration is a one-off. Only when a blob was actually
@@ -1453,6 +1917,12 @@ void db_graph_node_defaults(db_node_t *node, db_node_type_t type)
         node->window_ms = DB_REPEAT_DEF_MS;
         node->repeats   = (uint8_t)DB_REPEAT_DEF_TIMES;
         break;
+    case DB_NODE_SINK_MONITOR:
+        /* Not a window in the logic sense: how long the indicator stays lit
+         * after a hit. Three seconds is long enough to catch out of the corner
+         * of an eye and short enough that two presses read as two. */
+        node->window_ms = DB_MONITOR_HOLD_DEF_S * 1000u;
+        break;
     default:
         /* Sources (including the parameterless SOURCE_ANY_RF) and sinks have no
          * window of their own. */
@@ -1493,6 +1963,7 @@ esp_err_t db_graph_add_node(const db_node_t *node, uint16_t *id_out)
      * already clears its own entries; this makes the invariant hold even if some
      * future path forgets to. */
     repeat_cancel_node(id);
+    monitor_clear_node(id);
     s_node_count++;
 
     esp_err_t err = save_nodes();
@@ -1547,6 +2018,15 @@ esp_err_t db_graph_update_node(const db_node_t *node)
                      (unsigned)prev.id, cancelled);
     }
 
+    /* A monitor's history is a record of what THIS node saw. Retype it and the
+     * marks describe something that no longer exists; switch it off and it must
+     * go dark at once rather than showing a timeline it is no longer adding to.
+     * Changing the hold is deliberately not on this list — that only says how
+     * long the lamp stays lit, and throwing away ten minutes of observations
+     * because someone nudged it from 3 s to 5 s would be gratuitous. */
+    if (prev.type != node->type || (prev.enabled && !node->enabled))
+        monitor_clear_node(prev.id);
+
     esp_err_t err = save_nodes();
     if (err != ESP_OK)
         s_nodes[i] = prev;
@@ -1575,6 +2055,9 @@ esp_err_t db_graph_delete_node(uint16_t id)
      * silent no-op, at worst a ring from a chain the user has just deleted. The
      * table is keyed by node id, so the shift below cannot touch it either way. */
     int stopped = repeat_cancel_node(id);
+    /* Likewise the monitor ring: ids are handed back out to new nodes, so a
+     * ring left behind would surface as somebody else's history. */
+    monitor_clear_node(id);
 
     for (int k = i; k < s_node_count - 1; k++) {
         s_nodes[k]   = s_nodes[k + 1];

@@ -42,6 +42,33 @@
 extern "C" {
 #endif
 
+/*
+ * THE ONE PLACE A FORK CHANGES.
+ *
+ * Everything this module asks GitHub for is derived from this slug, and so are
+ * the two DEFAULT MANUAL UPDATE URLS below. It lives in the header rather than
+ * in update_check.c because db_config.c seeds the stored OTA URL from it and
+ * http_api.c hands both defaults to the web UI, and a second copy of a repo name
+ * in either of those is a fork that half-works.
+ *
+ * The defaults point at `releases/latest/download/<asset>`, which GitHub
+ * redirects to the newest release's asset — so a box updated by URL follows the
+ * stable line without anyone editing a version into a text field.
+ *
+ * NOTE WHAT THESE ARE NOT FOR. The automatic check (GET /api/update, POST
+ * /api/update/install) never touches them: it reads the exact
+ * browser_download_url out of the release it just fetched. These exist purely so
+ * the MANUAL "update from a URL" path has something sensible already typed in.
+ */
+#define DB_UPDATE_REPO_SLUG   "MarvAmBass/klingelbox"
+/* The asset names the release workflow publishes. Named once, used both to find
+ * the asset inside a release document and to build the URLs below. */
+#define DB_UPDATE_ASSET_APP   "klingelbox.bin"
+#define DB_UPDATE_ASSET_WEBUI "storage.bin"
+#define DB_UPDATE_RELEASE_URL "https://github.com/" DB_UPDATE_REPO_SLUG "/releases/latest/download/"
+#define DB_UPDATE_APP_URL     DB_UPDATE_RELEASE_URL DB_UPDATE_ASSET_APP
+#define DB_UPDATE_WEBUI_URL   DB_UPDATE_RELEASE_URL DB_UPDATE_ASSET_WEBUI
+
 /* Field sizes are part of the API: the REST layer copies this struct out. */
 #define DB_UPDATE_VER_MAX   32    /* "v0.10.0-rc1" and then some            */
 #define DB_UPDATE_HTML_MAX  160   /* the release page                       */

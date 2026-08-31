@@ -135,6 +135,25 @@ function fmtEpoch(s) {
 }
 
 /* ======================================================================
+   Where updates come from
+
+   THE ONE PLACE A FORK CHANGES ON THIS SIDE. The firmware has its own single
+   copy (DB_UPDATE_REPO_SLUG in update_check.h) and serves the resulting URLs as
+   config.ota.default_url / default_webui_url, which the UI prefers when it is
+   there. These constants are the fallback for a box running a firmware older
+   than that field — without them the manual update fields would be empty on
+   exactly the boxes most in need of updating.
+
+   `releases/latest/download/<asset>` is a GitHub redirect to the newest
+   release's asset, so it never needs a version typed into it.
+   ====================================================================== */
+
+var GH_REPO_SLUG = "MarvAmBass/klingelbox";
+var GH_RELEASE_ASSETS = "https://github.com/" + GH_REPO_SLUG + "/releases/latest/download/";
+var OTA_DEFAULT_APP_URL = GH_RELEASE_ASSETS + "klingelbox.bin";
+var OTA_DEFAULT_WEBUI_URL = GH_RELEASE_ASSETS + "storage.bin";
+
+/* ======================================================================
    State
    ====================================================================== */
 
@@ -149,6 +168,9 @@ var S = {
   gpio: null,
   learn: null,            /* only while a learn flow sheet is open */
   diag: null,
+  /* Monitor telemetry from GET /api/monitor: { now_s, at, by: { id -> node } }.
+     null = never fetched, which is also the "have not probed yet" state. */
+  monitor: null,
 
   events: [],
   serial: -1,             /* /api/events serial; -1 = nothing fetched yet */
@@ -159,7 +181,7 @@ var S = {
   built: {},              /* tab -> true once its static frame is in the DOM */
 
   /* feature availability, driven purely by response codes */
-  has: { gpio: true, diagnostics: true, radioCfg: true, ap: true, config: true },
+  has: { gpio: true, diagnostics: true, radioCfg: true, ap: true, config: true, monitor: true },
   txBlock: null,          /* reason string when transmit is unavailable */
 
   upBase: null,           /* uptime_s at the last /api/system */
@@ -408,6 +430,11 @@ function onTabEnter(name, resumed) {
       if (!S.signals || !resumed) loadSignals();
       if (S.has.gpio && !S.gpio) loadGpio();
       if (!S.config) loadConfig();
+      /* One probe per page load, before any Monitor node necessarily exists:
+         it is what tells a 404 (this firmware has no Monitor node — hide the
+         palette entry too) apart from "you have not added one yet". After that
+         syncMonitorPoll() decides whether to keep asking. */
+      if (S.has.monitor && !S.monitor) loadMonitor();
       poll("events", 2000, loadEvents);
       poll("dashclock", 1000, tickDashClock);
       break;
@@ -489,10 +516,63 @@ function loadGraph() {
   return api("/api/graph").then(function (res) {
     S.graph = { nodes: res.nodes || [], links: res.links || [] };
     renderGraph();
+    syncMonitorPoll();
     return S.graph;
   }).catch(function (e) {
     renderGraph(e);
   });
+}
+
+/* GET /api/monitor — every Monitor node's recent hits, in ONE call however many
+   there are. `now_s` and the hits share the device's uptime clock, so ages come
+   out of a subtraction and nothing here needs the box to know the date.
+
+   `at` is the wall-clock instant the sample arrived, used only to advance now_s
+   locally between polls: with a hold as short as 1 s, a lamp that only moved on
+   the poll edge would visibly stutter or stay lit a beat too long. */
+function loadMonitor() {
+  return api("/api/monitor").then(function (res) {
+    var by = {};
+    (res.nodes || []).forEach(function (m) { if (m && m.id) by[m.id] = m; });
+    S.monitor = { now_s: numOr(res.now_s, 0), at: Date.now(), by: by };
+    refreshMonitors();
+    return S.monitor;
+  }).catch(function (e) {
+    /* 404 = this firmware predates the Monitor node. Hide the feature whole:
+       no palette entry, no lamps, no timelines — the same contract every other
+       optional endpoint here follows. */
+    if ((e.status === 404 || e.status === 501) && S.has.monitor) {
+      S.has.monitor = false;
+      S.monitor = null;
+      stopPoll("monitor");
+      renderGraph();
+    }
+    return null;
+  });
+}
+
+function monitorNodes() {
+  return ((S.graph && S.graph.nodes) || []).filter(function (n) {
+    return n.type === "sink.monitor";
+  });
+}
+
+/* Poll only while the Dashboard is up AND at least one Monitor node exists.
+   A box with none must cost nothing, and the graph is what decides that — so
+   this is re-evaluated after every loadGraph() rather than set once. poll()
+   fires immediately and resets the interval, so an already-running timer is
+   left alone. */
+function syncMonitorPoll() {
+  if (S.tab !== "dashboard" || S.recovery || !S.has.monitor || !monitorNodes().length) {
+    stopPoll("monitor");
+    return;
+  }
+  /* 1 s. The hold can be set as low as 1 s, so anything slower could miss a
+     lit window completely; the response is a few integers per node; and the
+     Dashboard already ticks at 1 Hz for the age labels, so this adds no new
+     class of wake-up to a phone that is showing the page anyway. */
+  if (!timers.monitor) poll("monitor", 1000, loadMonitor);
+  else refreshMonitors();
 }
 
 function loadGpio() {
@@ -813,11 +893,13 @@ function signalBlock(sig, opts) {
   /* Above every other control, because it is the answer to the question a
      user has already formed by the time they get here.
 
-     This used to fork on the node's direction: pairing teaches a RECEIVER a
-     code, which only a transmit sink could do, so on a listen-only node the
-     panel was replaced by a paragraph explaining that pairing lived elsewhere.
-     A Signal node can send, so the panel simply applies -- and the paragraph it
-     replaced no longer describes anything. */
+     It does NOT fork on the node's direction, and deliberately so. Pairing
+     teaches one of the user's own receivers this code, and it does that through
+     POST /api/signals/{id}/transmit -- the SIGNAL's own transmit, not the
+     node's. So it is just as applicable in a Signal receiver's editor ("make my
+     chime answer the same code my doorbell sends") as in a sender's, and an
+     earlier version that hid it on listen-only nodes was hiding a thing that
+     worked. */
   if (sig.origin === "synthesized") add(box, pairPanel(sig));
 
   /* confidence meter */
@@ -1283,18 +1365,18 @@ function ev1527Text(id20, button) { return "EV1527 id=" + hex20(id20) + " btn=" 
 
 /* ----------------------------------------------------------------------
    Hand-crafting a signal, as a flow. Reached as the third option ("Configure
-   by hand") both from a Signal node and from the stored-signals list.
+   by hand") both from a Signal node's editor and from the stored-signals list.
 
    The copy used to fork on direction, because a source node could only listen
    and a transmit sink could only send, and the same made-up code therefore
-   meant two different things depending on which end you were standing at. A
-   Signal node is BOTH ends, so the fork is gone and the sheet says both things:
-   the box will send this code, and it will also react to hearing it. The
-   sentence that had to survive from the old source copy is the one about
-   nothing happening on its own -- without it a user invents a code, hears
-   silence, and concludes the box is broken.
+   meant two different things depending on which end you were standing at. The
+   node type now says which end it is, so this sheet no longer has to guess:
+   it explains what a hand-entered code IS, and the node's own editor says what
+   that node will do with it. The sentence that had to survive from the old
+   source copy is the one about nothing happening on its own -- without it a
+   user invents a code, hears silence, and concludes the box is broken.
 
-   opts.mode: "signal" (a node's code, both directions) | "sink" (the stored
+   opts.mode: "signal" (a code for a graph node, either direction) | "sink" (the stored
    signals list, where there is no node and pairing is the whole point).
    Default "sink". Resolves with the created signal.
    ---------------------------------------------------------------------- */
@@ -1305,7 +1387,7 @@ function openVirtualFlow(opts) {
     var done = false;
     var sh = openSheet("Enter a code",
       isNode
-        ? "A code this node will send, and fire on when it hears."
+        ? "A code for this node to use."
         : "A brand-new code, so you can pair your own receivers to this box.",
       function () { if (!done) { done = true; resolve(null); } });
 
@@ -1315,9 +1397,9 @@ function openVirtualFlow(opts) {
         "decoded elsewhere — or when you are inventing a fresh one for a receiver of your own. " +
         "If the remote is in your hand, Learn is easier and cannot get a digit wrong."));
       add(sh.body, el("div", "note warn",
-        "A code on its own does nothing. Link something into this node's input and the box " +
-        "transmits it — which is also how you pair a chime, relay or socket to it. Its output " +
-        "stays quiet until something actually sends that code over the air."));
+        "A code on its own does nothing. A Signal sender puts it on air when something " +
+        "triggers it — which is also how you pair a chime, relay or socket to it. A Signal " +
+        "receiver stays quiet until that code is actually heard on air."));
     } else {
       add(sh.body, el("p", "small",
         "A virtual signal is a brand-new EV1527 code that no remote in the world is using yet. " +
@@ -1408,9 +1490,9 @@ function openVirtualFlow(opts) {
     add(sh.body, foot);
 
     add(sh.body, el("div", "note", isNode
-      ? "The node is created carrying exactly this code, both ways. It gets a “Pair with a " +
-        "receiver” panel for teaching your chime the code, and its output shows up in the " +
-        "Activity feed under the graph the moment anything sends it over the air."
+      ? "The node is created carrying exactly this code. It gets a “Pair with a receiver” " +
+        "panel for teaching your chime the code, and anything sending that code over the air " +
+        "shows up in the Activity feed under the graph."
       : "Next: the signal you are creating gets a “Pair with a receiver” panel. Put your receiver " +
         "into pairing mode and tap Pair now there — the receiver stores this code and answers to " +
         "it from then on."));
@@ -1466,26 +1548,35 @@ function openVirtualFlow(opts) {
      source  -- output only
      logic   -- both
      sink    -- input only
-     signal  -- both, and the reason this list has four groups instead of three
 
-   A 433 MHz signal is not an input or an output, it is a thing that can be
-   received OR sent, so the one node that stands for a stored signal has a port
-   at each end. It replaced the old "433 MHz button" (in only) and "Transmit"
-   (out only), which between them made the box able to do both while showing
-   neither -- wiring a Virtual trigger into a 433 MHz button was refused, and
-   there was no reason for that anyone could see on the screen. */
+   Three groups, and every node type fits one of them honestly. There was
+   briefly a fourth, `signal`, for a single node that stood for a stored code
+   and carried a port at BOTH ends -- and that is exactly what went wrong with
+   it: what such a node did depended on how the event had arrived, which is
+   invisible on screen. One code now gets up to two nodes instead. A Signal
+   receiver is a source in every sense (it starts chains, it has no input), a
+   Signal sender is a sink in every sense (it acts, it has no output), and the
+   two dots on the map finally mean what they look like. */
 var NODE_TYPES = [
-  { t: "signal", g: "signal", label: "Signal", ico: "📶",
-    help: "One 433 MHz code, both ways: its output fires when the code is heard on air, " +
-          "and anything linked into its input transmits it." },
+  /* The pair. Same signal_id pool, one direction each -- wire an rx to a tx and
+     you have "when I hear this, send that", written down where you can read it. */
+  { t: "signal.rx", g: "source", label: "Signal receiver", ico: "📶",
+    help: "Fires when one stored 433 MHz code is heard on air. Listens only — it never " +
+          "sends anything." },
   { t: "source.gpio", g: "source", label: "Wired button", ico: "🔌",
     help: "Fires when a button wired to a GPIO pin is pressed. Optional." },
   { t: "source.virtual", g: "source", label: "Virtual trigger", ico: "✨",
     help: "Fires from this page, from the REST API, or from an MQTT topic." },
   { t: "source.any_rf", g: "source", label: "Any RF signal", ico: "📻",
     help: "Wildcard: fires on EVERY burst the receiver hears, registered or not." },
+  /* Two genuinely different jobs under one type, so the help describes them
+     separately. The old one line ("ANY or ALL of its inputs inside a time
+     window") implied the window applied to both; it does not apply to ANY at
+     all, which made the useful half of the node the invisible half. */
   { t: "logic.group", g: "logic", label: "Group", ico: "🔗",
-    help: "Passes on when ANY or ALL of its inputs fire inside a time window." },
+    help: "ANY: a merge point — everything that arrives passes straight through, and the " +
+          "window is not used. ALL: passes on only once every inbound link has carried an " +
+          "event inside the window, then re-arms." },
   { t: "logic.throttle", g: "logic", label: "Rate limit", ico: "⏱",
     help: "Passes the first press, then ignores everything for a cooldown you set. " +
           "Someone can lean on the button — the bell still rings once." },
@@ -1495,8 +1586,29 @@ var NODE_TYPES = [
   { t: "logic.repeat", g: "logic", label: "Repeat", ico: "🔁",
     help: "Rings straight away, then again a few more times at an interval you set. " +
           "One press, several chimes — for when the first one gets missed." },
+  /* The node that is a switch in the wire. Everything else here is a source, a
+     transform or a sink; this one sits IN a link and decides whether it
+     conducts, which is what makes "turn the inside bell off tonight" a toggle
+     instead of deleting a link and remembering to put it back. */
+  { t: "logic.switch", g: "logic", label: "Switch", ico: "🎚",
+    help: "A switch in the wire: while it is ON events pass straight through, while it is " +
+          "OFF nothing gets past it. Give it an MQTT topic and Home Assistant gets a real " +
+          "toggle for it." },
+  /* The other half of the pair. 📡 is the same glyph the Transmit buttons wear,
+     so the node that sends and the button that sends read as one idea. */
+  { t: "signal.tx", g: "sink", label: "Signal sender", ico: "📡",
+    help: "Transmits one stored 433 MHz code whenever something linked into it fires. " +
+          "Sends only — it never listens." },
   { t: "sink.mqtt", g: "sink", label: "MQTT publish", ico: "📨",
-    help: "Publishes to your broker / fires a Home Assistant device trigger." }
+    help: "Publishes to your broker / fires a Home Assistant device trigger." },
+  /* The one node that DOES nothing. It exists to be looked at: a lamp that
+     lights whenever the chain reaches it, and a rolling ten-minute timeline of
+     when it did. Drop one next to any sink to prove a chain fires without
+     ringing anything. */
+  { t: "sink.monitor", g: "sink", label: "Monitor", ico: "💡",
+    help: "Only watches — it changes nothing. No signal goes out, nothing is published. " +
+          "Its lamp lights whenever the chain reaches it, and its timeline shows the last " +
+          "10 minutes of hits." }
 ];
 function nodeType(t) {
   for (var i = 0; i < NODE_TYPES.length; i++) if (NODE_TYPES[i].t === t) return NODE_TYPES[i];
@@ -1516,14 +1628,239 @@ function signalName(id) {
   for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i].name || ("Signal " + id);
   return null;
 }
-/* Ports follow from the group: a source has no input, a sink has no output, and
-   everything else -- logic and signal alike -- has both. */
+/* Ports follow from the group, with no exceptions left: a source has no input,
+   a sink has no output, and logic has both. */
 function hasInput(n) { return nodeType(n.type).g !== "source"; }
 function hasOutput(n) { return nodeType(n.type).g !== "sink"; }
+
+/* The two halves of one stored code. Asked often enough -- and in enough
+   places -- that the type strings are written down once here rather than
+   compared inline wherever a signal section, a ▶ or a summary is built. */
+function isSignalRx(n) { return !!n && n.type === "signal.rx"; }
+function isSignalTx(n) { return !!n && n.type === "signal.tx"; }
+function isSignalNode(n) { return isSignalRx(n) || isSignalTx(n); }
+
+/* ------------------------------------------------------------- switches --
+
+   A Switch node's POSITION is its `enabled` flag -- the same field, not a
+   second one beside it. The firmware skips a disabled node when it walks the
+   graph, and "the walk does not enter it" is exactly what "the wire does not
+   conduct" means, so the two ideas are one. That is also why a Switch card
+   never shows the generic "disabled" chip: on this type that word is wrong,
+   the honest word is OFF.
+
+   Everywhere else in the UI `enabled === false` still means "switched off by
+   hand and out of service", which reads the same way on the canvas: a node the
+   events do not reach, and links that do not carry. */
+function isSwitch(n) { return !!n && n.type === "logic.switch"; }
+function switchOn(n) { return !!n && n.enabled !== false; }
+
+/* Blocked = an event travelling this link never arrives, because one of its
+   two ends is a node the engine will not enter. One rule for every type, so a
+   Switch turned OFF and a node disabled by hand look the same on the map --
+   they behave the same. */
+function linkBlocked(a, b) {
+  return (!!a && a.enabled === false) || (!!b && b.enabled === false);
+}
+
+/* The one place a switch is moved, so the card, the editor and the canvas
+   badge cannot drift apart -- and so all three go through the endpoint that
+   does NOT rewrite flash on every toggle (see docs/API.md). */
+function setSwitch(n, on, btn, msgNode) {
+  if (btn) btn.disabled = true;
+  setMsg(msgNode, on ? "Switching on…" : "Switching off…");
+  return postJSON("/api/graph/nodes/" + n.id + "/switch", { on: !!on })
+    .then(function () {
+      setMsg(msgNode, on ? "On — this path conducts again." : "Off — this path is blocked.", "ok");
+      return loadGraph().then(function () { return true; });
+    }).catch(function (e) {
+      setMsg(msgNode, e.message, "err");
+      return false;
+    }).then(function (ok) {
+      if (btn) btn.disabled = false;
+      return ok;
+    });
+}
 function linkExists(from, to) {
   var ls = (S.graph && S.graph.links) || [];
   for (var i = 0; i < ls.length; i++) if (ls[i].from === from && ls[i].to === to) return true;
   return false;
+}
+
+/* ONE delete path, ONE confirmation, shared by the list card, the editor sheet
+   and the ✕ on the map. The confirmation is what makes a bare ✕ on the canvas
+   safe to offer at all — so it has to be this dialog, with this wording, and
+   not a second one that could drift out of step with it. */
+function deleteNodeConfirmed(n, onError, onDone) {
+  var ty = nodeType(n.type);
+  return confirmSheet("Delete “" + (n.name || ty.label) + "”?",
+    ["The node and every link to or from it are removed.",
+     "Stored signals are NOT touched — nothing has to be learned again."],
+    "Delete node", true).then(function (ok) {
+    if (!ok) return false;
+    return api("/api/graph/nodes/" + n.id, { method: "DELETE" }).then(function () {
+      if (onDone) onDone();
+      return loadGraph().then(function () { return true; });
+    }).catch(function (e) {
+      if (onError) onError(e);
+      return false;
+    });
+  });
+}
+
+/* ------------------------------------------------------- monitor readout --
+
+   A Monitor node is the only node whose whole value is what it LOOKS like, so
+   its two pieces of chrome live here and are reused wherever the node appears:
+
+     monitorLamp()      a dot that lights while the newest hit is inside hold_s
+     monitorTimeline()  the last 10 minutes as an inline SVG strip
+
+   Both are marked with a data attribute and refreshed in place by
+   refreshMonitors() on every poll, rather than by re-rendering the cards. A
+   card rebuild every second would fight the sheet, lose focus and thrash the
+   DOM; a lamp is a class toggle, and CSS turns that into a fade. */
+
+var MON_WINDOW_S = 600;   /* fallback until the box states its own retention */
+
+/* A Monitor node only shows its chrome when the firmware actually serves
+   /api/monitor — a 404 there hides the lamp and the strip everywhere at once. */
+function isMonitor(n) { return !!n && n.type === "sink.monitor" && S.has.monitor; }
+
+function monitorEntry(id) {
+  return (S.monitor && S.monitor.by && S.monitor.by[id]) || null;
+}
+/* now_s advanced locally since the sample arrived — see loadMonitor(). */
+function monitorNow() {
+  if (!S.monitor) return 0;
+  return S.monitor.now_s + (Date.now() - S.monitor.at) / 1000;
+}
+function monitorLit(id) {
+  var e = monitorEntry(id);
+  if (!e || !e.hits || !e.hits.length) return false;
+  return (monitorNow() - e.hits[0]) < numOr(e.hold_s, 3);
+}
+
+function monitorLamp(id, cls) {
+  var s = el("span", "lamp" + (cls ? " " + cls : ""));
+  s.setAttribute("data-monlamp", id);
+  s.setAttribute("role", "img");
+  s.setAttribute("aria-label", "Monitor indicator");
+  return s;
+}
+
+/* The strip. Newest on the RIGHT, because that is where "now" is on every
+   timeline anyone has read before, and the eye should land on the most recent
+   hit first.
+
+   viewBox width is exactly the retention in seconds, so one unit is one second
+   and a hit of hold_s seconds is hold_s units wide with no scaling maths. With
+   preserveAspectRatio="none" the strip stretches to whatever width it is given
+   — 328 px inside a card on a 360 px phone, more on a laptop — which is why the
+   axis labels are HTML underneath rather than SVG text that would be squashed
+   horizontally along with everything else. */
+function monitorTimeline(id) {
+  var e = monitorEntry(id);
+  var win = numOr(e && e.retention_s, MON_WINDOW_S);
+  var hold = numOr(e && e.hold_s, 3);
+  var hits = (e && e.hits) || [];
+  var now = monitorNow();
+
+  var box = el("div", "montl");
+  box.setAttribute("data-monstrip", id);
+
+  var H = 26;
+  var svg = svgEl("svg", "montl-svg");
+  svg.setAttribute("viewBox", "0 0 " + win + " " + H);
+  svg.setAttribute("preserveAspectRatio", "none");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label",
+    hits.length ? (hits.length + " hits in the last " + Math.round(win / 60) + " minutes")
+                : ("No hits in the last " + Math.round(win / 60) + " minutes"));
+
+  /* One tick a minute: enough to read "about four minutes ago" off the strip
+     without turning it into graph paper. */
+  for (var m = 60; m < win; m += 60) {
+    var gl = svgEl("line", "montl-grid");
+    gl.setAttribute("x1", win - m); gl.setAttribute("x2", win - m);
+    gl.setAttribute("y1", "0"); gl.setAttribute("y2", H);
+    add(svg, gl);
+  }
+
+  var drawn = 0;
+  hits.forEach(function (t) {
+    var age = now - t;
+    if (age < 0) age = 0;
+    if (age > win) return;
+    /* A 3 s hold is 0.5% of a ten-minute strip — under two pixels on a phone,
+       which is a mark you cannot see. Floor the drawn width so every hit is
+       legible; the bar still grows with a longer hold. */
+    var w = Math.max(5, hold);
+    var x = Math.min(win - w, Math.max(0, win - age - w / 2));
+    var r = svgEl("rect", "montl-hit");
+    r.setAttribute("x", x.toFixed(1)); r.setAttribute("y", "3");
+    r.setAttribute("width", w.toFixed(1)); r.setAttribute("height", H - 6);
+    r.setAttribute("rx", "2");
+    var tip = svgEl("title");
+    tip.textContent = shortDur(age) + " ago";
+    add(r, tip);
+    add(svg, r);
+    drawn++;
+  });
+  add(box, svg);
+
+  var ax = el("div", "montl-axis");
+  add(ax, el("span", null, Math.round(win / 60) + " min ago"));
+  add(ax, el("span", null,
+    drawn ? (drawn + (hits.length > drawn ? "+" : "") + (drawn === 1 ? " hit" : " hits")) : ""));
+  add(ax, el("span", null, "now"));
+  add(box, ax);
+
+  if (!drawn) {
+    add(box, el("div", "montl-empty",
+      S.monitor ? "Nothing yet — this monitor has not fired in the last "
+                  + Math.round(win / 60) + " minutes."
+                : "Waiting for the box…"));
+  }
+  return box;
+}
+
+/* Called once per poll. Lamps are a class toggle; strips are rebuilt, which is
+   correct rather than wasteful — the window rolls, so every mark moves left a
+   pixel a second whether or not anything new arrived. */
+function refreshMonitorLamps() {
+  $$("[data-monlamp]").forEach(function (n) {
+    var lit = monitorLit(parseInt(n.getAttribute("data-monlamp"), 10));
+    if (n.classList) n.classList.toggle("on", lit);
+  });
+}
+function refreshMonitors() {
+  refreshMonitorLamps();
+  $$("[data-monstrip]").forEach(function (n) {
+    var id = parseInt(n.getAttribute("data-monstrip"), 10);
+    var fresh = monitorTimeline(id);
+    if (n.parentNode) n.parentNode.replaceChild(fresh, n);
+  });
+}
+
+/* One place fires a node, so the list card, the editor sheet and the canvas ▶
+   all behave identically — including refreshing the monitors straight away,
+   which is what makes "click ▶, watch 💡 light" feel immediate instead of
+   waiting out the next poll tick. */
+function fireNode(id, btn, msgNode) {
+  if (btn) btn.disabled = true;
+  setMsg(msgNode, "Firing…");
+  return postJSON("/api/graph/nodes/" + id + "/fire", {}).then(function () {
+    setMsg(msgNode, "Fired. Watch the monitors and the Activity feed for what it triggered.", "ok");
+    if (S.has.monitor && monitorNodes().length) setTimeout(loadMonitor, 120);
+    return true;
+  }).catch(function (e) {
+    setMsg(msgNode, e.message, "err");
+    return false;
+  }).then(function (ok) {
+    if (btn) btn.disabled = false;
+    return ok;
+  });
 }
 
 var autoEls = {};   /* the graph */
@@ -1542,9 +1879,10 @@ function buildDashboard() {
     "passes, and something at the far end acts — send a signal, publish to MQTT. " +
     "Nodes are linked by tapping, never by dragging."));
   add(h, el("p", null,
-    "A “Signal” node is one 433 MHz code and works both ways: its output fires when that code " +
-    "is heard on air, and anything linked into its input transmits it. So the same node is the " +
-    "doorbell at one end of a chain and the chime at the other."));
+    "A 433 MHz code gets one node per direction. A “Signal receiver” fires when that code is " +
+    "heard on air; a “Signal sender” puts a code on air when something triggers it. They share " +
+    "the same stored codes, so a doorbell that rings a chime is a receiver wired to a sender — " +
+    "and every wire on the map then runs the one way events actually travel."));
   add(h, el("p", null,
     "Two more are worth knowing about: “Any RF signal” is a wildcard that fires on every " +
     "burst on the band, and a “Group” lets several buttons drive one action."));
@@ -1620,28 +1958,54 @@ function buildDashboard() {
   add(rp, rh);
   [
     ["Repeat a doorbell to a second chime",
-     "Signal (Front door) → Signal (Virtual chime 1). Two signal nodes: the first one's output " +
-     "fires when the doorbell is heard, the second one's input sends the chime's code."],
+     "Signal receiver (Front door) → Signal sender (Virtual chime 1). Two nodes, one each way: " +
+     "the receiver fires when the doorbell is heard, the sender puts the chime's code on air."],
     ["Several buttons, one chime",
-     "Signal (Front) + Signal (Back) → Group (mode: any) → Signal (Virtual chime 1). " +
-     "This is how you fold several remotes into a single virtual signal — no special node needed, " +
-     "just two signal outputs into one group."],
+     "Signal receiver (Front) + Signal receiver (Back) → Group (mode: ANY) → Signal sender " +
+     "(Virtual chime 1). ANY is a merge point — it passes on whatever reaches it — so this is " +
+     "how you fold several remotes into a single virtual signal with no special node."],
     ["Two buttons pressed together",
-     "Same as above but set the Group to mode ALL and give it a window (e.g. 3 s)."],
+     "Same as above but set the Group to mode ALL and give it a window (e.g. 3 s). Now nothing " +
+     "passes until BOTH receivers have fired inside that window."],
     ["Ring several times from one press",
-     "Signal (Front door) → Repeat (3 times, 5 s) → Signal (chime). The chime rings at once and " +
-     "then twice more, five seconds apart — no second link and no extra node needed, the one " +
-     "Repeat node does it all. Press again mid-run and the count starts over."],
+     "Signal receiver (Front door) → Repeat (3 times, 5 s) → Signal sender (chime). The chime " +
+     "rings at once and then twice more, five seconds apart — the one Repeat node does it all. " +
+     "Press again mid-run and the count starts over."],
     ["Stop a stuck button ringing forever",
-     "Signal (Front door) → Rate limit (10 s cooldown) → Signal (chime)."],
+     "Signal receiver (Front door) → Rate limit (10 s cooldown) → Signal sender (chime)."],
     ["Ring the chime from Home Assistant",
-     "Virtual trigger (topic: front_gate) → Signal (chime). Publish anything to the trigger topic " +
-     "and the code goes out."],
+     "Virtual trigger (topic: front_gate) → Signal sender (chime). Publish anything to the " +
+     "trigger topic and the code goes out."],
+    /* The shape the split was asked for. Worth spelling out: it is the one
+       pattern that used to need the same node at both ends of itself. */
+    ["Relay a code you hear as a different code",
+     "Signal receiver (neighbour's remote) → Signal sender (your chime). Two nodes, so the map " +
+     "reads left to right and you can put a Rate limit or a Switch between them. The same code " +
+     "on both sides is legal too — the box ignores its own transmission for a second afterwards, " +
+     "so it does not hear itself and go round again."],
+    /* The case this node type was asked for, in the user's own shape. */
+    ["Turn the inside bell off from Home Assistant, keep the outside one",
+     "Signal receiver (Front door) → Switch “Outside bell” (topic: outside_bell) → Signal sender " +
+     "(outside chime), and the SAME receiver → Switch “Inside bell” (topic: inside_bell) → " +
+     "Signal sender (inside chime). Two toggles appear in Home Assistant. Switch one off and that branch goes dead — " +
+     "on the map its wire is drawn broken — while the other still rings. Nothing is deleted and " +
+     "nothing has to be re-wired to put it back."],
+    ["One toggle, several paths",
+     "Give two or more Switch nodes the SAME topic. They become one Home Assistant switch that " +
+     "gates every one of them at once — the way one wall switch feeds several lamps."],
     ["Tell Home Assistant someone rang",
-     "Signal (Front door) → MQTT publish (topic: front)."],
+     "Signal receiver (Front door) → MQTT publish (topic: front)."],
     ["Proxy the whole band to Home Assistant",
      "Any RF signal → MQTT publish. Every press within range reaches HA, including buttons you " +
-     "never registered. Add a Rate limit in the middle if the band is busy."]
+     "never registered. Add a Rate limit in the middle if the band is busy."],
+    ["Test any chain without ringing anything",
+     "Virtual trigger (▶) → Monitor (💡). Tap ▶ on the trigger — on its card or straight on the " +
+     "map — and watch the monitor's lamp light and a mark land on its timeline. No transmitter, " +
+     "no doorbell press, nothing audible."],
+    ["Check a chain fires without hearing the chime",
+     "… → Signal sender (chime)  and  … → Monitor. Link the SAME upstream node into both. The monitor " +
+     "changes nothing, so it can sit beside a real sink permanently — its lamp tells you the " +
+     "chain reached that point even when the chime is unplugged or you are three rooms away."]
   ].forEach(function (r) {
     var b = el("div");
     b.style.marginBottom = ".6rem";
@@ -1825,14 +2189,15 @@ function renderGraph(err) {
   var links = (S.graph && S.graph.links) || [];
   autoEls.empty.classList.toggle("hidden", nodes.length > 0);
 
-  /* Order sources, then signals, then logic, then sinks: that is the direction
-     of flow, and on a phone the reading order IS the diagram. Signals sit where
-     their commonest role is, the same compromise nextPosition() makes on the
-     canvas — a node with both ports cannot be in exactly one place in a
-     left-to-right list. `|| 0` and not `numOr`: an unknown group must sort
-     somewhere definite, because an undefined here makes the comparator return
-     NaN and the whole list order arbitrary. */
-  var order = { source: 0, signal: 1, logic: 2, sink: 3 };
+  /* Sources, then logic, then sinks: that is the direction of flow, and on a
+     phone the reading order IS the diagram. There used to be a fourth rank
+     between sources and logic for the two-ported signal node, which could never
+     honestly be in one place in a left-to-right list; a Signal receiver sorts
+     with the sources and a Signal sender with the sinks, because that is what
+     they now are. `|| 0` and not `numOr`: an unknown group must sort somewhere
+     definite, because an undefined here makes the comparator return NaN and the
+     whole list order arbitrary. */
+  var order = { source: 0, logic: 1, sink: 2 };
   nodes.slice().sort(function (a, b) {
     var d = (order[nodeType(a.type).g] || 0) - (order[nodeType(b.type).g] || 0);
     return d !== 0 ? d : (a.id - b.id);
@@ -1841,6 +2206,10 @@ function renderGraph(err) {
   });
 
   if (S.graphView === "map") renderCanvas();
+  /* Freshly built lamps start dark; give them the state we already hold rather
+     than making them wait out a poll tick. The strips were just drawn from the
+     same data, so only the lamps need it. */
+  refreshMonitorLamps();
 }
 
 function noteRow(text) {
@@ -1851,13 +2220,19 @@ function noteRow(text) {
 
 function nodeSummary(n) {
   switch (n.type) {
-    /* Both directions in one line, because both are always true of this node:
-       what it listens for is what it sends. */
-    case "signal": {
-      var sn = signalName(n.signal_id);
-      if (!sn) return n.signal_id ? "Signal " + n.signal_id + " (missing from the store)"
+    /* One direction each, and the summary says which. The send parameters
+       appear only on the sender, because they are the only node they act on. */
+    case "signal.rx": {
+      var rn = signalName(n.signal_id);
+      if (!rn) return n.signal_id ? "Signal " + n.signal_id + " (missing from the store)"
                                   : "No signal chosen yet";
-      return sn + " · out when heard, in to send it (" +
+      return rn + " · fires when this code is heard on air";
+    }
+    case "signal.tx": {
+      var tn = signalName(n.signal_id);
+      if (!tn) return n.signal_id ? "Signal " + n.signal_id + " (missing from the store)"
+                                  : "No signal chosen yet";
+      return tn + " · sends this code when triggered (" +
              numOr(n.repeats, 6) + "x, " + numOr(n.gap_us, 8000) + " us gap)";
     }
     case "source.gpio":
@@ -1870,8 +2245,13 @@ function nodeSummary(n) {
         : "Fired from this page or the REST API only";
     case "source.any_rf":
       return "Fires on every received burst — registered buttons and strangers alike";
+    /* The window is named only where it is used. Printing "window 1 s" beside
+       mode ANY described a rule the firmware does not have: ANY passes the
+       first thing through immediately and never looks at the clock. */
     case "logic.group":
-      return "Mode " + (n.group_mode === "all" ? "ALL" : "ANY") + " · window " + numOr(n.window_s, 1) + " s";
+      return n.group_mode === "all"
+        ? ("ALL — fires only when every input has fired within " + numOr(n.window_s, 1) + " s")
+        : "ANY — a merge point: anything arriving passes straight through";
     case "logic.throttle":
       return "Rings once, then ignores presses for " + numOr(n.window_s, 10) + " s";
     case "logic.repeat": {
@@ -1882,8 +2262,14 @@ function nodeSummary(n) {
         ? "Passes through once (no repeat)"
         : "Rings " + times + "x total, " + numOr(n.window_s, 5) + " s apart";
     }
+    case "logic.switch":
+      return (switchOn(n) ? "ON — events pass through" : "OFF — everything past it is blocked") +
+             (n.topic ? (" · " + mqttSwitchTopic(n.topic, "set")) : " · no MQTT topic");
     case "sink.mqtt":
       return n.topic ? ("Publishes to " + mqttPublishTopic(n.topic)) : "No topic set";
+    case "sink.monitor":
+      return "Watches only — nothing is sent or published. Lamp stays lit " +
+             numOr(n.window_s, 3) + " s per hit.";
     default:
       return "";
   }
@@ -1897,10 +2283,21 @@ function mqttBase() {
 function mqttEnabled() { return !!(S.config && S.config.mqtt && S.config.mqtt.enabled); }
 function mqttTriggerTopic(topic) { return mqttBase() + "/trigger/" + (topic || ""); }
 function mqttPublishTopic(topic) { return mqttBase() + "/" + (topic || ""); }
+/* leaf is "set" (what Home Assistant writes) or "state" (what it reads back,
+   retained). Both are shown to the user, because an automation may well want
+   the state one directly. */
+function mqttSwitchTopic(topic, leaf) {
+  return mqttBase() + "/switch/" + (topic || "") + "/" + leaf;
+}
 
 function nodeCard(n, links) {
   var ty = nodeType(n.type);
-  var c = el("div", "card nodecard g-" + ty.g + (n.enabled === false ? " off" : ""));
+  /* A Switch that is OFF is not a "disabled" card -- it is a working node doing
+     its job. It gets its own class so the styling can say "blocked" rather than
+     "greyed out and ignore me". */
+  var sw = isSwitch(n);
+  var c = el("div", "card nodecard g-" + ty.g +
+    (n.enabled === false ? (sw ? " swoff" : " off") : ""));
 
   var head = el("div", "card-head");
   add(head, el("span", "li-ico", ty.ico));
@@ -1911,10 +2308,21 @@ function nodeCard(n, links) {
   wrapT.style.minWidth = "0";
   add(wrapT, main, el("div", "node-type", ty.label));
   add(head, wrapT);
-  if (n.enabled === false) add(head, el("span", "chip warn", "disabled"));
+  if (sw) add(head, el("span", "chip " + (switchOn(n) ? "ok" : "bad"),
+                       switchOn(n) ? "ON" : "OFF"));
+  else if (n.enabled === false) add(head, el("span", "chip warn", "disabled"));
+  /* The lamp belongs in the head, beside the name: on a phone the list IS the
+     diagram, so this is where you watch a chain fire. */
+  if (isMonitor(n)) add(head, monitorLamp(n.id));
   add(c, head);
 
   add(c, el("div", "card-sub", nodeSummary(n)));
+
+  /* The strip inline on the card, not only in the editor. It is 26 px tall and
+     full-bleed, so it costs one line and does not crowd anything even at
+     360 px — and a monitor whose history you have to open a sheet to see is a
+     monitor you stop looking at. */
+  if (isMonitor(n)) add(c, monitorTimeline(n.id));
 
   /* --- links as chips --- */
   var ins = links.filter(function (l) { return l.to === n.id; });
@@ -1928,34 +2336,42 @@ function nodeCard(n, links) {
   var edit = el("button", "btn", "Edit");
   edit.type = "button";
   edit.addEventListener("click", function () { openNodeEditor(n); });
-  /* Firing a node runs its OUTPUT, so on a Signal node this is "pretend the
-     code was just heard" — it does not transmit. Sending one on demand is the
-     📡 Transmit button inside the node's signal section, or a link into its
-     input. The label has to say which, or the button reads as a transmit that
-     silently is not one. */
-  var fire = el("button", "btn",
-    n.type === "source.virtual" ? "▶ Trigger"
-      : n.type === "signal" ? "▶ Simulate heard" : "Test fire");
-  fire.type = "button";
-  fire.addEventListener("click", function () {
-    fire.disabled = true;
-    setMsg(msg, "Firing…");
-    postJSON("/api/graph/nodes/" + n.id + "/fire", {}).then(function () {
-      setMsg(msg, "Fired. Watch the Activity feed below the graph for what it triggered.", "ok");
-    }).catch(function (e) { setMsg(msg, e.message, "err"); })
-      .then(function () { fire.disabled = false; });
-  });
+  /* Firing a node makes that node do ITS OWN thing, and since the split there
+     is only ever one of those per type. On a Signal receiver that is "pretend
+     this code was just heard": its output fires, the chain runs, and nothing
+     goes on air. On a Signal sender it is a real transmission.
+
+     Two acts, two glyphs, everywhere: 📡 sends a code OUT over the air, 📥
+     pretends one came IN. The card spends the glyph rather than a ▶ precisely
+     because it has room for it — one press of 📡 can ring a chime in someone's
+     house, and a button that says which way it goes is worth two characters. */
+  /* On a Virtual trigger this is not a debug affordance, it is the node's
+     entire purpose — being fired by hand is what the type is FOR — so it reads
+     as the primary action of the card rather than a test button. */
+  var virt = n.type === "source.virtual";
+  var fire;
+  if (sw) {
+    /* On a Switch the primary action of the card is not firing it -- it is
+       moving it. "Test fire" would start a traversal AT the switch, which
+       walks straight past the very thing the node exists to control, so it
+       would be a button that lies. */
+    fire = el("button", "btn " + (switchOn(n) ? "danger" : "primary"),
+              switchOn(n) ? "Switch OFF" : "Switch ON");
+    fire.type = "button";
+    fire.addEventListener("click", function () { setSwitch(n, !switchOn(n), fire, msg); });
+  } else {
+    fire = el("button", "btn" + (virt ? " primary" : ""),
+      virt ? "▶ Trigger"
+        : isSignalRx(n) ? "📥 Simulate heard"
+        : isSignalTx(n) ? "📡 Transmit now"
+        : "Test fire");
+    fire.type = "button";
+    fire.addEventListener("click", function () { fireNode(n.id, fire, msg); });
+  }
   var del = el("button", "btn danger", "Delete");
   del.type = "button";
   del.addEventListener("click", function () {
-    confirmSheet("Delete “" + (n.name || ty.label) + "”?",
-      ["The node and every link to or from it are removed.",
-       "Stored signals are not touched."], "Delete", true).then(function (ok) {
-      if (!ok) return;
-      api("/api/graph/nodes/" + n.id, { method: "DELETE" })
-        .then(loadGraph)
-        .catch(function (e) { setMsg(msg, e.message, "err"); });
-    });
+    deleteNodeConfirmed(n, function (e) { setMsg(msg, e.message, "err"); });
   });
   add(row, edit, fire, del);
   add(c, row, msg);
@@ -2051,25 +2467,22 @@ function openLinkPicker(n, dir) {
 /* Sources on the left, logic in the middle, sinks on the right — the layout
    mirrors the direction events actually travel.
 
-   Signal nodes get a column of their own, between sources and logic. There is
-   no honest single answer for a node with both ports — the same node is the
-   button at the start of one chain and the chime at the end of another — so it
-   is placed where its commonest role reads correctly (a press arriving) and is
-   simply dragged right when it is being used as the far end. What it must NOT
-   do is share a column with the sources, or the two would overlap on a canvas
-   the user then has to untangle by hand.
+   Three columns, one per group, and no special case left. The two-ported signal
+   node needed a fourth column of its own because there was no honest answer for
+   where a node that is both ends of a chain belongs; a Signal receiver drops in
+   with the sources and a Signal sender with the sinks, which is where each of
+   them genuinely sits in the flow.
 
-   The four columns are 200 apart because a node box is 168 wide: any tighter
-   and the new column would visibly overlap its neighbours. Existing nodes keep
-   whatever ui_x they were saved with; this only decides where the NEXT one is
-   dropped.
+   The columns are at least 200 apart because a node box is 168 wide: any
+   tighter and they would visibly overlap. Existing nodes keep whatever ui_x
+   they were saved with; this only decides where the NEXT one is dropped.
 
    Counting nodes in the column is not enough to pick a free row: delete the
    second of three and the next node lands on top of the third. So walk down the
    column and take the first row nothing already occupies. */
 function nextPosition(group) {
   var nodes = (S.graph && S.graph.nodes) || [];
-  var col = { source: 40, signal: 240, logic: 440, sink: 640 }[group] || 440;
+  var col = { source: 40, logic: 440, sink: 640 }[group] || 440;
   var ROW = 96;
   for (var row = 0; row < 40; row++) {
     var y = 30 + row * ROW;
@@ -2083,18 +2496,25 @@ function nextPosition(group) {
 
 function openAddNode() {
   var items = NODE_TYPES.filter(function (t) {
-    return !(t.t === "source.gpio" && !S.has.gpio);
+    return !(t.t === "source.gpio" && !S.has.gpio) &&
+           !(t.t === "sink.monitor" && !S.has.monitor);
   }).map(function (t) {
     return {
       value: t.t, icon: t.ico, label: t.label, sub: t.help, meta: t.g
     };
   });
   pickerSheet("Add a node",
-    "A signal goes both ways; sources hear things, logic filters, sinks act.",
+    "Sources hear things, logic shapes, sinks act. A 433 MHz code needs a receiver to " +
+    "hear it and a sender to say it — pick whichever end you are wiring.",
     items, function (type) {
     /* A node that needs a signal is never created empty: the signal IS the
-       node's identity, so the choice of one is part of adding it. */
-    if (type === "signal") { openSignalNodeFlow(); return; }
+       node's identity, so the choice of one is part of adding it. Both halves
+       of the pair go through the same flow, told apart only by which type it
+       ends up creating. */
+    if (type === "signal.rx" || type === "signal.tx") {
+      openSignalNodeFlow(type);
+      return;
+    }
     createNode(type, null);
   });
 }
@@ -2109,10 +2529,14 @@ function createNode(type, sig) {
      6 frame copies and a 10 s cooldown — so it gets its own starting point
      rather than being created wrong and corrected in the editor. */
   var rep = (type === "logic.repeat");
+  /* window_s means three different things depending on the type, so each one
+     starts from its own number rather than from a shared 10 that is wrong for
+     two of them: a repeat INTERVAL, a monitor's lamp HOLD, a cooldown. */
+  var win = rep ? 5 : (type === "sink.monitor" ? 3 : 10);
   var body = {
     type: type, name: sig ? signalLabel(sig) : ty.label, enabled: true,
     signal_id: sig ? sig.id : 0, gpio_pin: -1, gpio_active_low: true, gpio_debounce_ms: 50,
-    repeats: rep ? 3 : 6, gap_us: 8000, window_s: rep ? 5 : 10, group_mode: "any",
+    repeats: rep ? 3 : 6, gap_us: 8000, window_s: win, group_mode: "any",
     topic: "", ui_x: pos.x, ui_y: pos.y
   };
   return postJSON("/api/graph/nodes", body).then(function (created) {
@@ -2126,22 +2550,26 @@ function createNode(type, sig) {
 /* The fork that replaces the old Learn tab and the old Signals tab in one
    question: where does this node's signal come from? Every branch ends with a
    node that already works, in one flow and one confirmation. */
-function openSignalNodeFlow() {
+function openSignalNodeFlow(type) {
+  var rx = (type !== "signal.tx");
   function learn() {
     openLearnFlow({
       title: "Learn a signal",
-      sub: "Arm the receiver, then press the remote button. The code is captured, " +
-           "named and stored — this node then fires when it is heard, and sends it when asked."
-    }).then(function (sig) { if (sig) createNode("signal", sig); });
+      sub: rx
+        ? "Arm the receiver, then press the remote button. The code is captured, named and " +
+          "stored — this node then fires whenever it is heard again."
+        : "Arm the receiver, then press the remote button. The code is captured, named and " +
+          "stored — this node then sends that same code whenever it is triggered."
+    }).then(function (sig) { if (sig) createNode(type, sig); });
   }
   function virtual() {
     openVirtualFlow({ mode: "signal" })
-      .then(function (sig) { if (sig) createNode("signal", sig); });
+      .then(function (sig) { if (sig) createNode(type, sig); });
   }
   function existing() {
     openSignalPicker({
       title: "Signal for this node",
-      onPick: function (sig) { createNode("signal", sig); },
+      onPick: function (sig) { createNode(type, sig); },
       onLearn: learn,
       onVirtual: virtual
     });
@@ -2161,9 +2589,12 @@ function openSignalNodeFlow() {
       sub: "Type an EV1527 code you know, or roll a random one to pair your own chime to.",
       meta: "by hand" }
   ];
-  pickerSheet("Which signal is this node?",
-    "A Signal node IS its signal: its output fires when that code is heard, and its input " +
-    "transmits it. Pick where the code comes from.",
+  pickerSheet(rx ? "Which code should this node listen for?"
+                 : "Which code should this node send?",
+    rx ? "A Signal receiver IS its signal: it fires whenever that code is heard on air, and " +
+         "sends nothing. Pick where the code comes from."
+       : "A Signal sender IS its signal: it puts that code on air whenever something " +
+         "triggers it, and listens for nothing. Pick where the code comes from.",
     items, function (choice) {
       if (choice === "learn") learn();
       else if (choice === "virtual") virtual();
@@ -2179,9 +2610,14 @@ function openNodeEditor(n) {
   var nameIn = inputEl("text", n.name || "", { maxlength: "40" });
   add(sh.body, field("Name", nameIn));
 
-  var enabled = checkField("Enabled", n.enabled !== false,
-    "A disabled node stays in the graph but never fires.");
-  add(sh.body, enabled);
+  /* On a Switch node this field IS the position, and it already has a control
+     of its own further down that says so in the right words and moves it
+     through the endpoint built for it. Offering "Enabled" as well would be two
+     controls for one flag, and the wrong one would win on Save. */
+  var enabled = isSwitch(n) ? null
+    : checkField("Enabled", n.enabled !== false,
+                 "A disabled node stays in the graph but never fires.");
+  if (enabled) add(sh.body, enabled);
 
   var ctl = {};   /* type-specific controls */
 
@@ -2190,12 +2626,14 @@ function openNodeEditor(n) {
      question anyone has about a signal node. Decoded identity, waveform,
      pairing, transmit-to-test, rename, and the ways to point the node
      somewhere else. */
-  if (n.type === "signal") {
+  if (isSignalNode(n)) {
     var sigSec = el("div", "sigsec");
     add(sh.body, el("div", "lg-label", "Signal"));
-    add(sh.body, el("div", "hint",
-      "Its output fires when this code is heard on air. Anything linked into its input " +
-      "transmits it."));
+    add(sh.body, el("div", "hint", isSignalRx(n)
+      ? "This node fires when this code is heard on air. It never transmits — to send a " +
+        "code, add a Signal sender node and wire something into it."
+      : "This node transmits this code whenever something linked into it fires. It never " +
+        "listens — to react to a code, add a Signal receiver node for it."));
     add(sh.body, sigSec);
     renderNodeSignal(sigSec, n);
   }
@@ -2203,10 +2641,12 @@ function openNodeEditor(n) {
   var grid = el("div", "formgrid");
   add(sh.body, grid);
 
-  /* Transmit policy: only the input side uses these, but they belong to the
-     node either way — a signal node with no inbound link today may get one
-     tomorrow, and hiding them would make it look like it could not send. */
-  if (n.type === "signal") {
+  /* Transmit policy, on the only node that transmits. It used to be shown on
+     every signal node whether or not anything was wired into it, because there
+     was no way to tell from the type which of them would ever send; a Signal
+     receiver has no send side at all, so these would be two settings that
+     provably do nothing. */
+  if (isSignalTx(n)) {
     ctl.repeats = inputEl("number", numOr(n.repeats, 6), { min: "1", max: "32", step: "1", inputmode: "numeric" });
     ctl.gap = inputEl("number", numOr(n.gap_us, 8000), { min: "500", max: "60000", step: "500", inputmode: "numeric" });
     add(grid, field("Repeats when sending", ctl.repeats,
@@ -2248,6 +2688,16 @@ function openNodeEditor(n) {
   }
 
   if (n.type === "source.virtual") {
+    /* First, above the settings: the reason this node exists is to be fired by
+       hand, so the button that does it comes before the topic it may never
+       need. Same action and the same words as the card and the canvas ▶. */
+    var fireMsg = el("div", "formmsg");
+    var fireBtn = el("button", "btn primary block", "▶ Trigger");
+    fireBtn.type = "button";
+    fireBtn.addEventListener("click", function () { fireNode(n.id, fireBtn, fireMsg); });
+    sh.body.insertBefore(fireBtn, grid);
+    sh.body.insertBefore(fireMsg, grid);
+
     ctl.topic = inputEl("text", n.topic || "", { maxlength: "48", placeholder: "front_gate" });
     var topicPreview = el("div", "hint mono");
     function syncTopic() {
@@ -2280,27 +2730,49 @@ function openNodeEditor(n) {
       "including signals from buttons you never registered. Wire it to an MQTT publish sink " +
       "and Home Assistant sees every press on the band."));
     add(sh.body, el("div", "note",
-      "It fires IN ADDITION to any matching button node — a registered press drives both its " +
+      "It fires IN ADDITION to any matching Signal receiver — a registered press drives both its " +
       "own chain and this wildcard chain. That is intended, not double-firing."));
     add(sh.body, el("div", "note warn",
       "If the band around you is busy, put a Rate limit between this node and its sink. " +
       "A chatty neighbouring remote will otherwise spam your broker."));
   }
 
+  /* TWO MODES, TWO DIFFERENT NODES really, and the editor stops pretending
+     otherwise. The window belongs to ALL alone -- in ANY the firmware returns
+     "passes" before it ever looks at a clock -- so showing a Window field on an
+     ANY group offered a setting that changes nothing, which is worse than
+     offering none. It is hidden rather than disabled: the value is still there,
+     still saved, and comes straight back if the mode is switched to ALL. */
   if (n.type === "logic.group") {
     ctl.mode = selectEl([
-      { value: "any", label: "ANY — pass on the first input that fires" },
-      { value: "all", label: "ALL — pass on only when every input fired in the window" }
+      { value: "any", label: "ANY — merge: pass everything straight through" },
+      { value: "all", label: "ALL — coincidence: wait until every input has fired" }
     ], n.group_mode === "all" ? "all" : "any");
     ctl.windowS = inputEl("number", numOr(n.window_s, 1), { min: "1", max: "6000", step: "1", inputmode: "numeric" });
     ctl.windowDflt = 1;
     add(grid, field("Mode", ctl.mode, null, "full"));
     /* The API's field is window_s, in SECONDS -- this said "ms" and passed the
        wrong variable, so the input never reached the DOM at all. */
-    add(grid, field("Window (seconds)", ctl.windowS, "How long inputs are remembered when matching ALL."));
-    add(sh.body, el("div", "note",
-      "This is how several remote buttons become one action: link every button node into this " +
-      "group with mode ANY, then link the group to a Transmit sink."));
+    var winField = field("Window (seconds)", ctl.windowS,
+      "How long an input is remembered while the group waits for the others.");
+    add(grid, winField);
+    var modeNote = el("div", "note");
+    add(sh.body, modeNote);
+    function syncGroupMode() {
+      var all = ctl.mode.value === "all";
+      winField.classList.toggle("hidden", !all);
+      modeNote.textContent = all
+        ? "ALL is a coincidence detector. Nothing passes until EVERY link into this node has " +
+          "carried an event inside the window; when that happens it fires once, forgets them " +
+          "all and starts over. Use it for “both buttons within 10 seconds means something”. " +
+          "A group with no inputs can never be satisfied."
+        : "ANY is a merge point, not a filter. Whatever arrives is passed straight on, " +
+          "immediately — the window is not used at all in this mode. Its value is that " +
+          "several buttons can meet at one node, so the chain after it is wired and edited " +
+          "in a single place.";
+    }
+    ctl.mode.addEventListener("change", syncGroupMode);
+    syncGroupMode();
   }
 
   if (n.type === "logic.throttle") {
@@ -2328,6 +2800,63 @@ function openNodeEditor(n) {
       "second run, so leaning on the button cannot queue up a dozen chimes."));
   }
 
+  if (n.type === "logic.switch") {
+    /* The position leads, above everything else and above the grid: opening a
+       switch is nearly always "is it on, and make it the other thing". */
+    var swMsg = el("div", "formmsg");
+    var swBtn = el("button", "btn block " + (switchOn(n) ? "danger" : "primary"),
+                   switchOn(n) ? "Switch OFF — block this path"
+                               : "Switch ON — let this path conduct");
+    swBtn.type = "button";
+    var swState = el("div", "note " + (switchOn(n) ? "" : "warn"),
+      switchOn(n)
+        ? "Currently ON. Events reaching this node pass straight through, unchanged."
+        : "Currently OFF. Nothing gets past this node — everything wired after it is dead " +
+          "until it is switched back on. The nodes and links are all still there.");
+    swBtn.addEventListener("click", function () {
+      setSwitch(n, !switchOn(n), swBtn, swMsg).then(function (ok) {
+        if (ok) sh.close();
+      });
+    });
+    sh.body.insertBefore(swState, grid);
+    sh.body.insertBefore(swBtn, grid);
+    sh.body.insertBefore(swMsg, grid);
+
+    ctl.topic = inputEl("text", n.topic || "", { maxlength: "48", placeholder: "outside_bell" });
+    var swPreview = el("div", "hint mono");
+    function syncSw() {
+      var t = trimOf(ctl.topic);
+      clear(swPreview);
+      if (!t) {
+        swPreview.textContent =
+          "No topic — this switch can only be moved from this page or the REST API.";
+        return;
+      }
+      add(swPreview, el("div", null, "Home Assistant sets:  " + mqttSwitchTopic(t, "set")));
+      add(swPreview, el("div", null, "Box reports (retained):  " + mqttSwitchTopic(t, "state")));
+    }
+    ctl.topic.addEventListener("input", syncSw);
+    syncSw();
+    var sf = field("MQTT topic (optional)", ctl.topic, null, "full");
+    add(sf, swPreview);
+    add(grid, sf);
+    add(sh.body, el("div", "note",
+      "With a topic set, Home Assistant discovers this as a real switch entity on the " +
+      "Klingelbox device — a toggle, not a workaround. ON, OFF, 1, 0, true and false are all " +
+      "accepted on the set topic; the box answers on the state topic, retained, so the toggle " +
+      "is never stale after a restart."));
+    add(sh.body, el("div", "note",
+      "Several Switch nodes may share ONE topic on purpose: give “Outside bell” to two switches " +
+      "and a single Home Assistant toggle gates both paths at once. The reported state is ON if " +
+      "any of them is conducting."));
+    if (S.has.config && !mqttEnabled()) {
+      add(sh.body, el("div", "note warn",
+        "MQTT is currently disabled, so the topic is stored but nothing subscribes to it yet. " +
+        "The switch still works from this page. Enable MQTT under Settings and Home Assistant " +
+        "picks it up — no change needed here."));
+    }
+  }
+
   if (n.type === "sink.mqtt") {
     ctl.topic = inputEl("text", n.topic || "", { maxlength: "48", placeholder: "front" });
     var pubPreview = el("div", "hint mono");
@@ -2346,6 +2875,29 @@ function openNodeEditor(n) {
     }
   }
 
+  if (n.type === "sink.monitor") {
+    /* The timeline is the node, so it leads — before the one setting it has. */
+    var monHead = el("div", "montl-head");
+    add(monHead, el("span", "lg-label", "Last 10 minutes"), monitorLamp(n.id, "lamp-lg"));
+    sh.body.insertBefore(monHead, grid);
+    sh.body.insertBefore(monitorTimeline(n.id), grid);
+
+    ctl.windowS = inputEl("number", numOr(n.window_s, 3),
+      { min: "1", max: "60", step: "1", inputmode: "numeric" });
+    ctl.windowDflt = 3;
+    add(grid, field("Lamp stays lit (seconds)", ctl.windowS,
+      "How long the indicator glows after each hit, and how wide each mark is drawn " +
+      "on the timeline. 1–60 s."));
+    add(sh.body, el("div", "note",
+      "This node acts on nothing. It transmits no signal, publishes no message and touches " +
+      "no pin — it only records that the chain reached it, in RAM, for the last 10 minutes. " +
+      "Nothing is written to flash and nothing survives a reboot."));
+    add(sh.body, el("div", "note",
+      "Wire one alongside a real sink to prove a chain fires without ringing anything: " +
+      "link the same node into both the Signal sender you would use and this Monitor, then " +
+      "trigger the chain and watch the lamp instead of listening for the chime."));
+  }
+
   var msg = el("div", "formmsg");
   var foot = el("div", "formfoot");
   /* Delete belongs here too, not only on the list card: opening a node from the
@@ -2353,15 +2905,9 @@ function openNodeEditor(n) {
   var delBtn = el("button", "btn danger", "Delete node");
   delBtn.type = "button";
   delBtn.addEventListener("click", function () {
-    confirmSheet("Delete \u201c" + (n.name || nodeType(n.type).label) + "\u201d?",
-      ["The node and every link to or from it are removed.",
-       "Stored signals are NOT touched — nothing has to be learned again."],
-      "Delete node", true).then(function (ok) {
-      if (!ok) return;
-      api("/api/graph/nodes/" + n.id, { method: "DELETE" })
-        .then(function () { sh.close(); loadGraph(); })
-        .catch(function (e) { setMsg(msg, e.message, "err"); });
-    });
+    deleteNodeConfirmed(n,
+      function (e) { setMsg(msg, e.message, "err"); },
+      function () { sh.close(); });
   });
 
   var save = el("button", "btn primary", "Save");
@@ -2369,9 +2915,12 @@ function openNodeEditor(n) {
   save.addEventListener("click", function () {
     /* signal_id is deliberately absent: binding a signal is an action of its
        own, applied the moment it is chosen, not a form field to remember. */
-    patch = { name: trimOf(nameIn) || nodeType(n.type).label, enabled: enabled.input.checked };
+    patch = { name: trimOf(nameIn) || nodeType(n.type).label };
+    /* Absent for a Switch: its position is not a form field to remember, and
+       posting it here would persist synchronously behind the user's back. */
+    if (enabled) patch.enabled = enabled.input.checked;
     if (ctl.repeats) patch.repeats = intOf(ctl.repeats, 6);
-    /* Same wire field as a transmit sink's copy count, different meaning and a
+    /* Same wire field as a Signal sender's copy count, different meaning and a
        different default — hence a control of its own rather than reusing
        ctl.repeats and its default of 6. */
     if (ctl.times) patch.repeats = intOf(ctl.times, 3);
@@ -2403,10 +2952,11 @@ function renderNodeSignal(wrap, n) {
   var sid = numOr(n.signal_id, 0);
 
   if (!sid) {
-    add(wrap, el("div", "note warn",
-      "This node has no signal yet, so it never fires and sends nothing. Learn the button " +
-      "it should stand for, pick one you already have, or invent a code your own receiver " +
-      "can be paired to."));
+    add(wrap, el("div", "note warn", (isSignalTx(n)
+      ? "This node has no signal yet, so there is nothing for it to send. "
+      : "This node has no signal yet, so nothing on air can ever fire it. ") +
+      "Learn the button it should stand for, pick one you already have, or invent a code " +
+      "your own receiver can be paired to."));
     add(wrap, signalChooser(wrap, n));
     return;
   }
@@ -2459,8 +3009,7 @@ function signalChooser(wrap, n) {
   function relearn() {
     openLearnFlow({
       title: bound ? "Learn a replacement" : "Learn a button",
-      sub: "Press the button this node should stand for from now on — the code it " +
-           "listens for and the code it sends.",
+      sub: "Press the button this node should stand for from now on.",
       note: bound
         ? "The signal this node uses today stays in the store under its name — re-learning " +
           "only changes what this node points at."
@@ -2496,9 +3045,23 @@ function renderCanvas() {
   if (!nodes.length) { add(wrap, el("div", "empty", "No nodes to draw.")); return; }
 
   add(wrap, el("p", "hint",
-    "Drag a node to rearrange it; tap it to edit. Everything here is also doable from the list view."));
+    "Drag a node to rearrange it; tap it to edit. The badges along its top edge: " +
+    "✕ deletes it (with a confirmation) and ▶ does that node's own thing now — a " +
+    "Virtual trigger fires, a Signal receiver pretends its code was just heard, a " +
+    "Signal sender TRANSMITS its code over the air. Each ▶ says which in its tooltip, " +
+    "because those are opposite directions. 💡 lights when a Monitor is hit, and I / O " +
+    "flips a Switch. A wire drawn broken and faded carries nothing: the node at one of " +
+    "its ends is switched off. Everything here is also doable from the list view."));
+  /* The canvas has no per-node message line, so one shared one under the tools
+     carries the confirmations the ▶ button owes. */
+  var canvasMsg = el("div", "formmsg");
 
-  var NW = 168, NH = 52;
+  /* 168 x 60. The extra height over the original 52 is the badge strip along
+     the top: without it the badges would sit on top of the title and force it
+     to truncate at about thirteen characters, which costs more than four units
+     of box height ever could. Title and type simply moved down; the ports
+     follow NH/2 as they always did, and every position below is derived. */
+  var NW = 168, NH = 60;
   var maxX = 0, maxY = 0;
   nodes.forEach(function (n) {
     maxX = Math.max(maxX, numOr(n.ui_x, 40) + NW);
@@ -2520,6 +3083,7 @@ function renderCanvas() {
   var zFit = el("button", "btn small", "Fit"); zFit.type = "button";
   add(zbar, zOut, zLbl, zIn, zFit);
   add(wrap, zbar);
+  add(wrap, canvasMsg);
 
   var box = el("div", "canvas-wrap");
   var svg = svgEl("svg", "canvas");
@@ -2562,14 +3126,15 @@ function renderCanvas() {
   function pos(n) { return { x: numOr(n.ui_x, 40), y: numOr(n.ui_y, 40) }; }
 
   /* A node's ports follow directly from its group: a source has nothing feeding
-   * it, a sink emits nothing onward, and everything else — logic and signal
-   * alike — has both. Drawing them makes the direction of flow legible at a
-   * glance, and gives the pointer something concrete to drag from — without
-   * connectors the canvas is only a picture, and every link has to be made over
-   * in the list view.
+   * it, a sink emits nothing onward, and logic has both. Drawing them makes the
+   * direction of flow legible at a glance, and gives the pointer something
+   * concrete to drag from — without connectors the canvas is only a picture,
+   * and every link has to be made over in the list view.
    *
-   * A signal node drawing BOTH ports is the whole point of the type: the two
-   * dots are what say "this code can be heard here, and sent from here". */
+   * A Signal receiver draws one dot on its right and a Signal sender one on its
+   * left, which is the entire argument for splitting the old two-ported signal
+   * node in two: the picture now cannot show a connection the engine will not
+   * make, and a relay reads left to right as rx → … → tx. */
   function hasIn(ty)  { return ty.g !== "source"; }
   function hasOut(ty) { return ty.g !== "sink"; }
   function outXY(n) { var p = pos(n); return { x: p.x + NW, y: p.y + NH / 2 }; }
@@ -2591,7 +3156,12 @@ function renderCanvas() {
        * thin to hit with a finger or a quick click. */
       var hit = svgEl("path", "lnk-hit");
       hit.setAttribute("d", curve(p1.x, p1.y, p2.x, p2.y));
-      var path = svgEl("path", "lnk");
+      /* THE POINT OF LOOKING AT THE MAP. A path that cannot carry an event must
+       * not look like one that can — otherwise the first thing a user does after
+       * turning a Switch off is stare at an unchanged picture and wonder whether
+       * it worked. A blocked wire is drawn broken and faded, which is what a
+       * broken wire looks like in every diagram anyone has read. */
+      var path = svgEl("path", "lnk" + (linkBlocked(a, b) ? " blocked" : ""));
       path.setAttribute("d", curve(p1.x, p1.y, p2.x, p2.y));
       function removeLink(ev) {
         ev.stopPropagation();
@@ -2652,16 +3222,15 @@ function renderCanvas() {
     var from = linking.from;
     cancelLink();
     if (!target) return;
-    /* Newly reachable: a signal node has both ports, so its own output can be
-       dragged onto its own input. The firmware refuses a self-link outright
-       (a cycle of one), and it would be a pointless one anyway — hearing a code
-       and immediately sending it back is a feedback loop, not a doorbell. Say
-       so rather than letting the drag die silently. */
+    /* Only a logic node has both ports, so only a logic node can have its own
+       output dragged onto its own input. The firmware refuses a self-link
+       outright (a cycle of one), so say why rather than letting the drag die
+       silently. */
     if (target.id === from) {
       if (hasIn(nodeType(target.type)) && hasOut(nodeType(target.type)))
         alertSheet("A node cannot feed itself",
-          nodeName(from) + " would hear its own code and send it straight back out. " +
-          "Link it to another node instead.");
+          nodeName(from) + " would be its own input, which is a loop of one and would " +
+          "never settle. Link it to another node instead.");
       return;
     }
     if (!hasIn(nodeType(target.type))) {
@@ -2694,23 +3263,200 @@ function renderCanvas() {
   svg.addEventListener("pointerup", endPan);
   svg.addEventListener("pointercancel", endPan);
 
+  /* ---- the small controls a node box may carry ----
+   *
+   * THE LAYOUT IS ONE DESIGN, not three additions. The fixed furniture is the
+   * ports: they sit on the vertical centre line at (0, NH/2) and (NW, NH/2),
+   * and the output one hides a 13-unit .port-grab disc. So the controls get a
+   * strip of their own along the INSIDE of the top edge, right-aligned, and the
+   * box grew from 52 to 60 units tall to give them that strip rather than
+   * making them sit on the title.
+   *
+   *   ▶ / 💡  act or lamp   (NW - 56, 14) = (112, 14)   drawn r 9, hit r 13
+   *   ✕        delete       (NW - 26, 14) = (142, 14)   drawn r 9, hit r 13
+   *
+   * ✕ is always the rightmost badge, so its position never moves with the type.
+   * The slot to its left holds whatever that type has: ▶ on a signal or a
+   * virtual trigger, 💡 on a monitor, I/O on a switch, nothing otherwise. No
+   * type has two, so two slots is the whole vocabulary — a new badge takes the
+   * act slot or it does not exist. Verifiable separations:
+   *
+   *   ✕ to the output grab (NW, NH/2):  sqrt(26² + 16²) = 30.5  vs 13 + 13 = 26
+   *   ✕ to the act badge:               30                      vs 13 + 13 = 26
+   *   act badge to the input port:      sqrt(112² + 16²) = 113.1  (no grab disc)
+   *   ✕ to the input port:              sqrt(142² + 16²) = 142.9
+   *
+   * The natural inset corner (NW-16, 14) = (152, 14) is only sqrt(16² + 16²) =
+   * 22.6 from the output port — a 13-unit hit disc there already overlaps the
+   * 13-unit grab — which is why ✕ is inset a further ten units instead. And the
+   * badges clear the text vertically (they end at y 27, the title's cap height
+   * starts at 31), so a title still gets its full 22 characters on every type
+   * and a node with no badges reads exactly as one with them.
+   *
+   * Three types get a ▶, and it always means "do this node's own thing, now":
+   *
+   *   signal.tx       transmit that code over the air
+   *   signal.rx       pretend that code was just heard — fires its output only
+   *   source.virtual  fire its output
+   *
+   * THOSE FIRST TWO ARE OPPOSITE DIRECTIONS, which is the one thing this glyph
+   * must not hide. It is still the right glyph — each node has exactly one own
+   * thing to do, and ▶ is "do it" — but the two cannot be told apart by looking,
+   * so playAction() gives every ▶ a tooltip that names the direction in words,
+   * and the ✕-style confirmation-free click is backed by a message on the line
+   * under the tools saying what just happened. The list cards spend the clearer
+   * 📡 / 📥 glyphs instead, where there is room for them.
+   *
+   * source.gpio and source.any_rf get none: they are driven by the physical
+   * world, and a fake press would be a lie about what happened. logic.* and
+   * sink.mqtt get none either, and that is a judgement rather than an
+   * oversight — firing a logic node starts a traversal AT it, and traverse()
+   * never gates its own start, so ▶ on a Rate limit would push an event
+   * through the very node whose job is to block one; and ▶ on an MQTT sink
+   * would publish a real message to the user's broker with no trigger behind
+   * it. Neither is that node doing its own thing. Both keep Test fire on their
+   * list card, where the wording can say what it really is.
+   *
+   * Every interactive one stops the pointerdown that would otherwise start a
+   * node drag, and draws a bigger invisible disc than its glyph, exactly as
+   * .port-grab does. The action runs on pointerup, so a press that slides off
+   * the target does nothing. */
+  var BADGE_Y = 14,      /* the badge strip, inside the top edge            */
+      BADGE_R = 9,       /* drawn radius                                    */
+      BADGE_HIT = 13,    /* invisible hit radius, comfortably larger        */
+      BADGE_X_DEL = NW - 26,   /* 142 — ✕ is always the rightmost badge     */
+      BADGE_X_ACT = NW - 56;   /* 112 — the type's own badge, if it has one */
+
+  /* A badge is a filled disc with a border and a glyph centred on it, so it
+     reads as a button rather than a loose mark on the box. Every control shares
+     the shape — ✕, ▶ and 💡 alike — because three different visual languages on
+     one 168-unit box is what makes a node look like a toolbar. */
+  function badge(g, cx, cy, cls, glyph) {
+    var c = svgEl("circle", "nbadge " + cls);
+    c.setAttribute("cx", cx); c.setAttribute("cy", cy); c.setAttribute("r", BADGE_R);
+    add(g, c);
+    if (glyph) {
+      var t = svgEl("text", "nbadge-gl " + cls);
+      t.setAttribute("x", cx); t.setAttribute("y", cy + 3.5);
+      t.setAttribute("text-anchor", "middle");
+      t.textContent = glyph;
+      add(g, t);
+    }
+    return c;
+  }
+
+  function hitDisc(g, cx, cy, r, label, onFire) {
+    var d = svgEl("circle", "nhit");
+    d.setAttribute("cx", cx); d.setAttribute("cy", cy); d.setAttribute("r", r);
+    var tip = svgEl("title");
+    tip.textContent = label;
+    add(d, tip);
+    d.addEventListener("pointerdown", function (ev) {
+      if (linking) return;    /* a link drop lands on the node, not on this */
+      ev.stopPropagation();   /* must not also start dragging the node */
+      ev.preventDefault();
+    });
+    d.addEventListener("pointerup", function (ev) {
+      /* Releasing a link drag over one of these must complete the LINK. Let it
+         bubble to the canvas handler untouched rather than acting on the node
+         the user was aiming a wire at. */
+      if (linking) return;
+      ev.stopPropagation();
+      onFire();
+    });
+    add(g, d);
+    return d;
+  }
+
+  /* What ▶ does on this node, or null when it has none. Kept in one place so
+     the glyph, the tooltip, the disabled reason and the action can never say
+     three different things about the same button. */
+  function playAction(n) {
+    if (n.type === "source.virtual") {
+      return {
+        tip: "Trigger “" + nodeName(n.id) + "” now (fires its output; nothing is sent on air)",
+        why: null,
+        run: function (flash) { flash(); fireNode(n.id, null, canvasMsg); }
+      };
+    }
+    /* The receiver's ▶ is the safe one, and its tooltip has to say so as
+       plainly as the sender's says the opposite — the two wear the same glyph
+       on the same canvas. Never disabled: a node with no code bound still has
+       an output, and firing it is exactly how you test the chain hanging off
+       it before the code exists. */
+    if (n.type === "signal.rx") {
+      var rsid = numOr(n.signal_id, 0);
+      var what = rsid ? ("“" + (signalName(rsid) || ("signal " + rsid)) + "”")
+                      : "this node's code";
+      return {
+        tip: "Simulate hearing " + what + " — fires this node's output and runs the chain " +
+             "after it. NOTHING is transmitted; no chime rings from this.",
+        why: null,
+        run: function (flash) {
+          flash();
+          setMsg(canvasMsg, "Simulating " + what + " — nothing was sent on air.");
+          fireNode(n.id, null, canvasMsg);
+        }
+      };
+    }
+    if (n.type === "signal.tx") {
+      var sid = numOr(n.signal_id, 0);
+      var why = !sid ? "This sender has no code bound to it yet, so there is nothing to send."
+                     : (!txAvailable() ? S.txBlock : null);
+      return {
+        /* Says OVER THE AIR in as many words. One click here can ring a chime
+           in someone's house, so the tooltip must not be coy about it. */
+        tip: why || ("Transmit “" + (signalName(sid) || ("signal " + sid)) +
+                     "” OVER THE AIR now — this rings anything paired to it"),
+        why: why,
+        run: function (flash) {
+          flash();
+          setMsg(canvasMsg, "Sending “" + (signalName(sid) || ("signal " + sid)) + "”…");
+          transmit(sid, null, canvasMsg, {
+            body: { repeats: numOr(n.repeats, 6), gap_us: numOr(n.gap_us, 8000) },
+            ok: "Sent “" + (signalName(sid) || ("signal " + sid)) + "” over the air ✓ " +
+                "(that the pulses left the radio — it cannot know a receiver reacted)"
+          });
+        }
+      };
+    }
+    /* Everything else: no ▶. See the note above for why. */
+    return null;
+  }
+
   nodes.forEach(function (n) {
     var ty = nodeType(n.type);
     var p = pos(n);
-    var g = svgEl("g", "node");
+    var mon = isMonitor(n);
+    var play = playAction(n);
+    var g = svgEl("g", "node" + (n.enabled === false ? " off" : ""));
     g.setAttribute("transform", "translate(" + p.x + "," + p.y + ")");
-    var r = svgEl("rect", "nbox g-" + ty.g);
+    var r = svgEl("rect", "nbox g-" + ty.g + (n.enabled === false ? " off" : ""));
     r.setAttribute("width", NW); r.setAttribute("height", NH);
     r.setAttribute("rx", "10");
     add(g, r);
+    /* Every control lives outside the box or on a port line a sink does not
+       use, so the labels sit at the same inset on every type — a node with no
+       controls at all reads exactly as it always did. Only the 💡 takes room
+       inside, and only on the type that has one. */
     var t1 = svgEl("text", "ntitle");
-    t1.setAttribute("x", "12"); t1.setAttribute("y", "22");
+    t1.setAttribute("x", "12"); t1.setAttribute("y", "40");
     t1.textContent = (n.name || ty.label).slice(0, 22);
     add(g, t1);
     var t2 = svgEl("text", "ntype");
-    t2.setAttribute("x", "12"); t2.setAttribute("y", "38");
+    t2.setAttribute("x", "12"); t2.setAttribute("y", "53");
     t2.textContent = ty.ico + " " + ty.label;
     add(g, t2);
+
+    /* 💡 — the whole reason the Monitor node exists on the map: you can watch a
+       chain light up node by node instead of reading a log. It takes the act
+       slot (a monitor has no ▶) and wears the same badge shape as the others,
+       but no hit disc: it is a readout, not a button. refreshMonitors() toggles
+       .on and CSS fades it. */
+    if (mon) {
+      var lamp = badge(g, BADGE_X_ACT, BADGE_Y, "nlamp", null);
+      lamp.setAttribute("data-monlamp", n.id);
+    }
 
     if (hasIn(ty)) {
       var pin = svgEl("circle", "port in");
@@ -2732,6 +3478,67 @@ function renderCanvas() {
       });
       add(g, grab);
     }
+
+    /* ▶ — do this node's own thing, now. On a Virtual trigger and a Signal
+       receiver that is firing its output and nothing more; on a Signal sender
+       it is transmitting the code OVER THE AIR, which is audible in someone's
+       house. Same glyph, opposite directions, so every one of them names what
+       it does in its tooltip and reports back on the message line — see the
+       badge notes above. Deliberately no confirmation: it is not destructive,
+       and the user asked for a button, not a dialog.
+
+       With a Monitor downstream this is also the whole verification loop for a
+       Virtual trigger: click ▶, watch 💡 light, see the mark land on the
+       timeline — no transmitter, no doorbell press, nothing audible. */
+    if (play) {
+      var off = play.why ? " off" : "";
+      var fbg = badge(g, BADGE_X_ACT, BADGE_Y, "nfire" + off, "▶");
+      hitDisc(g, BADGE_X_ACT, BADGE_Y, BADGE_HIT, play.tip, function () {
+        /* Disabled is shown, not silent: say WHY on the message line rather
+           than swallowing the click. */
+        if (play.why) { setMsg(canvasMsg, play.why, "err"); return; }
+        play.run(function () {
+          /* A flash on the badge itself, so the eye that is on the node does
+             not have to travel to the message line to know the click landed. */
+          if (!fbg.classList) return;
+          fbg.classList.add("fired");
+          setTimeout(function () { if (fbg.classList) fbg.classList.remove("fired"); }, 550);
+        });
+      });
+    }
+
+    /* I / O — the position of a Switch node, in the act slot (a Switch has no
+       ▶: firing one would start a traversal AT it, walking straight past the
+       thing it exists to control). Same badge shape as everything else, and it
+       is a BUTTON, so the map is somewhere you can actually flip a switch and
+       watch the wires after it break.
+
+       The glyph is the mains-rocker pair rather than a word, because at 9 units
+       across nothing longer is legible — and the colour carries it anyway: the
+       ON badge is the same green as ▶, the OFF one is red and the whole box and
+       its outgoing wires go with it. */
+    if (isSwitch(n)) {
+      var on = switchOn(n);
+      var sbg = badge(g, BADGE_X_ACT, BADGE_Y, "nsw" + (on ? " on" : " off"), on ? "I" : "O");
+      hitDisc(g, BADGE_X_ACT, BADGE_Y, BADGE_HIT,
+        (on ? "Switch “" + (n.name || ty.label) + "” OFF — blocks everything wired after it"
+            : "Switch “" + (n.name || ty.label) + "” ON — lets this path conduct again"),
+        function () {
+          if (sbg.classList) sbg.classList.add("fired");
+          setSwitch(n, !on, null, canvasMsg);
+        });
+    }
+
+    /* ✕ — delete, through the SAME confirmation the editor's Delete uses. The
+       confirmation is what makes a bare ✕ on the map safe; a second dialog or a
+       second delete path would only be a second thing to keep in step. */
+    badge(g, BADGE_X_DEL, BADGE_Y, "ndel", "✕");
+    hitDisc(g, BADGE_X_DEL, BADGE_Y, BADGE_HIT, "Delete " + (n.name || ty.label), function () {
+      deleteNodeConfirmed(n, function (e) {
+        setMsg(canvasMsg, e.message, "err");
+      });
+    });
+
     add(gNodes, g);
 
     /* pointer drag -> persist ui_x/ui_y on release */
@@ -2771,6 +3578,7 @@ function renderCanvas() {
   drawLinks();
   add(box, svg);
   add(wrap, box);
+  refreshMonitorLamps();
 }
 
 /* The canvas renders 1:1 inside a scrolling wrapper, so this is a plain offset
@@ -3472,32 +4280,58 @@ function sectionFirmware() {
   /* --- is there a newer release? --- */
   add(body, updateCheckBlock());
 
-  /* --- from a URL --- */
+  /* --- from a URL ---
+     TWO fields, not one. There are two images and they live at two different
+     URLs, and a single box that had to be re-typed between the two buttons was
+     how "Update web UI" ended up flashing an app image at people. Each is
+     prefilled with the stable release asset for its own kind, so the common
+     case is a click. */
   add(body, el("div", "divider"));
   add(body, el("h3", null, "From a URL"));
-  var urlIn = inputEl("url", "", { placeholder: "https://.../doorbell433.bin" });
+  add(body, el("div", "note",
+    "Prefilled with the latest stable release of each image. They are ordinary text fields — " +
+    "point them at a fork, a test build or a file on your own web server and the box fetches " +
+    "that instead. The automatic check above needs none of this: it uses the URLs it finds in " +
+    "the release itself."));
+
+  var urlIn = inputEl("url", "", { placeholder: OTA_DEFAULT_APP_URL });
   urlIn.type = "url";
-  add(body, field("Image URL", urlIn, "The box downloads it itself, so it needs working internet."));
+  add(body, field("Firmware image URL", urlIn,
+    "The box downloads it itself, so it needs working internet."));
+  var uiUrlIn = inputEl("url", "", { placeholder: OTA_DEFAULT_WEBUI_URL });
+  uiUrlIn.type = "url";
+  add(body, field("Web UI image URL", uiUrlIn,
+    "The second, separate image — this page itself."));
+
   var urlMsg = el("div", "formmsg");
   var urlRow = el("div", "btnrow");
   var appBtn = el("button", "btn primary", "Update firmware");
   appBtn.type = "button";
   var uiBtn = el("button", "btn", "Update web UI");
   uiBtn.type = "button";
-  function urlUpdate(path, what, btn) {
-    var u = trimOf(urlIn);
-    if (!u) { setMsg(urlMsg, "Enter the image URL first.", "err"); return; }
+  function urlUpdate(path, what, btn, input) {
+    var u = trimOf(input);
+    if (!u) { setMsg(urlMsg, "Enter the " + what + " image URL first.", "err"); return; }
     startOta(path, { url: u }, what + " from this URL", btn, urlMsg,
       [u, "The box downloads and flashes it, then reboots. Do not power it off."]);
   }
-  appBtn.addEventListener("click", function () { urlUpdate("/api/ota", "firmware", appBtn); });
-  uiBtn.addEventListener("click", function () { urlUpdate("/api/ota/webui", "web UI", uiBtn); });
+  appBtn.addEventListener("click", function () { urlUpdate("/api/ota", "firmware", appBtn, urlIn); });
+  uiBtn.addEventListener("click", function () { urlUpdate("/api/ota/webui", "web UI", uiBtn, uiUrlIn); });
   add(urlRow, appBtn, uiBtn);
   add(body, urlRow, urlMsg);
 
+  /* Prefill only what is EMPTY, and never over something already typed: the
+     stored ota.url wins (it is what this box was last told to use), then the
+     box's own defaults, then the constants above for a firmware too old to
+     serve them. */
+  urlIn.value = OTA_DEFAULT_APP_URL;
+  uiUrlIn.value = OTA_DEFAULT_WEBUI_URL;
   loadConfig().then(function (cfg) {
-    if (cfg && cfg.ota && cfg.ota.url && !urlIn.value) urlIn.value = cfg.ota.url;
-  });
+    var o = (cfg && cfg.ota) || {};
+    if (o.url) urlIn.value = o.url;
+    else if (o.default_url) urlIn.value = o.default_url;
+    if (o.default_webui_url) uiUrlIn.value = o.default_webui_url;
+  }).catch(function () { /* the constants above already filled both in */ });
 
   /* --- browser upload --- */
   add(body, el("div", "divider"));
@@ -3568,7 +4402,9 @@ function sectionFirmware() {
     add(wrap, b);
     return wrap;
   }
-  add(body, uploadRow("Firmware image (doorbell433.bin)", "/api/ota/upload", "firmware"));
+  /* The release asset is called klingelbox.bin; the label said doorbell433.bin,
+     which is the project's old name and matches no file anyone can download. */
+  add(body, uploadRow("Firmware image (klingelbox.bin)", "/api/ota/upload", "firmware"));
   add(body, uploadRow("Web UI image (storage.bin)", "/api/ota/webui/upload", "web UI"));
   add(body, prog, upMsg);
   return s;

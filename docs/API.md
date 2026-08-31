@@ -147,7 +147,7 @@ burst is offered for registration.
 
 ### `GET /api/graph`
 ```json
-{ "nodes": [ { "id":1, "type":"signal", "name":"Front door",
+{ "nodes": [ { "id":1, "type":"signal.rx", "name":"Front door",
                "enabled":true, "signal_id":1,
                "gpio_pin":-1, "gpio_active_low":true, "gpio_debounce_ms":50,
                "repeats":6, "gap_us":8000,
@@ -155,35 +155,62 @@ burst is offered for registration.
                "topic":"", "ui_x":40, "ui_y":40 } ],
   "links": [ {"from":1,"to":2} ] }
 ```
-`type` is one of: `signal`, `source.gpio`, `source.virtual`,
+`type` is one of: `signal.rx`, `signal.tx`, `source.gpio`, `source.virtual`,
 `source.any_rf`, `logic.group`, `logic.throttle`, `logic.repeat`,
-`sink.mqtt`.
+`logic.switch`, `sink.mqtt`, `sink.monitor`.
 
-**`signal` has BOTH ports** — it is one stored 433 MHz signal, and a signal is
-not inherently an input or an output:
+#### `signal.rx` and `signal.tx` — one code, one direction each
 
-| direction | what it means |
+A 433 MHz signal can be received or sent, so it gets **two node types** over the
+same `signal_id` pool. Each has one port and one job:
+
+| type | ports | what it does |
+|---|---|---|
+| `signal.rx` | out only | fires when `signal_id` is heard on air |
+| `signal.tx` | in only | transmits `signal_id` when reached (`repeats` copies, `gap_us` apart) |
+
+A signal you both listen for and send is **two nodes**, and a relay is written
+down as `signal.rx (A) → … → signal.tx (B)` — which reads left to right like
+every other chain.
+
+`POST /api/graph/nodes/{id}/fire` simply starts a traversal at the node, so it
+does whatever that node does:
+
+| firing a | does |
 |---|---|
-| out | the node fires when `signal_id` is heard on air |
-| in  | reaching the node over a link transmits `signal_id` (`repeats` copies, `gap_us` apart) |
+| `signal.rx` | "pretend this code was just heard" — its output fires, **nothing is transmitted** |
+| `signal.tx` | transmits, exactly as an inbound link would have |
 
-Firing a signal node directly (`POST /api/graph/nodes/{id}/fire`) runs the
-**output** side: it is "pretend that code was just heard", and it does not
-transmit. It is also what an RF match does, which is why hearing a code never
-makes the box echo it straight back out. To send one on demand use
-`POST /api/signals/{id}/transmit`, or link something into the node's input.
+An RF match starts `signal.rx` nodes only. A `signal.tx` bound to the same code
+is never started by hearing it, which is why the box cannot echo a code back out:
+the node that heard it has no send side to reach.
 
-`signal` replaces the former `source.button` (input only) and `sink.transmit`
-(output only). **Stored graphs migrate automatically**: `signal` occupies the
-enum slot `source.button` had, so every stored button node is already a signal
-node, and a stored `sink.transmit` is retyped to `signal` on the first boot of
-this firmware, keeping its id, name, `signal_id`, `repeats`, `gap_us`, canvas
-position and every link. Neither wire name is accepted any more.
+`repeats` and `gap_us` are read on `signal.tx` alone; they are still present on
+an `rx` node's JSON (every field is, see below) and ignored there.
+
+**Stored graphs migrate automatically** (nodes blob v2 → v3). `signal.rx` keeps
+the enum slot the old two-ported `signal` type had, so a stored node is already
+an `rx` node, and the migration only decides which ones were being used as
+senders — by the links attached to them:
+
+| the stored `signal` node | becomes |
+|---|---|
+| has an outgoing link | `signal.rx` |
+| has only incoming links | `signal.tx` |
+| has no links at all | `signal.rx` |
+| has **both** directions | `signal.rx`, plus a logged warning and a `system` event naming the node |
+
+Nodes keep their id, name, `signal_id`, `repeats`, `gap_us`, canvas position and
+every link; **nothing is created and no link is rewired**. The both-directions
+case is the one that genuinely needs a second node now, and the box reports it
+rather than inventing one — add a `signal.tx` for that code and move the inbound
+links onto it. The wire name `signal` is no longer accepted, and neither are the
+older `source.button` and `sink.transmit`.
 
 **`source.any_rf` is a wildcard**: it fires on EVERY received burst, including
 ones matching no stored signal. Wire one to a `sink.mqtt` and Home Assistant
 sees every press on the band — registered or not. It fires in addition to any
-matching `signal` node, which is intended, not double-firing.
+matching `signal.rx` node, which is intended, not double-firing.
 Irrelevant fields for a given type are present but ignored.
 
 **A link from a node to itself is refused** (400): it is a cycle of one. A
@@ -192,6 +219,20 @@ most once per traversal and logs a `system` event when it stops.
 
 **Time windows are in SECONDS** (`window_s`, 1–6000). `window_ms` is emitted
 alongside it and still accepted on write, but `window_s` wins when both are sent.
+
+**`logic.group` has two modes that do genuinely different things**, and only one
+of them uses `window_s`:
+
+| `group_mode` | behaviour | uses `window_s` |
+|---|---|---|
+| `any` | A **merge point**. Anything arriving is passed straight on, immediately. | no |
+| `all` | A **coincidence detector**. Nothing passes until EVERY inbound link has carried an event inside the window; it then fires once, forgets them all and re-arms. | yes |
+
+`any` does not wait, does not compare and never consults the clock — sending a
+`window_s` with it is accepted and stored, but changes nothing. Its value is
+structural: several sources meet at one node, so the chain hanging off it is
+wired and edited in one place. An `all` group with no inbound links can never be
+satisfied and never fires.
 
 **`logic.throttle` is a leading-edge throttle** (a cooldown / rate limit): the
 first event passes straight through, then everything inside the window is
@@ -208,11 +249,11 @@ carrying the original trigger unchanged. It uses two fields:
 | `repeats` | total emissions, the immediate one included | 1–20 | 3 |
 | `window_s` | interval between emissions | 1–6000 | 5 |
 
-So `signal (front door) → logic.repeat (repeats 3, window_s 5) → signal (chime)`
-rings the chime at 0 s, 5 s and 10 s from a single press. `repeats: 1` is a legal
-pass-through that adds nothing. `repeats` is the same struct field a `signal`
-node uses for its frame copies; on a repeat node it counts emissions instead, and
-is capped at 20 rather than 32.
+So `signal.rx (front door) → logic.repeat (repeats 3, window_s 5) → signal.tx
+(chime)` rings the chime at 0 s, 5 s and 10 s from a single press. `repeats: 1`
+is a legal pass-through that adds nothing. `repeats` is the same struct field a
+`signal.tx` node uses for its frame copies; on a repeat node it counts emissions
+instead, and is capped at 20 rather than 32.
 
 A new event arriving while a repeat is still running **restarts** it — it does
 not stack, so five impatient presses do not queue fifteen rings. Deleting or
@@ -224,22 +265,112 @@ immediate emission still happens and the repeats are dropped with a `system`
 event. Wiring a repeat node back into itself is bounded too: the engine stops
 such a chain after 8 laps and logs a `system` event.
 
-**`topic` serves two node types.** On `sink.mqtt` it is published to as
+**`logic.switch` is a switch in the wire.** Every other type is a source, a
+transform or a sink; this one sits IN a link and decides whether it conducts.
+While it is ON an event passes through untouched; while it is OFF nothing gets
+past it, and everything wired after it is dead until it is switched back on. The
+nodes and links all stay exactly where they are — that is the whole point, since
+the only previous way to stop a path was to delete the link.
+
+**Its position IS `enabled`.** Not a second field beside it: the engine already
+skips a disabled node when it walks the graph, and "the walk does not enter it"
+is exactly "the wire does not conduct", so the two are one idea. Read the
+position out of `enabled` in `GET /api/graph`; move it with the route below.
+
+```
+POST /api/graph/nodes/{id}/switch   {"on": false}   → the updated node object
+```
+`{"enabled": false}` is accepted as a synonym for `{"on": false}`. `409` if the
+node is not a `logic.switch`.
+
+Posting `{"enabled": false}` to the ordinary `POST /api/graph/nodes/{id}` moves
+the same flag and is not an error — but it **persists synchronously**, the way
+every graph mutation does. The `/switch` route does not: it puts the change in
+RAM immediately (so the very next traversal sees it) and lets the box write the
+node blob back once the position has been stable for ~10 s, and at most once
+every 2 minutes. That is deliberate. The graph blob is rewritten in full on every
+save, and this is the one control a home-automation rule may flip as often as it
+likes; a write per toggle would be a flash-wear bug. Use `/switch` from anything
+automated. The cost is bounded staleness — a power cut seconds after a toggle
+comes back in the previous position — and the box always republishes its
+**actual** position retained on connect, so no subscriber is left believing a
+switch it cannot see.
+
+**`topic` serves three node types.** On `sink.mqtt` it is published to as
 `<base>/<topic>`. On `source.virtual` it is SUBSCRIBED to as
 `<base>/trigger/<topic>` — any message there fires the node, which is how a
 virtual input becomes reachable from Home Assistant or a shell one-liner with no
-RF involved. Empty on a `source.virtual` means UI/REST triggering only.
+RF involved. On `logic.switch` it names a pair of topics:
+
+| topic | direction | payload |
+|---|---|---|
+| `<base>/switch/<topic>/set` | subscribed | `ON` `OFF` `1` `0` `true` `false` `open` `close`, any case; or `{"state":"ON"}` / `{"on":true}` / `{"value":1}` |
+| `<base>/switch/<topic>/state` | published, **retained**, QoS 1 | `ON` or `OFF` |
+
+The state is published when the switch moves, on every broker connect, and after
+a reboot, so Home Assistant never shows a position the box is not in. With
+discovery enabled the topic also becomes a native HA **`switch`** entity on the
+shared Klingelbox device — a real toggle, not a template or a button pair.
+
+**Several `logic.switch` nodes may share one `topic`**, and that is a feature:
+one Home Assistant toggle then gates several paths at once. A `set` command moves
+every node carrying the suffix; the state reported for the topic is `ON` if
+**any** of them is conducting (an all-of rule would report `OFF` while a path
+still rang). Discovery announces one entity **per distinct topic**, not per node
+— two toggles that always move together and command each other would read as a
+bug — named after the first node on the topic, with `(N paths)` appended when
+several share it.
+
+Empty on a `source.virtual` or a `logic.switch` means UI/REST only: the node
+still works, nothing subscribes to it and no HA entity appears.
+
+**`sink.monitor` acts on nothing.** It is a visualizer: reaching it records a
+timestamp and that is all — no transmit, no publish, no GPIO. Drop one anywhere
+in a chain to see that the chain fires, and read the hits back from
+`GET /api/monitor`.
+
+| field | meaning | range | default |
+|---|---|---|---|
+| `window_s` | how long the UI's indicator stays lit per hit | 1–60 | 3 |
+
+It reuses `window_s` rather than adding a field, the same way `logic.repeat`
+reuses `repeats`. Its hits live in RAM only and are **never written to flash** —
+this is debug telemetry, and persisting a press every time someone rings the
+bell would wear NVS out for data nobody reads a minute later. They are dropped
+on delete, on disable, on a retype and on reboot. At most 64 hits are kept per
+node, and anything older than the 600 s retention window is pruned as new hits
+arrive, so a busy band cannot flush the history in seconds. At most 8 monitor
+nodes hold a hit ring at once; a ninth is logged and simply records nothing.
 
 **Combining several buttons into one virtual signal** needs no special node type:
-link each `signal` node into a `logic.group` (mode `any` or `all`) and link
-that to a `signal` node carrying the virtual signal.
+link each `signal.rx` node into a `logic.group` (mode `any` or `all`) and link
+that to a `signal.tx` node carrying the virtual signal.
 
 ### `POST /api/graph/nodes` — a node object without `id`; returns the created node.
 ### `POST /api/graph/nodes/{id}` — partial update.
 ### `DELETE /api/graph/nodes/{id}` — also removes its links.
 ### `POST /api/graph/nodes/{id}/fire` — test-fire (or trigger a `source.virtual`).
+### `POST /api/graph/nodes/{id}/switch` — `{"on":true}` on a `logic.switch`; see above.
 ### `POST /api/graph/links` — `{"from":1,"to":2}`
 ### `DELETE /api/graph/links` — `{"from":1,"to":2}`
+
+### `GET /api/monitor`
+Every `sink.monitor` node and when it recently fired, in **one call** however
+many exist — a client polls this once per tick regardless of how many monitors
+are on the canvas.
+```json
+{ "now_s": 1234,
+  "nodes": [ { "id": 7, "name": "Front door watch", "hold_s": 3,
+               "retention_s": 600, "hits": [1231, 1180, 1104] } ] }
+```
+`hits` are **device-uptime seconds, newest first**, on the same clock as
+`now_s` — so an age is `now_s - hit` and no wall-clock sync is needed. That is
+deliberate: the box may have no time source at all, and an epoch timestamp
+would be a lie on a cold boot. `hold_s` is the node's `window_s`, clamped to
+1–60. `retention_s` is how far back `hits` can reach (600 s).
+
+`nodes` is `[]` when no monitor node exists — which is how a client tells "this
+firmware has no monitors" (404) apart from "none has been added" (200).
 
 ### `GET /api/gpio/available`
 Which GPIOs the UI may offer for a `source.gpio` node — the wired-button feature
@@ -292,8 +423,25 @@ succeeded and the key was dropped.) Reads report only `has_pass`.
   "mqtt": { "enabled":false, "host":"", "port":1883, "user":"",
             "base_topic":"doorbell", "homeassistant":true,
             "discovery_prefix":"homeassistant" },
-  "ota": { "url":"" } }
+  "ota": { "url":"https://github.com/MarvAmBass/klingelbox/releases/latest/download/klingelbox.bin",
+           "default_url":"https://github.com/MarvAmBass/klingelbox/releases/latest/download/klingelbox.bin",
+           "default_webui_url":"https://github.com/MarvAmBass/klingelbox/releases/latest/download/storage.bin" } }
 ```
+
+`ota.url` is the app image URL this box will use for a manual update; it is
+writable and defaults to the stable release asset, so nobody has to type a GitHub
+path from memory. `default_url` and `default_webui_url` are **read-only** and are
+what the web UI prefills the two manual-update fields with. They point at
+`releases/latest/download/<asset>`, which GitHub redirects to the newest
+release's asset, so they never carry a version.
+
+A fork changes all of this in **one place**: `DB_UPDATE_REPO_SLUG` in
+`main/update_check.h`, which the update checker, the stored default and these two
+fields are all derived from. (The web UI carries one matching constant of its
+own, used only as a fallback against a firmware too old to serve these fields.)
+
+None of it is used by the **automatic** check or install below: those read the
+exact asset URLs out of the release document they just fetched.
 
 ### `GET /api/ap` / `POST /api/ap`
 ```json
@@ -313,13 +461,21 @@ succeeded and the key was dropped.) Reads report only `has_pass`.
 
 ## OTA
 
-* `POST /api/ota` — `{"url":"https://.../doorbell433.bin"}`
+* `POST /api/ota` — `{"url":"https://.../klingelbox.bin"}`
 * `POST /api/ota/webui` — `{"url":"https://.../storage.bin"}`
 * `POST /api/ota/upload` — raw app `.bin` as the body
 * `POST /api/ota/webui/upload` — raw SPIFFS `storage.bin` as the body
 
 All reboot on success. The app image and the web UI are separate partitions: an
 app OTA leaves the old UI in place until the UI is updated too.
+
+`url` may be omitted on either URL route. `POST /api/ota` then uses the stored
+`ota.url` (what this box was last told to use, so a custom build is never
+silently replaced by upstream's) and falls back to the built-in default;
+`POST /api/ota/webui`, which stores nothing, goes straight to its default. Both
+defaults are also served by `GET /api/config` so a client can prefill the fields.
+They are for this manual path only — the automatic install below never needs
+them, and reads the exact asset URLs out of the release it fetched.
 
 ---
 

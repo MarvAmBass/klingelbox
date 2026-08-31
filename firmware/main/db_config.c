@@ -32,6 +32,9 @@
 #include "esp_random.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+/* For DB_UPDATE_APP_URL — the ONE place the release repo is named (see
+ * update_check.h). Header-only: no dependency on the update checker itself. */
+#include "update_check.h"
 
 static const char *TAG = "db_cfg";
 
@@ -101,7 +104,11 @@ void db_config_defaults(db_config_t *cfg)
     strlcpy(cfg->mqtt_discovery_prefix, "homeassistant",
             sizeof(cfg->mqtt_discovery_prefix));
 
-    cfg->ota_url[0] = '\0';
+    /* The stable release asset, so "update from a URL" is a button and not a
+     * typing exercise. Still fully editable — a fork, a local web server or a
+     * one-off test build is a matter of replacing the text. The AUTOMATIC check
+     * does not use this at all; it follows the URLs it finds in the release. */
+    strlcpy(cfg->ota_url, DB_UPDATE_APP_URL, sizeof(cfg->ota_url));
 
     /* Radio: a 433.92 MHz OOK doorbell. These mirror cc1101_radio_cfg_default()
      * — the driver's helper is the bring-up default, this is the persisted,

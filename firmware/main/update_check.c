@@ -66,12 +66,10 @@
 
 static const char *TAG = "db_update";
 
-/*
- * THE ONE PLACE A FORK CHANGES. Everything below is derived from this slug, so
- * someone running their own build points it at their own releases here and
- * nowhere else.
- */
-#define GH_REPO_SLUG    "MarvAmBass/klingelbox"
+/* The slug itself lives in update_check.h — db_config.c and http_api.c derive
+ * the default manual-update URLs from the same one, so there is exactly one
+ * repo name in the firmware for a fork to change. */
+#define GH_REPO_SLUG    DB_UPDATE_REPO_SLUG
 #define GH_LATEST_URL   "https://api.github.com/repos/" GH_REPO_SLUG "/releases/latest"
 
 /* GitHub 403s a request with no User-Agent. See the file header. */
@@ -79,9 +77,10 @@ static const char *TAG = "db_update";
 #define GH_ACCEPT       "application/vnd.github+json"
 #define GH_API_VERSION  "2022-11-28"
 
-/* The asset names the release workflow publishes. */
-#define GH_ASSET_APP    "klingelbox.bin"
-#define GH_ASSET_WEBUI  "storage.bin"
+/* The asset names the release workflow publishes (update_check.h, which also
+ * builds the default manual-update URLs out of them). */
+#define GH_ASSET_APP    DB_UPDATE_ASSET_APP
+#define GH_ASSET_WEBUI  DB_UPDATE_ASSET_WEBUI
 
 #define GH_CHUNK        512      /* bytes pulled from the socket at a time     */
 #define GH_MAX_BODY     (128 * 1024)  /* hard ceiling on what we will read     */
