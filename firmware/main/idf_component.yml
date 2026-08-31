@@ -1,0 +1,3 @@
+## Managed components for the Klingelbox firmware.
+dependencies:
+  espressif/mdns: "^1.2.0"

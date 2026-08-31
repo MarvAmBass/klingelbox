@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1a202a" media="(prefers-color-scheme: dark)">
+<title>Klingelbox</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<!--
+  Klingelbox web UI — mobile-first shell.
+  The product name is German; the interface is English on purpose.
+
+  The markup here is only the frame: header, the two navigations (a bottom bar
+  on phones, a header tab strip from 720 px up) and one empty <section> per
+  screen. Everything inside the sections is built by app.js, because every
+  screen's content depends on what the box actually reports — a node graph, a
+  signal store, a diagnostics table — and because a feature whose endpoint
+  answers 404/503 must vanish rather than sit there as dead HTML.
+
+  Both navigations are always in the DOM and select the same panes; CSS decides
+  which one is visible, so there is no JS branch on viewport width for nav.
+-->
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span id="brand-dot" class="brand-dot" aria-hidden="true"></span>
+    <h1>Klingelbox<span id="brand-ver" class="brand-ver"></span></h1>
+  </div>
+
+  <!-- Wide-screen tab strip. Hidden below 720 px, where .bottomnav takes over. -->
+  <nav class="tabs" role="tablist" aria-label="Sections">
+    <button class="tab active" type="button" data-tab="dashboard" role="tab" aria-selected="true">Dashboard</button>
+    <button class="tab" type="button" data-tab="signals" role="tab" aria-selected="false">Signals</button>
+    <button class="tab" type="button" data-tab="learn" role="tab" aria-selected="false">Learn</button>
+    <button class="tab" type="button" data-tab="automations" role="tab" aria-selected="false">Automations</button>
+    <button class="tab" type="button" data-tab="settings" role="tab" aria-selected="false">Settings</button>
+    <button class="tab" type="button" data-tab="diagnostics" role="tab" aria-selected="false">Diagnostics</button>
+  </nav>
+
+  <div class="topbar-right">
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Theme">&#128421;</button>
+    <div id="status-badge" class="status-badge" title="Box status">&hellip;</div>
+  </div>
+</header>
+
+<main>
+  <!-- Recovery first-run wizard. app.js fills and reveals this, and adds
+       .recovery to <body>, when /api/system reports wifi_mode == "recovery". -->
+  <section id="tab-recovery" class="tabpane" role="tabpanel" aria-label="Wi-Fi setup"></section>
+
+  <section id="tab-dashboard"   class="tabpane active" role="tabpanel" aria-label="Dashboard"></section>
+  <section id="tab-signals"     class="tabpane" role="tabpanel" aria-label="Signals"></section>
+  <section id="tab-learn"       class="tabpane" role="tabpanel" aria-label="Learn"></section>
+  <section id="tab-automations" class="tabpane" role="tabpanel" aria-label="Automations"></section>
+  <section id="tab-settings"    class="tabpane" role="tabpanel" aria-label="Settings"></section>
+  <section id="tab-diagnostics" class="tabpane" role="tabpanel" aria-label="Diagnostics"></section>
+
+  <footer class="foot">Klingelbox &mdash; <i>Die Klingel, lokal und ohne Cloud.</i><span id="foot-ver"></span></footer>
+</main>
+
+<!-- Phone navigation: fixed to the bottom, in thumb reach, 6 targets of
+     56x60 px at 360 px wide. Scrolls horizontally as a safety net for very
+     narrow viewports or very large system text. -->
+<nav class="bottomnav" role="tablist" aria-label="Sections">
+  <button class="navbtn active" type="button" data-tab="dashboard" role="tab" aria-selected="true">
+    <span class="ico" aria-hidden="true">&#127968;</span><span class="lbl">Home</span></button>
+  <button class="navbtn" type="button" data-tab="signals" role="tab" aria-selected="false">
+    <span class="ico" aria-hidden="true">&#128246;</span><span class="lbl">Signals</span></button>
+  <button class="navbtn" type="button" data-tab="learn" role="tab" aria-selected="false">
+    <span class="ico" aria-hidden="true">&#10133;</span><span class="lbl">Learn</span></button>
+  <button class="navbtn" type="button" data-tab="automations" role="tab" aria-selected="false">
+    <span class="ico" aria-hidden="true">&#128256;</span><span class="lbl">Flows</span></button>
+  <button class="navbtn" type="button" data-tab="settings" role="tab" aria-selected="false">
+    <span class="ico" aria-hidden="true">&#9881;</span><span class="lbl">Settings</span></button>
+  <button class="navbtn" type="button" data-tab="diagnostics" role="tab" aria-selected="false">
+    <span class="ico" aria-hidden="true">&#129514;</span><span class="lbl">Health</span></button>
+</nav>
+
+<script src="/app.js"></script>
+</body>
+</html>

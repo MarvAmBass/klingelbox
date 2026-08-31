@@ -1,0 +1,6 @@
+# sdkconfig.defaults.4mb — overrides for the ESP32-S3 Zero (4 MB flash, no PSRAM).
+#
+# Apply on top of sdkconfig.defaults:
+#   SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.4mb" idf.py build
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-4mb.csv"

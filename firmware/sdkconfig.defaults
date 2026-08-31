@@ -1,0 +1,63 @@
+# sdkconfig.defaults — doorbell433 (ESP32-S3 433 MHz doorbell server).
+#
+# Committed so a fresh checkout and CI produce identical firmware. Regenerate the
+# full sdkconfig with `idf.py set-target esp32s3` (it seeds from this file).
+
+# ---- Target ---------------------------------------------------------------
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- Console --------------------------------------------------------------
+# The S3 is reached over its NATIVE USB (USB-Serial/JTAG), not a UART bridge, so
+# route console/logs there — otherwise logs go out the UART0 pins and USB is silent.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# ---- Flash & partition table ---------------------------------------------
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- PSRAM: deliberately OFF ---------------------------------------------
+# This dev board HAS 8 MB octal PSRAM, but the eventual target (ESP32-S3 Zero)
+# has none — and enabling SPIRAM on a module without it HANGS AT BOOT. Nothing in
+# this firmware needs it (RF capture buffers are a few KB), so the portable
+# default wins. To use it on this board only, uncomment:
+#   CONFIG_SPIRAM=y
+#   CONFIG_SPIRAM_MODE_OCT=y
+#   CONFIG_SPIRAM_SPEED_80M=y
+
+# ---- RMT: the RF capture peripheral --------------------------------------
+# Pulse timings must survive Wi-Fi, HTTP and NVS/SPIFFS writes. Putting the RMT
+# ISR in IRAM keeps edge capture running even while the flash cache is disabled
+# during a flash write — without this, a config save can smear a capture.
+# NOTE: any RMT callback must then be IRAM_ATTR and touch no flash-resident data.
+CONFIG_RMT_ISR_IRAM_SAFE=y
+
+# ---- Main task ------------------------------------------------------------
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# ---- Wi-Fi: softAP + STA at once (APSTA) ---------------------------------
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+CONFIG_LWIP_DHCPS=y
+
+# ---- lwIP -----------------------------------------------------------------
+CONFIG_LWIP_MAX_SOCKETS=12
+CONFIG_LWIP_SO_RCVTIMEO=y
+CONFIG_LWIP_SO_REUSE=y
+CONFIG_LWIP_IPV4=y
+
+# ---- HTTP server ----------------------------------------------------------
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
+CONFIG_HTTPD_PURGE_BUF_LEN=64
+
+# ---- OTA ------------------------------------------------------------------
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
+
+# ---- mbedTLS (no TLS server; only the OTA client may use it) -------------
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+
+# ---- FreeRTOS -------------------------------------------------------------
+CONFIG_FREERTOS_HZ=1000

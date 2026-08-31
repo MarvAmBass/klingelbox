@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Klingelbox &mdash; web UI not installed</title>
+<!--
+  Fallback page, flashed when firmware/webui/ was absent at build time.
+
+  Deliberately ONE self-contained file: no /style.css, no /app.js, no fonts, no
+  CDN. If those existed here they would be the very things that are missing.
+  It has one job beyond apologising: let you install the real UI from a phone
+  over the setup hotspot, with no internet on the box, using the documented
+  POST /api/ota/webui/upload route.
+-->
+<style>
+  :root {
+    --bg:#f3f5f8; --panel:#fff; --sunk:#eef1f5; --text:#171c26; --muted:#626c7c;
+    --line:#dfe3ea; --accent:#1263c9; --accent-text:#fff; --ok:#12854b; --bad:#bd3a27;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#11151c; --panel:#1a202a; --sunk:#141a22; --text:#e6eaf1; --muted:#94a0b0;
+      --line:#2d3542; --accent:#5498ea; --accent-text:#0b1017; --ok:#46c383; --bad:#e8705d;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; padding:1rem calc(1rem + env(safe-area-inset-left)) 2rem;
+    background:var(--bg); color:var(--text);
+    font:16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    -webkit-text-size-adjust:100%;
+  }
+  main { max-width:34rem; margin:0 auto; }
+  h1 { font-size:1.25rem; margin:0 0 .2rem; }
+  h2 { font-size:1rem; margin:0 0 .5rem; }
+  .tag { color:var(--muted); font-size:.85rem; font-style:italic; margin:0 0 1rem; }
+  .card {
+    background:var(--panel); border:1px solid var(--line); border-radius:14px;
+    padding:1rem; margin:0 0 .85rem;
+  }
+  p { margin:0 0 .7rem; }
+  p:last-child { margin-bottom:0; }
+  .muted { color:var(--muted); font-size:.86rem; }
+  code, .mono { font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:.85em; }
+  pre { background:var(--sunk); border-radius:10px; padding:.7rem; overflow-x:auto; margin:.5rem 0; }
+  dl { display:grid; grid-template-columns:minmax(6rem,auto) 1fr; gap:.25rem .7rem; margin:0; font-size:.88rem; }
+  dt { color:var(--muted); }
+  dd { margin:0; font-family:ui-monospace, Menlo, Consolas, monospace; overflow-wrap:anywhere; }
+  input[type=file] { font:inherit; font-size:1rem; width:100%; padding:.5rem 0; }
+  button {
+    font:inherit; font-weight:600; font-size:.95rem; min-height:2.75rem; width:100%;
+    padding:.6rem 1rem; border:1px solid var(--accent); border-radius:10px;
+    background:var(--accent); color:var(--accent-text); cursor:pointer; margin-top:.5rem;
+  }
+  button:disabled { opacity:.5; }
+  .bar { height:.5rem; background:var(--sunk); border-radius:999px; overflow:hidden; margin:.6rem 0; display:none; }
+  .bar > i { display:block; height:100%; width:0; background:var(--accent); }
+  .msg { font-size:.86rem; min-height:1.2em; }
+  .msg.ok { color:var(--ok); } .msg.err { color:var(--bad); }
+  @media (min-width:640px) { body { padding:2rem 1rem; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Klingelbox</h1>
+  <p class="tag">Die Klingel, lokal und ohne Cloud.</p>
+
+  <div class="card">
+    <h2>The web UI is not installed</h2>
+    <p>The firmware is running and the REST API at <code>/api/…</code> is answering
+       normally &mdash; only the browser interface is missing. This page was flashed
+       because <code>firmware/webui/</code> was empty when the image was built.</p>
+    <p class="muted">Nothing is broken and nothing is lost. Install the real UI in one
+       of the two ways below.</p>
+  </div>
+
+  <div class="card">
+    <h2>Status</h2>
+    <dl id="sys"><dt>Reading&hellip;</dt><dd></dd></dl>
+  </div>
+
+  <div class="card">
+    <h2>Install the web UI from this device</h2>
+    <p class="muted">Pick the SPIFFS image (<code>storage.bin</code>) built from
+       <code>firmware/webui/</code>. It is written straight into the storage
+       partition, then the box reboots. No internet needed.</p>
+    <input type="file" id="f" accept=".bin,application/octet-stream">
+    <button id="up" type="button">Upload &amp; flash web UI</button>
+    <div class="bar" id="bar"><i></i></div>
+    <div class="msg" id="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Or build and flash it over USB</h2>
+    <pre>cp -r your-webui/* firmware/webui/
+idf.py build
+idf.py -p /dev/cu.usbmodem1101 storage-flash</pre>
+    <p class="muted">The app image and the web UI live in separate partitions, so
+       reflashing the UI never touches the firmware, your stored signals or your
+       automations.</p>
+  </div>
+</main>
+
+<script>
+(function () {
+  var msg = document.getElementById("msg");
+  var bar = document.getElementById("bar");
+  var fill = bar.firstElementChild;
+  function say(t, k) { msg.textContent = t; msg.className = "msg" + (k ? " " + k : ""); }
+
+  /* Status: proof the API is alive, and the address to come back to. */
+  fetch("/api/system").then(function (r) { return r.json(); }).then(function (s) {
+    var dl = document.getElementById("sys");
+    dl.textContent = "";
+    var rows = [
+      ["Version", s.version || "?"],
+      ["Hostname", "http://" + (s.hostname || "klingelbox") + ".local"],
+      ["Wi-Fi", s.sta_connected ? (s.sta_ssid || "?") + " @ " + (s.sta_ip || "?") : "not connected"],
+      ["Hotspot", s.ap_ssid ? s.ap_ssid + " @ " + (s.ap_ip || "?") : "off"],
+      ["Radio", (s.radio && s.radio.present) ? "CC1101 detected" : "NOT detected"],
+      ["Mode", s.wifi_mode || "?"]
+    ];
+    rows.forEach(function (r2) {
+      var dt = document.createElement("dt"); dt.textContent = r2[0];
+      var dd = document.createElement("dd"); dd.textContent = r2[1];
+      dl.appendChild(dt); dl.appendChild(dd);
+    });
+  }).catch(function () {
+    document.getElementById("sys").textContent = "The API did not answer.";
+  });
+
+  document.getElementById("up").addEventListener("click", function () {
+    var btn = this;
+    var f = document.getElementById("f").files[0];
+    if (!f) { say("Choose a storage.bin file first.", "err"); return; }
+    btn.disabled = true;
+    bar.style.display = "block";
+    say("Uploading…");
+    var xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/ota/webui/upload");
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.timeout = 600000;
+    xhr.upload.onprogress = function (e) {
+      if (!e.lengthComputable) return;
+      var p = Math.round(e.loaded * 100 / e.total);
+      fill.style.width = p + "%";
+      say("Uploading… " + p + "%");
+    };
+    xhr.onload = function () {
+      btn.disabled = false;
+      var res = {};
+      try { res = JSON.parse(xhr.responseText || "{}"); } catch (e) {}
+      if (xhr.status === 200 && !res.error) {
+        fill.style.width = "100%";
+        say("Flashed. The box is rebooting — reload this page in a few seconds.", "ok");
+      } else {
+        bar.style.display = "none";
+        say("Upload failed: " + (res.error || ("HTTP " + xhr.status)), "err");
+      }
+    };
+    xhr.onerror = xhr.ontimeout = function () {
+      btn.disabled = false;
+      bar.style.display = "none";
+      say("Upload failed: the connection dropped.", "err");
+    };
+    xhr.send(f);
+  });
+})();
+</script>
+</body>
+</html>

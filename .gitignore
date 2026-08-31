@@ -1,0 +1,11 @@
+# Root ignores. ESP-IDF build output is handled by firmware/.gitignore.
+
+# macOS
+.DS_Store
+
+# Editor / language-server caches (clangd writes firmware/.cache/)
+.cache/
+
+# Host-side logic tests, built by firmware/host-test/Makefile
+/firmware/host-test/test_rf_decode
+/firmware/host-test/*.dSYM/

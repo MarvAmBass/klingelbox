@@ -1,0 +1,17 @@
+# doorbell433 partition table — 16 MB flash (this ESP32-S3-N16R8 dev board).
+#
+# Dual OTA app slots make updates rollback-safe: the updater writes the inactive
+# slot, reboots, and app-rollback reverts a bad image on the next boot. `storage`
+# is a SPIFFS image carrying the web UI, so the UI can be re-flashed without
+# recompiling the firmware.
+#
+# For the ESP32-S3 Zero (4 MB, no PSRAM) use partitions-4mb.csv instead — see
+# sdkconfig.defaults.4mb and README "Porting to the ESP32-S3 Zero".
+#
+# Name,     Type, SubType,  Offset,    Size,     Flags
+nvs,        data, nvs,      0x9000,    0x6000,
+otadata,    data, ota,      0xf000,    0x2000,
+phy_init,   data, phy,      0x11000,   0x1000,
+ota_0,      app,  ota_0,    0x20000,   0x200000,
+ota_1,      app,  ota_1,    0x220000,  0x200000,
+storage,    data, spiffs,   0x420000,  0x100000,
