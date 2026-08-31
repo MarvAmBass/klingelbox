@@ -13,10 +13,14 @@
   Klingelbox web UI — mobile-first shell.
   The product name is German; the interface is English on purpose.
 
-  THREE destinations, and the first one is the product: the node graph. There is
-  no separate Signals or Learn screen — a signal is learned, created, inspected
-  and deleted from inside the node that uses it, so the graph is the only place
-  wiring happens.
+  FIVE destinations, and the first one is the product: the node graph. The
+  Dashboard IS the map and nothing else — the live feed has its own tab
+  (Activity) and the written manual has its own tab (Handbook), because both
+  used to push the graph off the top of a 360 px screen.
+
+  There is still no separate Signals or Learn screen — a signal is learned,
+  created, inspected and deleted from inside the node that uses it, so the graph
+  is the only place wiring happens.
 
   The markup here is only the frame: header, the two navigations (a bottom bar
   on phones, a header tab strip from 720 px up) and one empty <section> per
@@ -39,14 +43,26 @@
   <!-- Wide-screen tab strip. Hidden below 720 px, where .bottomnav takes over. -->
   <nav class="tabs" role="tablist" aria-label="Sections">
     <button class="tab active" type="button" data-tab="dashboard" role="tab" aria-selected="true">Dashboard</button>
+    <button class="tab" type="button" data-tab="activity" role="tab" aria-selected="false">Activity</button>
     <button class="tab" type="button" data-tab="settings" role="tab" aria-selected="false">Settings</button>
     <button class="tab" type="button" data-tab="diagnostics" role="tab" aria-selected="false">Diagnostics</button>
+    <button class="tab" type="button" data-tab="handbook" role="tab" aria-selected="false">Handbook</button>
   </nav>
 
   <div class="topbar-right">
     <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Theme">&#128421;</button>
     <div id="status-badge" class="status-badge" title="Box status">&hellip;</div>
   </div>
+
+  <!-- Box status, right-aligned on its own header line and allowed to wrap to
+       two. It used to sit inside the Dashboard's Activity panel, which meant
+       "is the radio even listening" was only answerable on one screen; it is a
+       fact about the box, so it belongs where the box's name is.
+
+       app.js builds these six chips ONCE and thereafter only assigns
+       textContent — the uptime ticks at 1 Hz and a rebuilt row would repaint
+       the header every second. -->
+  <div id="status-chips" class="statuschips" aria-label="Box status"></div>
 </header>
 
 <main>
@@ -54,25 +70,43 @@
        .recovery to <body>, when /api/system reports wifi_mode == "recovery". -->
   <section id="tab-recovery" class="tabpane" role="tabpanel" aria-label="Wi-Fi setup"></section>
 
-  <!-- The Dashboard IS the node graph: view switch, the graph, the live
-       activity feed and the recipes, in that order. -->
+  <!-- The Dashboard IS the node graph and only the node graph: the two
+       blocking warnings, the status chips, the view switch + ➕ Add node, then
+       the map itself. -->
   <section id="tab-dashboard"   class="tabpane active" role="tabpanel" aria-label="Dashboard"></section>
+  <!-- The live event feed, a whole page of it, with search and a kind filter
+       above the list. Polls /api/events only while it is the visible tab. -->
+  <section id="tab-activity"    class="tabpane" role="tabpanel" aria-label="Activity"></section>
   <section id="tab-settings"    class="tabpane" role="tabpanel" aria-label="Settings"></section>
   <section id="tab-diagnostics" class="tabpane" role="tabpanel" aria-label="Diagnostics"></section>
+  <!-- The offline manual. This box can be reached over its own captive portal
+       with no internet at all, so the documentation has to ship inside it. -->
+  <section id="tab-handbook"    class="tabpane" role="tabpanel" aria-label="Handbook"></section>
 
   <footer class="foot">Klingelbox &mdash; <i>Die Klingel, lokal und ohne Cloud.</i><span id="foot-ver"></span></footer>
 </main>
 
-<!-- Phone navigation: fixed to the bottom, in thumb reach. Three targets share
-     the full width at 360 px, so each is 120x56 px — far past the 44 px floor.
-     Still an overflow-x scroller as a safety net for very large system text. -->
+<!-- Phone navigation: fixed to the bottom, in thumb reach. FIVE targets share
+     the full width at 360 px, so each is 72x56 px — still comfortably past the
+     44 px floor in both axes, and five is where that stops being true, so this
+     bar is full.
+
+     The labels are the short forms on purpose: the header strip at 720 px has
+     room for "Diagnostics" and this bar does not, and a label that wraps to two
+     lines costs more legibility than the two syllables it saves. "Map" is what
+     the Dashboard actually is now. Still an overflow-x scroller as a safety net
+     for 280 px devices and very large system text. -->
 <nav class="bottomnav" role="tablist" aria-label="Sections">
   <button class="navbtn active" type="button" data-tab="dashboard" role="tab" aria-selected="true">
-    <span class="ico" aria-hidden="true">&#128256;</span><span class="lbl">Dashboard</span></button>
+    <span class="ico" aria-hidden="true">&#128256;</span><span class="lbl">Map</span></button>
+  <button class="navbtn" type="button" data-tab="activity" role="tab" aria-selected="false">
+    <span class="ico" aria-hidden="true">&#128276;</span><span class="lbl">Activity</span></button>
   <button class="navbtn" type="button" data-tab="settings" role="tab" aria-selected="false">
     <span class="ico" aria-hidden="true">&#9881;</span><span class="lbl">Settings</span></button>
   <button class="navbtn" type="button" data-tab="diagnostics" role="tab" aria-selected="false">
     <span class="ico" aria-hidden="true">&#129514;</span><span class="lbl">Health</span></button>
+  <button class="navbtn" type="button" data-tab="handbook" role="tab" aria-selected="false">
+    <span class="ico" aria-hidden="true">&#128214;</span><span class="lbl">Handbook</span></button>
 </nav>
 
 <script src="/app.js"></script>

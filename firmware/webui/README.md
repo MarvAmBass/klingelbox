@@ -6,11 +6,29 @@ The browser interface for the Klingelbox — an ESP32-S3 appliance that receives
 stores and replays 433 MHz wireless doorbell signals and routes button presses
 through a node graph.
 
-**The node graph is the product.** There are three screens — **Dashboard**,
-**Settings**, **Diagnostics** — and the Dashboard *is* the graph, with the live
-activity feed underneath it. There is no Signals screen and no Learn screen: a
-signal is learned, synthesized, inspected, replayed and rebound from inside the
-node that uses it. Everything revolves around the nodes.
+**The node graph is the product.** There are five screens — **Dashboard**,
+**Activity**, **Settings**, **Diagnostics**, **Handbook** — and the Dashboard
+*is* the graph and nothing else.
+
+The live feed and the recipe list used to sit under the graph. Between them they
+cost about two screenfuls of scrolling on a phone, so the thing you opened the
+app to look at was underneath them; both moved out. The feed became
+**Activity**, a whole page of it with a search box and a kind filter. The
+recipes went into **Handbook**, together with everything that was explanation
+rather than control — three paragraphs of intro above the map and a nine-line
+badge legend on top of the canvas. The Dashboard is now a title, one clause, the
+two blocking warnings, one toolbar row and the map.
+
+There is still no Signals screen and no Learn screen: a signal is learned,
+synthesized, inspected, replayed and rebound from inside the node that uses it.
+Everything revolves around the nodes.
+
+**The Handbook is the manual, flashed into the box.** A fresh Klingelbox hands
+you its own access point and a captive portal, and a phone joined to that AP has
+no internet — `docs/` on the web is unreachable at exactly the moment someone is
+working out what a Group node does. So the documentation ships inside the image.
+Its node reference is **generated from `NODE_TYPES`**, so a node added to the
+palette can be under-documented but never missing.
 
 Three files, no build step, no dependencies:
 
@@ -55,11 +73,12 @@ The reference target is a 360 px portrait phone.
 
 | Breakpoint | What it adds |
 |---|---|
-| *(base)* | Single column. Fixed bottom tab bar (3 cells, 120×56 px at 360 px). Sheets slide up from the bottom, and every multi-step flow is one of them. |
-| `600px` | 2-up card grids, roomier padding, sheets become centred dialogs. |
-| `720px` | The tab strip moves into the header; the bottom bar retires. |
-| `900px` | The node-graph **canvas** view becomes available; forms go 2-column. |
-| `1100px` | Centred max-width column, 3-up cards. |
+| *(base)* | Single column. Fixed bottom tab bar (**5 cells, 56–86 × 56 px at 360 px**, measured). Sheets slide up from the bottom, and every multi-step flow is one of them. |
+| `600px` | 2-up card grids, roomier padding, sheets become centred dialogs. The brand version and the status badge return; status chips reach tier 2. |
+| `720px` | The tab strip moves into the header; the bottom bar retires. The status chips step aside here — see below. |
+| `900px` | The node-graph **canvas** view becomes available; forms go 2-column. Status chips return. |
+| `1100px` | Centred max-width column, 3-up cards. Status chips reach tier 2 again. |
+| `1300px` | All six status chips. |
 
 Concretely:
 
@@ -73,6 +92,12 @@ Concretely:
 * **Two navigations, one behaviour.** Both the header `.tabs` and the
   `.bottomnav` are always in the DOM and select the same panes; CSS decides
   which is visible, so there is no JS branch on viewport width.
+* **Five cells is the bottom bar's ceiling.** At 360 px they measure 56–86 px
+  wide and 56 px tall — past 44 px in both axes — using the short labels
+  (*Map*, *Health*) and `white-space: nowrap`, so a label that will not fit
+  overflows the strip (which scrolls) rather than wrapping and making the bar
+  taller. A sixth cell would land near 60 px and start wrapping. If another
+  destination is ever needed, something has to leave.
 * `env(safe-area-inset-*)` is honoured top and bottom for notched phones.
 
 ---
@@ -276,9 +301,17 @@ the *same* `confirmSheet` the editor's Delete uses; there is one delete path
 
 ### Node types
 
-`signal` · `source.gpio` · `source.virtual` · `source.any_rf` ·
-`logic.group` · `logic.throttle` · `logic.repeat` · `sink.mqtt` ·
-`sink.monitor`
+`signal.rx` · `signal.tx` · `source.gpio` · `source.virtual` · `source.any_rf` ·
+`logic.group` · `logic.throttle` · `logic.repeat` · `logic.switch` ·
+`sink.mqtt` · `sink.monitor`
+
+**This list is not maintained by hand anywhere the user can see it.** The
+Handbook's node reference iterates `NODE_TYPES` and looks each type up in
+`NODE_DOC` for its longer description, ports and settings; a type with no
+`NODE_DOC` entry still renders with its label, icon, group-derived ports and
+`help` string. A new node is therefore under-documented, never absent. Ports
+follow from the group with no exceptions — `source` is output-only, `sink` is
+input-only, `logic` has both.
 
 * **`signal`** is one stored 433 MHz code and the only type with **both** ports.
   Its **output** fires when that code is heard on air; anything linked into its
@@ -326,7 +359,8 @@ the *same* `confirmSheet` the editor's Delete uses; there is one delete path
 
 ### Recipes
 
-The Dashboard closes with a short recipe list, because the graph's most useful
+**These live on the Handbook tab now**, not at the foot of the Dashboard. They
+are reference material rather than a control, and the graph's most useful
 patterns need no special node type — only links:
 
 * **Several buttons, one chime** — each `signal` → `logic.group`
@@ -343,12 +377,14 @@ patterns need no special node type — only links:
 
 ## Screens
 
-Three tabs, plus the recovery wizard that replaces the whole page.
+Five tabs, plus the recovery wizard that replaces the whole page.
 
 | Screen | Endpoints |
 |---|---|
-| **Dashboard** — graph | `/api/graph`, `/api/graph/nodes[/{id}[/fire]]`, `/api/graph/links`, `/api/gpio/available`, `/api/config`, `/api/signals` |
-| **Dashboard** — activity + status | `/api/events?since=`, `/api/system`, `/api/radio` |
+| **Dashboard** — the graph, and only the graph | `/api/graph`, `/api/graph/nodes[/{id}[/fire]]`, `/api/graph/links`, `/api/gpio/available`, `/api/config`, `/api/signals`, `/api/monitor` |
+| **Activity** — the live feed | `/api/events?since=` |
+| **Handbook** — the offline manual | `/api/config` (once, for the real MQTT base topic) |
+| *header status chips* — on every tab | `/api/system`, `/api/radio` |
 | ↳ *add-node flow: learn* | `/api/learn`, `/api/learn/arm`, `/api/learn/cancel`, `/api/learn/accept` |
 | ↳ *add-node flow: configure by hand* | `/api/signals/virtual` |
 | ↳ *node editor, signal inline* | `/api/signals`, `/api/signals/{id}` (GET/POST), `/api/signals/{id}/transmit` |
@@ -359,12 +395,56 @@ Three tabs, plus the recovery wizard that replaces the whole page.
 
 A few notes on the less obvious ones:
 
-**The Dashboard's order is deliberate**: view switch and *➕ Add node*, then the
-graph, then **Activity**, then the recipes. The feed sits under the graph
-because watching presses arrive is exactly what you do *while* wiring. The
-box-status chips (radio, frequency, noise floor, Wi-Fi, uptime) ride along with
-it, and the two warnings that would make the whole screen a lie — no CC1101, no
-home network — sit at the very top instead.
+**The Dashboard is down to four things**: the two warnings that would make the
+whole screen a lie (no CC1101, no home network), one toolbar row, and the graph.
+Everything else left. The toolbar is a single row — *➕ Add node* on the left,
+the `Map | List` switch and the canvas zoom controls pushed right by
+`margin-left: auto` on the switch. The zoom controls are emptied (not hidden) in
+List view and do not exist below 900 px, and because they are `:empty`-collapsed
+their absence closes up without moving the switch, which is anchored to the right
+edge rather than to them. Below 900 px the row is the one primary button,
+stretched full width so it reads as a deliberate primary action.
+
+**Activity** is a flat list, newest first, with the search box and the kind
+filter above it and a count between. There is no collapse and no "show all" —
+those existed only because the feed sat under the graph. The filter controls are
+built **once**, in `buildActivity()`; `renderFeed()` only ever replaces the
+`<ul>` beneath them, because the feed repaints every 2 s and an input rebuilt on
+that cadence drops focus and swallows the word you were halfway through typing.
+A ✕ Clear button appears only while something is filtered.
+
+**The header status chips** are six chips about the box — radio state, CC1101
+part/version, frequency, noise floor, Wi-Fi, uptime — right-aligned *inside* the
+header row, not in a band under it, and two chip-lines tall. They fit for free:
+what sets the header's height is the 44 px theme toggle, and two chips at
+`line-height: 1.15` with `.18rem` of vertical padding come to ~40 px, so the
+header is exactly as tall as it was before they existed.
+
+Two things had to be dealt with for a row that relabels itself at 1 Hz:
+
+1. **Rebuilding.** The chips are created once, each with its own text node, and
+   every update writes `nodeValue` on a node that already exists. `textContent`
+   would replace the node instead — a `childList` mutation per chip per second.
+   Verified with a `MutationObserver`: **0 node churn**, only `characterData`.
+2. **Reflow.** `"9s"→"10s"` and `"59m 59s"→"1h 0m"` change a chip's *width*, and
+   in a right-aligned row that shoves every neighbour sideways. So:
+   `font-variant-numeric: tabular-nums`, plus a `min-width` on the two chips
+   whose length actually changes, sized *above* their natural width (a
+   `min-width` below it locks nothing — that was the first attempt and it did
+   nothing at all). The two lines are also **two elements with fixed
+   composition**, not one wrapping row, so the wrap point cannot move: line one
+   is what the box *is*, line two is what it is *measuring*, and every ticking
+   value is on line two. Verified across a 59s→1m 0s boundary: **one distinct
+   geometry** for the whole run.
+
+Chips are dropped in tiers as the header tightens, and the numbers are
+arithmetic rather than taste — the brand, toggle, badge, padding and gaps come
+to ~315 px and the five-tab strip to ~412 px, so a tier may appear only once the
+viewport clears `315 + 412 + block width`. Hence 900 / 1100 / 1300, and a
+deliberate blackout between 720 and 899 where the tab strip has just arrived and
+takes essentially the whole row. Getting this wrong does not overflow the page —
+it silently turns `.tabs` into a scroller, and five destinations you cannot see
+is the exact failure this restructure exists to fix.
 
 **The waveform** draws `durations_us` as a HIGH/LOW square wave in inline SVG
 (`preserveAspectRatio="none"` with a non-scaling stroke). Frames longer than
@@ -410,10 +490,20 @@ radio and the battery busy. `visibilitychange` refreshes immediately on return.
 | Timer | Interval | Runs when |
 |---|---|---|
 | `system` | 10 s | always |
-| `events` | 2 s | Dashboard visible |
-| `dashclock` | 1 s | Dashboard visible — relabels ages only, no re-render |
+| `events` | 2 s | **Activity** visible — the Dashboard no longer polls it at all |
+| `feedclock` | 1 s | Activity visible — relabels feed ages in place, no re-render |
+| `monitor` | 1 s | Dashboard visible **and** at least one Monitor node exists |
 | `learn` | 1 s | only while a learn sheet is open; torn down on close |
 | `diag` | 5 s | Diagnostics visible |
+| *(uptime tick)* | 1 s | always — **not a poll**, and deliberately outside the `timers` map |
+
+The uptime tick is a bare `setInterval` because the header chips are on every
+tab and `stopTabPolls()` must not reach it. It puts nothing on the wire:
+`/api/system` still arrives every 10 s and uptime is interpolated locally
+between samples, so the label has to be rewritten far more often than it is
+fetched. Its whole body is one comparison and at most one `nodeValue`
+assignment. `dashclock` is gone — its only job was re-rendering the status
+chips, which are in the header now.
 
 `/api/learn` has no loader of its own any more: it is polled by `openLearnFlow`
 for exactly as long as its sheet is on screen. `openSheet` therefore takes an
@@ -468,11 +558,17 @@ something.
 
 ## Size
 
-Roughly 189 KB raw across the three flashed files, well inside the ~250 KB
-budget (`app.js` ≈ 155 KB, `style.css` ≈ 30 KB, `index.html` ≈ 4 KB), and
-it compresses to a fraction of that in the SPIFFS image. Nothing is minified on
-purpose: the comments explain *why* each non-obvious decision was made, and a
-future maintainer reading this off a microcontroller has no source map.
+Roughly **306 KB** raw across the three flashed files — `app.js` ≈ 247 KB,
+`style.css` ≈ 52 KB, `index.html` ≈ 6.3 KB. The Handbook is about 25 KB of that
+and is the price of a manual that works with no internet, which is the situation
+this box is most often in.
+
+That is over the ~250 KB guideline this file used to quote, and it was already
+over it (≈ 257 KB) before the Handbook existed — the figure above had simply
+drifted. The real ceiling is the **1 MB `storage` partition**, and the SPIFFS
+image is nowhere near it. Nothing is minified on purpose: the comments explain
+*why* each non-obvious decision was made, and a future maintainer reading this
+off a microcontroller has no source map.
 
 ---
 

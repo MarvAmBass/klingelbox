@@ -8,11 +8,16 @@
  *
  * Four ideas run through the whole file.
  *
- * 0. THE GRAPH IS THE PRODUCT. There are three screens -- Dashboard, Settings,
- *    Diagnostics -- and the Dashboard is the node graph, with the live activity
- *    feed under it. There is no Signals screen and no Learn screen: a signal is
- *    learned, synthesized, inspected and rebound from inside the node that uses
- *    it. The store itself outlives the graph (deleting a node never deletes a
+ * 0. THE GRAPH IS THE PRODUCT. There are five screens -- Dashboard, Activity,
+ *    Settings, Diagnostics, Handbook -- and the Dashboard is the node graph and
+ *    nothing else. The live feed has its own tab because a feed under the graph
+ *    pushes the graph off a 360 px screen; the written manual has its own tab
+ *    because this box can be reached over its own captive portal with no
+ *    internet, so the documentation has to ship inside it.
+ *
+ *    There is still no Signals screen and no Learn screen: a signal is learned,
+ *    synthesized, inspected and rebound from inside the node that uses it. The
+ *    store itself outlives the graph (deleting a node never deletes a
  *    recording), so the one destructive list lives under Settings.
  *
  * 1. MOBILE FIRST, LIST FIRST. The layout is authored for a 360 px phone. The
@@ -435,8 +440,19 @@ function onTabEnter(name, resumed) {
          palette entry too) apart from "you have not added one yet". After that
          syncMonitorPoll() decides whether to keep asking. */
       if (S.has.monitor && !S.monitor) loadMonitor();
+      /* No `events` timer here any more. The feed lives on its own tab and
+         polls from there; the Dashboard is the map and nothing else, so a box
+         showing the map costs one /api/graph and the status chips. */
+      break;
+    case "activity":
+      buildActivity();
+      /* The feed's own poll, scoped exactly like every other tab poll: started
+         on entry, torn down by stopTabPolls() on the way out, and each tick
+         skipped while the document is hidden. */
       poll("events", 2000, loadEvents);
-      poll("dashclock", 1000, tickDashClock);
+      /* Ages are relabelled in place at 1 Hz — no re-render, so it never
+         fights the search box for focus. */
+      poll("feedclock", 1000, tickFeedClock);
       break;
     case "settings":
       buildSettings();
@@ -451,6 +467,13 @@ function onTabEnter(name, resumed) {
     case "diagnostics":
       buildDiagnostics();
       poll("diag", 5000, loadDiagnostics);
+      break;
+    case "handbook":
+      /* Static prose — nothing to poll. The only live thing on it is the MQTT
+         base topic, so fetch the config once if some other tab has not already,
+         and rebuild when it lands rather than printing the placeholder. */
+      buildHandbook();
+      if (!S.config && S.has.config) loadConfig().then(rebuildHandbook);
       break;
   }
 }
@@ -569,7 +592,7 @@ function syncMonitorPoll() {
   }
   /* 1 s. The hold can be set as low as 1 s, so anything slower could miss a
      lit window completely; the response is a few integers per node; and the
-     Dashboard already ticks at 1 Hz for the age labels, so this adds no new
+     Dashboard already ticks at 1 Hz for its status chips, so this adds no new
      class of wake-up to a phone that is showing the page anyway. */
   if (!timers.monitor) poll("monitor", 1000, loadMonitor);
   else refreshMonitors();
@@ -621,12 +644,14 @@ function renderHeader(err) {
     badge.textContent = "setup mode";
     badge.className = "status-badge warn";
     dot.className = "brand-dot";
+    renderStatusChips(err);
     return;
   }
   if (err || !S.sys) {
     badge.textContent = "offline";
     badge.className = "status-badge bad";
     dot.className = "brand-dot bad";
+    renderStatusChips(err);
     return;
   }
   var sys = S.sys;
@@ -650,6 +675,15 @@ function renderHeader(err) {
   badge.title = (sys.sta_connected ? ("Wi-Fi: " + (sys.sta_ssid || "?") + " @ " + (sys.sta_ip || "?"))
                                    : "Not on a home network")
     + (radioOk ? "" : " -- CC1101 not detected");
+  /* Below 600 px the badge is hidden and this dot IS the badge — same three
+     states, same class names — so it carries the same explanation. */
+  if (dot) dot.title = badge.textContent + " — " + badge.title;
+
+  /* Both live off the same /api/system reading, so both are refreshed by the
+     one call that produced it — the header chips everywhere, and the two
+     blocking warnings if the Dashboard happens to be built. */
+  renderStatusChips();
+  renderDashNotes();
 }
 
 /* ======================================================================
@@ -1492,7 +1526,7 @@ function openVirtualFlow(opts) {
     add(sh.body, el("div", "note", isNode
       ? "The node is created carrying exactly this code. It gets a “Pair with a receiver” " +
         "panel for teaching your chime the code, and anything sending that code over the air " +
-        "shows up in the Activity feed under the graph."
+        "shows up on the Activity tab."
       : "Next: the signal you are creating gets a “Pair with a receiver” panel. Put your receiver " +
         "into pairing mode and tap Pair now there — the receiver stores this code and answers to " +
         "it from then on."));
@@ -1533,14 +1567,20 @@ function openVirtualFlow(opts) {
 }
 
 /* ======================================================================
-   DASHBOARD -- the node graph IS the product
+   DASHBOARD -- the node graph IS the product, and now it is ALL of it
 
-   One screen, four things, in this order:
-     1. the view switch (Map / List) and "Add node",
-     2. the graph itself,
-     3. the live activity feed -- watching presses arrive while you wire is
-        exactly when it is needed, so it sits under the thing being wired,
-     4. the recipes.
+   One screen, three things, in this order:
+     1. the two warnings that would make the whole screen a lie (no radio, no
+        home network) and the box-status chips,
+     2. the view switch (Map / List) and "Add node",
+     3. the graph itself.
+
+   The live feed and the recipes used to sit under the graph. They were both
+   moved out — to Activity and to the Handbook — because between them they cost
+   about two screenfuls above the fold's worth of scrolling on a phone, and the
+   thing you opened the app to look at was underneath them. A feed you have to
+   scroll past is worse than one tap away, and a recipe list is reference
+   material, not a control.
    ====================================================================== */
 
 /* `g` is the node's GROUP, and the group is what decides its ports:
@@ -1864,28 +1904,22 @@ function fireNode(id, btn, msgNode) {
 }
 
 var autoEls = {};   /* the graph */
-var dashEls = {};   /* the activity feed and the box-status chips under it */
+var dashEls = {};   /* the Dashboard's two warnings and its box-status chips */
 
 function buildDashboard() {
   if (S.built.dashboard) return;
   S.built.dashboard = true;
   var root = clear($("#tab-dashboard"));
 
+  /* NO PROSE HERE. This screen is the working surface: three paragraphs
+     explaining what a node is used to sit above the map, which on a phone put
+     the thing you opened the app to look at below the fold, every single time,
+     forever. All of it moved to the Handbook — which is the tab that exists for
+     exactly this — and what is left is a title and one clause. */
   var p = el("div", "panel");
   var h = el("div", "panel-head");
   add(h, el("h2", null, "Your box, as a flow"));
-  add(h, el("p", null,
-    "A press travels left to right: something hears it, optional LOGIC decides whether it " +
-    "passes, and something at the far end acts — send a signal, publish to MQTT. " +
-    "Nodes are linked by tapping, never by dragging."));
-  add(h, el("p", null,
-    "A 433 MHz code gets one node per direction. A “Signal receiver” fires when that code is " +
-    "heard on air; a “Signal sender” puts a code on air when something triggers it. They share " +
-    "the same stored codes, so a doorbell that rings a chime is a receiver wired to a sender — " +
-    "and every wire on the map then runs the one way events actually travel."));
-  add(h, el("p", null,
-    "Two more are worth knowing about: “Any RF signal” is a wildcard that fires on every " +
-    "burst on the band, and a “Group” lets several buttons drive one action."));
+  add(h, el("p", "hint", "Events run left to right. Tap a node to edit it."));
   add(p, h);
 
   /* The two things that make the whole screen a lie if they are wrong: no
@@ -1895,7 +1929,17 @@ function buildDashboard() {
   dashEls.txNote = el("div");
   add(p, dashEls.txNote);
 
-  var topRow = el("div", "row");
+  /* The box-status chips that used to sit under the feed are in the HEADER
+     now — see buildStatusChips(). They are a fact about the box, not about this
+     screen, and on the header they answer "is the radio even listening" from
+     wherever you happen to be. What stays here is the pair of warnings, which
+     ARE about this screen: with no radio or no network the map is a lie. */
+
+  /* ONE toolbar row: ➕ Add node on the left, the view switch and the canvas
+     zoom controls pushed right. The zoom buttons used to live in a second row
+     inside the canvas panel, which meant two toolbars stacked above the map for
+     no reason other than where the code that built them happened to be. */
+  var topRow = el("div", "row toolbar");
   var addBtn = el("button", "btn primary", "➕ Add node");
   addBtn.type = "button";
   addBtn.addEventListener("click", openAddNode);
@@ -1918,6 +1962,12 @@ function buildDashboard() {
      switch at all, and the leading position should match the default. */
   add(autoEls.viewSwitch, bMap, bList);
   add(topRow, autoEls.viewSwitch);
+
+  /* renderCanvas() fills this; setGraphView() empties the row of it in List
+     view. It is `:empty`-collapsed in CSS, so an absent zoom control leaves no
+     gap and the view switch does not shift when the two views are swapped. */
+  autoEls.zoomSlot = el("div", "zoomslot");
+  add(topRow, autoEls.zoomSlot);
   add(p, topRow);
   add(root, p);
 
@@ -1926,116 +1976,14 @@ function buildDashboard() {
   autoEls.canvasWrap = el("div", "panel hidden");
   add(root, autoEls.canvasWrap);
   autoEls.empty = el("div", "empty",
-    "No nodes yet. Add two “Signal” nodes — your doorbell and your chime — then link the " +
-    "first one's output to the second one's input.");
+    "Nothing wired yet. Tap ➕ Add node and start with a Signal receiver for your doorbell.");
   add(root, autoEls.empty);
-
-  /* --- live activity ---
-     Directly under the graph on purpose: the moment you want to see presses
-     arrive is the moment you are wiring the node that should catch them. */
-  var ap = el("div", "panel");
-  var ah = el("div", "panel-head");
-  add(ah, el("h2", null, "Activity"));
-  add(ah, el("p", null,
-    "Everything the receiver hears and everything the nodes do about it, as it happens. " +
-    "The radio listens continuously; learning a button only decides what happens to a " +
-    "signal it does not recognise."));
-  add(ap, ah);
-  dashEls.statusRow = el("div", "chiprow");
-  add(ap, dashEls.statusRow);
-  dashEls.feed = el("ul", "feed");
-  add(ap, dashEls.feed);
-  dashEls.feedEmpty = el("div", "empty", "Nothing heard yet. Press a doorbell button.");
-  add(ap, dashEls.feedEmpty);
-  add(root, ap);
-
-  /* Recipes: the group pattern is the least obvious capability here, and it is
-     precisely what "make several buttons ring one chime" needs. */
-  var rp = el("div", "panel");
-  var rh = el("div", "panel-head");
-  add(rh, el("h2", null, "Recipes"));
-  add(rh, el("p", null, "Patterns that need no special node type — just links."));
-  add(rp, rh);
-  [
-    ["Repeat a doorbell to a second chime",
-     "Signal receiver (Front door) → Signal sender (Virtual chime 1). Two nodes, one each way: " +
-     "the receiver fires when the doorbell is heard, the sender puts the chime's code on air."],
-    ["Several buttons, one chime",
-     "Signal receiver (Front) + Signal receiver (Back) → Group (mode: ANY) → Signal sender " +
-     "(Virtual chime 1). ANY is a merge point — it passes on whatever reaches it — so this is " +
-     "how you fold several remotes into a single virtual signal with no special node."],
-    ["Two buttons pressed together",
-     "Same as above but set the Group to mode ALL and give it a window (e.g. 3 s). Now nothing " +
-     "passes until BOTH receivers have fired inside that window."],
-    ["Ring several times from one press",
-     "Signal receiver (Front door) → Repeat (3 times, 5 s) → Signal sender (chime). The chime " +
-     "rings at once and then twice more, five seconds apart — the one Repeat node does it all. " +
-     "Press again mid-run and the count starts over."],
-    ["Stop a stuck button ringing forever",
-     "Signal receiver (Front door) → Rate limit (10 s cooldown) → Signal sender (chime)."],
-    ["Ring the chime from Home Assistant",
-     "Virtual trigger (topic: front_gate) → Signal sender (chime). Publish anything to the " +
-     "trigger topic and the code goes out."],
-    /* The shape the split was asked for. Worth spelling out: it is the one
-       pattern that used to need the same node at both ends of itself. */
-    ["Relay a code you hear as a different code",
-     "Signal receiver (neighbour's remote) → Signal sender (your chime). Two nodes, so the map " +
-     "reads left to right and you can put a Rate limit or a Switch between them. The same code " +
-     "on both sides is legal too — the box ignores its own transmission for a second afterwards, " +
-     "so it does not hear itself and go round again."],
-    /* The case this node type was asked for, in the user's own shape. */
-    ["Turn the inside bell off from Home Assistant, keep the outside one",
-     "Signal receiver (Front door) → Switch “Outside bell” (topic: outside_bell) → Signal sender " +
-     "(outside chime), and the SAME receiver → Switch “Inside bell” (topic: inside_bell) → " +
-     "Signal sender (inside chime). Two toggles appear in Home Assistant. Switch one off and that branch goes dead — " +
-     "on the map its wire is drawn broken — while the other still rings. Nothing is deleted and " +
-     "nothing has to be re-wired to put it back."],
-    ["One toggle, several paths",
-     "Give two or more Switch nodes the SAME topic. They become one Home Assistant switch that " +
-     "gates every one of them at once — the way one wall switch feeds several lamps."],
-    ["Tell Home Assistant someone rang",
-     "Signal receiver (Front door) → MQTT publish (topic: front)."],
-    ["Proxy the whole band to Home Assistant",
-     "Any RF signal → MQTT publish. Every press within range reaches HA, including buttons you " +
-     "never registered. Add a Rate limit in the middle if the band is busy."],
-    ["Test any chain without ringing anything",
-     "Virtual trigger (▶) → Monitor (💡). Tap ▶ on the trigger — on its card or straight on the " +
-     "map — and watch the monitor's lamp light and a mark land on its timeline. No transmitter, " +
-     "no doorbell press, nothing audible."],
-    ["Check a chain fires without hearing the chime",
-     "… → Signal sender (chime)  and  … → Monitor. Link the SAME upstream node into both. The monitor " +
-     "changes nothing, so it can sit beside a real sink permanently — its lamp tells you the " +
-     "chain reached that point even when the chime is unplugged or you are three rooms away."]
-  ].forEach(function (r) {
-    var b = el("div");
-    b.style.marginBottom = ".6rem";
-    add(b, el("div", null, r[0]));
-    add(b, el("div", "hint mono", r[1]));
-    add(rp, b);
-  });
-  add(root, rp);
 
   setGraphView(defaultGraphView(), bList, bMap, false);
   watchGraphViewport();
 
   renderGraph();
-  renderDashStatus();
-  renderFeed();
-}
-
-/* ------------------------------------------------------------- activity --
-   The live feed, the box-status chips beside it and the 1 Hz relabelling of
-   ages: all of it came off the old Dashboard unchanged, including the serial
-   guard in loadEvents() that leaves the DOM alone when nothing happened. */
-
-function tickDashClock() {
-  if (!S.built.dashboard) return;
-  renderDashStatus();
-  /* refresh only the age column of the feed -- cheap, no re-render */
-  $$(".fi-age", dashEls.feed).forEach(function (n) {
-    var ts = parseFloat(n.dataset.ts);
-    if (isFinite(ts)) n.textContent = agoText(ts);
-  });
+  renderDashNotes();
 }
 
 function renderTxNote() {
@@ -2045,37 +1993,149 @@ function renderTxNote() {
   if (warn) add(dashEls.txNote, warn);
 }
 
-function renderDashStatus() {
-  if (!dashEls.statusRow) return;
-  var row = clear(dashEls.statusRow);
+/* ---------------------------------------------------- header status chips --
+
+   Six chips, right-aligned on their own header line. The uptime one relabels
+   itself every second, which is exactly why none of this is built on a tick.
+
+   TWO separate things make a 1 Hz row flicker, and both are dealt with here:
+
+   1. REBUILDING. clear() + re-create at 1 Hz repaints the whole row every
+      second and, on a phone, is visible as a shimmer. So the chips are created
+      ONCE, kept in `hdrChips`, and every update assigns .textContent on an
+      element that already exists. The 1 Hz path touches exactly one string.
+
+   2. REFLOW. "up 9s" -> "up 10s" and "up 59m 59s" -> "up 1h 0m" change the
+      chip's WIDTH, and in a right-aligned row every chip to its left jumps.
+      tabular-nums stops digits from changing width, and a min-width sized for
+      the widest plausible value stops the chip itself from changing width. The
+      dBm floor gets the same treatment: it moves too.
+
+   Nothing is ever shown stale or invented. A value the box has not reported --
+   no radio, no /api/radio, no Wi-Fi -- either says so in words or the chip is
+   removed from the row entirely. */
+
+var hdrChips = {};
+
+function buildStatusChips() {
+  var host = $("#status-chips");
+  if (!host || hdrChips.host) return;
+  hdrChips.host = host;
+
+  /* TWO EXPLICIT LINES, not one wrapping row.
+
+     Natural wrapping would put the break wherever the text happened to end,
+     and two of these chips change their text every second — so the break point
+     itself would move, and a chip would hop between lines while you watched.
+     Fixing the composition of each line in the DOM makes the split a fact
+     rather than a consequence.
+
+     The split is also the right one to read: line one is what the box IS
+     (radio state, which chip, which network) and line two is what it is
+     MEASURING (frequency, noise floor, uptime). Every value that ticks is on
+     line two, and both of those chips are min-width locked, so line two can
+     never change width either. Line one is set by the SSID and does not move
+     while you look at it. The block's width is therefore constant, which is
+     what stops the brand and the tabs beside it from twitching. */
+  var lineA = el("div", "sc-line");
+  var lineB = el("div", "sc-line");
+  add(host, lineA, lineB);
+
+  function chip(line, cls) {
+    var c = el("span", "chip " + cls);
+    c.__base = "chip " + cls;    /* the state class (ok/bad/warn) is appended */
+    c.__txt = null;
+    /* The text node is created HERE, once, and every later update writes its
+       nodeValue. `el.textContent = s` would replace it instead — a childList
+       mutation per chip per second, which is real DOM churn even though it
+       looks like a string assignment. */
+    c.__node = document.createTextNode("");
+    c.appendChild(c.__node);
+    add(line, c);
+    return c;
+  }
+  /* sc-t2 / sc-t3 are the tiers CSS drops as the header gets tight. */
+  hdrChips.radio = chip(lineA, "sc-radio");
+  hdrChips.part  = chip(lineA, "mono sc-t3");
+  hdrChips.wifi  = chip(lineA, "sc-t2");
+  hdrChips.freq  = chip(lineB, "mono sc-t3");
+  hdrChips.floor = chip(lineB, "mono sc-floor sc-t2");
+  hdrChips.up    = chip(lineB, "mono sc-up");
+}
+
+/* text === null removes the chip. Both writes are guarded, so a tick that
+   changes nothing performs no DOM write at all. */
+function setHdrChip(node, text, state) {
+  if (!node) return;
+  var cls = node.__base + (text === null ? " hidden" : (state ? " " + state : ""));
+  if (text !== null && node.__txt !== text) { node.__txt = text; node.__node.nodeValue = text; }
+  if (node.className !== cls) node.className = cls;
+}
+
+function renderStatusChips(err) {
+  buildStatusChips();
+  if (!hdrChips.host) return;
+  /* `err` matters as much as `!sys`: a failed /api/system leaves S.sys holding
+     the last good reading, and presenting that as the current state is the one
+     lie this row exists to avoid. */
+  var sys = err ? null : S.sys;
+
+  if (S.recovery) { hdrChips.host.classList.add("hidden"); return; }
+  hdrChips.host.classList.remove("hidden");
+
+  if (!sys) {
+    /* Everything else on the row would be the last known value of a box that
+       is no longer answering, which is the one thing a status row must not
+       show. So the row collapses to the single true statement. */
+    setHdrChip(hdrChips.radio, "● Box not reachable", "bad");
+    setHdrChip(hdrChips.part, null);
+    setHdrChip(hdrChips.freq, null);
+    setHdrChip(hdrChips.floor, null);
+    setHdrChip(hdrChips.wifi, null);
+    setHdrChip(hdrChips.up, null);
+    return;
+  }
+
+  var radio = sys.radio || {};
+  if (radio.present === false) setHdrChip(hdrChips.radio, "● No radio", "bad");
+  else setHdrChip(hdrChips.radio, "● Radio listening", "ok");
+
+  setHdrChip(hdrChips.part, typeof radio.version === "number"
+    ? ("CC1101 v0x" + (radio.version || 0).toString(16) + " p" + numOr(radio.partnum, 0))
+    : null);
+
+  setHdrChip(hdrChips.freq,
+    (S.radio && typeof S.radio.freq_hz === "number") ? fmtHz(S.radio.freq_hz) : null);
+  setHdrChip(hdrChips.floor,
+    (S.radio && typeof S.radio.rssi_dbm === "number") ? (S.radio.rssi_dbm + " dBm floor") : null);
+
+  setHdrChip(hdrChips.wifi,
+    sys.sta_connected ? ("Wi-Fi " + (sys.sta_ssid || "?")) : "AP only",
+    sys.sta_connected ? "ok" : "warn");
+
+  tickUptimeChip();
+}
+
+/* The whole of the 1 Hz path: one comparison and, at most, one string
+   assignment. No layout is invalidated because .sc-up cannot change width. */
+function tickUptimeChip() {
+  if (!hdrChips.up || S.recovery) return;
+  var up = uptimeNow();
+  setHdrChip(hdrChips.up, up === null ? null : ("up " + durText(up)));
+}
+
+/* ------------------------------------------------------- dashboard notes --
+   What is left on the Dashboard once the chips have gone: the two conditions
+   that make the map itself untrustworthy. */
+function renderDashNotes() {
+  if (!dashEls.statusNote) return;
   var sys = S.sys;
 
   renderTxNote();
 
-  if (!sys) { add(row, el("span", "chip bad", "Box not reachable")); return; }
-
-  var radio = sys.radio || {};
-  if (radio.present === false) {
-    add(row, el("span", "chip bad", "● Radio not detected"));
-  } else {
-    add(row, el("span", "chip ok", "● Radio listening"));
-    if (typeof radio.version === "number") {
-      add(row, el("span", "chip mono",
-        "CC1101 v0x" + (radio.version || 0).toString(16) + " p" + numOr(radio.partnum, 0)));
-    }
-  }
-  if (S.radio && typeof S.radio.freq_hz === "number") {
-    add(row, el("span", "chip mono", fmtHz(S.radio.freq_hz)));
-  }
-  if (S.radio && typeof S.radio.rssi_dbm === "number") {
-    add(row, el("span", "chip mono", S.radio.rssi_dbm + " dBm floor"));
-  }
-  add(row, el("span", "chip " + (sys.sta_connected ? "ok" : "warn"),
-    sys.sta_connected ? ("Wi-Fi " + (sys.sta_ssid || "")) : "AP only"));
-  var up = uptimeNow();
-  if (up !== null) add(row, el("span", "chip", "up " + durText(up)));
-
   var note = clear(dashEls.statusNote);
+  if (!sys) return;
+  var radio = sys.radio || {};
   if (radio.present === false) {
     add(note, el("div", "note bad",
       "The CC1101 module did not answer on SPI, so this box can neither receive nor " +
@@ -2089,6 +2149,23 @@ function renderDashStatus() {
   }
 }
 
+/* ======================================================================
+   ACTIVITY -- the live event feed, a whole tab of it
+
+   This used to be a panel wedged between the graph and the recipes, capped at
+   five rows with a "Show all" button, because anything taller pushed the map
+   off the screen. On its own page that cap is pure obstruction: the list is the
+   page, so it is shown whole and scrolls.
+
+   What survived the move -- and is the reason the move was worth making -- is
+   the filtering. Search and the kind filter are built ONCE, in buildActivity(),
+   and renderFeed() only ever replaces the <ul> beneath them. The feed repaints
+   every 2 s; an input rebuilt on that cadence would drop focus and swallow the
+   word you were halfway through typing.
+   ====================================================================== */
+
+var actEls = {};   /* the feed, its filters and its result counter */
+
 var EVENT_KINDS = {
   rf_unmatched: { ico: "❓", label: "Unrecognised signal" },
   button_press: { ico: "🔔", label: "Button press" },
@@ -2099,11 +2176,119 @@ var EVENT_KINDS = {
   system: { ico: "⚙", label: "System" }
 };
 
+/* The box keeps 60 events; this is the ceiling on how many are ever put in the
+   DOM at once, so a firmware that one day returns more cannot turn a scroll
+   into a stall. */
+var FEED_MAX = 200;
+
+function buildActivity() {
+  if (S.built.activity) return;
+  S.built.activity = true;
+  var root = clear($("#tab-activity"));
+
+  var p = el("div", "panel");
+  var h = el("div", "panel-head");
+  add(h, el("h2", null, "Activity"));
+  add(h, el("p", null,
+    "Everything the receiver hears and everything the nodes do about it, as it happens. " +
+    "The radio listens continuously; learning a button only decides what happens to a " +
+    "signal it does not recognise."));
+  add(p, h);
+
+  var tools = el("div", "feedtools");
+
+  actEls.feedSearch = inputEl("search", "", { placeholder: "Search activity…" });
+  actEls.feedSearch.setAttribute("aria-label", "Search activity");
+  actEls.feedSearch.addEventListener("input", renderFeed);
+
+  actEls.feedKind = selectEl(
+    [{ value: "", label: "All kinds" }].concat(
+      Object.keys(EVENT_KINDS).map(function (k) {
+        return { value: k, label: EVENT_KINDS[k].ico + " " + EVENT_KINDS[k].label };
+      })), "");
+  actEls.feedKind.setAttribute("aria-label", "Filter by kind");
+  actEls.feedKind.addEventListener("change", renderFeed);
+
+  /* One tap back to everything. Without it, clearing a filter on a phone means
+     selecting the search text and deleting it AND remembering the kind select
+     is still set — two operations to undo what one tap set up. It hides itself
+     when nothing is filtered, so it is never a control that does nothing. */
+  actEls.feedClear = el("button", "btn feedclear", "✕ Clear");
+  actEls.feedClear.type = "button";
+  actEls.feedClear.addEventListener("click", function () {
+    actEls.feedSearch.value = "";
+    actEls.feedKind.value = "";
+    renderFeed();
+    actEls.feedSearch.focus();
+  });
+
+  add(tools, actEls.feedSearch, actEls.feedKind, actEls.feedClear);
+  add(p, tools);
+
+  actEls.feedCount = el("div", "feedcount");
+  add(p, actEls.feedCount);
+
+  actEls.feed = el("ul", "feed");
+  add(p, actEls.feed);
+  actEls.feedEmpty = el("div", "empty", "Nothing heard yet. Press a doorbell button.");
+  add(p, actEls.feedEmpty);
+  add(root, p);
+
+  renderFeed();
+}
+
+/* Relabel the age column in place. Cheap, and it deliberately does NOT call
+   renderFeed() — a full re-render once a second would fight the search box for
+   focus and reset the scroll position mid-read. */
+function tickFeedClock() {
+  if (!S.built.activity || !actEls.feed) return;
+  $$(".fi-age", actEls.feed).forEach(function (n) {
+    var ts = parseFloat(n.dataset.ts);
+    if (isFinite(ts)) n.textContent = agoText(ts);
+  });
+}
+
 function renderFeed() {
-  if (!dashEls.feed) return;
-  var ul = clear(dashEls.feed);
-  dashEls.feedEmpty.classList.toggle("hidden", S.events.length > 0);
-  S.events.slice(0, 40).forEach(function (ev) {
+  if (!actEls.feed) return;
+  var ul = clear(actEls.feed);
+
+  var q = (actEls.feedSearch ? actEls.feedSearch.value : "").trim().toLowerCase();
+  var kindSel = actEls.feedKind ? actEls.feedKind.value : "";
+
+  var matched = S.events.filter(function (ev) {
+    if (kindSel && ev.kind !== kindSel) return false;
+    if (!q) return true;
+    var k = EVENT_KINDS[ev.kind];
+    /* Search the text, the kind's wire name and its human label, so both
+       "transmit" and "Transmit" find the same rows. */
+    var hay = ((ev.text || "") + " " + (ev.kind || "") + " " + (k ? k.label : "")).toLowerCase();
+    return hay.indexOf(q) !== -1;
+  });
+
+  var filtering = !!(q || kindSel);
+  var shown = matched.slice(0, FEED_MAX);
+
+  if (actEls.feedClear) actEls.feedClear.classList.toggle("hidden", !filtering);
+
+  /* The count is what makes a filter honest: "3 of 60" says both that the
+     filter worked and that there is more behind it. Unfiltered it states the
+     depth of the box's own buffer, which is the other thing people ask. */
+  if (actEls.feedCount) {
+    clear(actEls.feedCount);
+    if (S.events.length) {
+      actEls.feedCount.textContent = filtering
+        ? (matched.length + " of " + S.events.length + " events")
+        : (S.events.length + " events, newest first");
+    }
+  }
+
+  actEls.feedEmpty.classList.toggle("hidden", matched.length > 0);
+  if (matched.length === 0)
+    actEls.feedEmpty.textContent = filtering
+      ? "Nothing in the feed matches that filter."
+      : "Nothing heard yet. Press a doorbell button.";
+
+  shown.forEach(function (ev) {
     var kind = EVENT_KINDS[ev.kind] || { ico: "·", label: ev.kind || "event" };
     var li = el("li", "feeditem k-" + (ev.kind || "other"));
     add(li, el("div", "fi-ico", kind.ico));
@@ -2170,6 +2355,9 @@ function setGraphView(v, bList, bMap, persist) {
   bMap.classList.toggle("active", v === "map");
   autoEls.listWrap.classList.toggle("hidden", v !== "list");
   autoEls.canvasWrap.classList.toggle("hidden", v !== "map");
+  /* The zoom controls belong to the canvas, so they leave the toolbar with it.
+     Emptying rather than hiding keeps :empty collapse honest. */
+  if (autoEls.zoomSlot && v !== "map") clear(autoEls.zoomSlot);
   if (persist) {
     try { localStorage.setItem(GRAPH_VIEW_KEY, v); } catch (e) { /* private mode */ }
   }
@@ -3042,16 +3230,15 @@ function renderCanvas() {
   var wrap = clear(autoEls.canvasWrap);
   var nodes = (S.graph && S.graph.nodes) || [];
   var links = (S.graph && S.graph.links) || [];
-  if (!nodes.length) { add(wrap, el("div", "empty", "No nodes to draw.")); return; }
+  if (!nodes.length) {
+    if (autoEls.zoomSlot) clear(autoEls.zoomSlot);   /* nothing to zoom */
+    add(wrap, el("div", "empty", "No nodes to draw."));
+    return;
+  }
 
-  add(wrap, el("p", "hint",
-    "Drag a node to rearrange it; tap it to edit. The badges along its top edge: " +
-    "✕ deletes it (with a confirmation) and ▶ does that node's own thing now — a " +
-    "Virtual trigger fires, a Signal receiver pretends its code was just heard, a " +
-    "Signal sender TRANSMITS its code over the air. Each ▶ says which in its tooltip, " +
-    "because those are opposite directions. 💡 lights when a Monitor is hit, and I / O " +
-    "flips a Switch. A wire drawn broken and faded carries nothing: the node at one of " +
-    "its ends is switched off. Everything here is also doable from the list view."));
+  /* The paragraph that used to explain every badge on a node is in the
+     Handbook now, under "How it works" -> Reading the map. It was a nine-line
+     legend permanently occupying the top of the map it described. */
   /* The canvas has no per-node message line, so one shared one under the tools
      carries the confirmations the ▶ button owes. */
   var canvasMsg = el("div", "formmsg");
@@ -3076,13 +3263,16 @@ function renderCanvas() {
      redraws the whole canvas). Kept in the same 0.4..2 range the buttons offer. */
   var zoom = numOr(S.graphZoom, 1);
 
-  var zbar = el("div", "row canvas-tools");
+  /* Into the Dashboard's one toolbar row, beside the view switch — not into a
+     second bar of its own above the canvas. */
+  var zbar = clear(autoEls.zoomSlot);
   var zOut = el("button", "btn small", "\u2212"); zOut.type = "button";
+  zOut.setAttribute("aria-label", "Zoom out");
   var zLbl = el("span", "hint mono zoom-lbl");
   var zIn = el("button", "btn small", "+"); zIn.type = "button";
+  zIn.setAttribute("aria-label", "Zoom in");
   var zFit = el("button", "btn small", "Fit"); zFit.type = "button";
   add(zbar, zOut, zLbl, zIn, zFit);
-  add(wrap, zbar);
   add(wrap, canvasMsg);
 
   var box = el("div", "canvas-wrap");
@@ -3915,7 +4105,7 @@ function sectionRadio() {
       }).then(function (res) {
         S.radio = res && res.freq_hz ? res : S.radio;
         setMsg(msg, "Applied live — no reboot needed.", "ok");
-        renderDashStatus();
+        renderStatusChips();
       }).catch(function (e) { setMsg(msg, e.message, "err"); })
         .then(function () { save.disabled = false; });
     });
@@ -4570,6 +4760,612 @@ function renderDiagnostics(err) {
 }
 
 /* ======================================================================
+   HANDBOOK -- the manual, shipped inside the box
+
+   This tab exists because of how the box is reached. A fresh one hands you its
+   own access point and a captive portal, and a phone joined to that AP has NO
+   internet: docs/ on the web is unreachable at exactly the moment someone is
+   trying to work out what a Group node does. So the manual is flashed with the
+   UI, and it is written to be read on a 360 px screen in a hallway.
+
+   EVERY SECTION IS A CLOSED <details>. Seven sections of prose as one page is
+   a wall nobody reads; closed, the page opens as a seven-line table of
+   contents that fits on one screen, and the summaries ARE the navigation --
+   which is why they are full-height tap targets with an open/closed chevron,
+   the same .sect-summary Settings uses.
+
+   Which sections were open is remembered, so coming back from Diagnostics to
+   check one more line does not re-collapse what you were reading.
+
+   The node reference is GENERATED FROM NODE_TYPES. Anything else drifts: a node
+   added to the palette and forgotten here would be a manual that lies. The
+   per-type detail below is a lookup keyed by the same type string, and a type
+   with no entry still gets its label, icon, ports and help -- so a new node is
+   under-documented rather than invisible.
+   ====================================================================== */
+
+var HB_OPEN_KEY = "klingelbox-handbook-open";
+
+function hbOpenList() {
+  try {
+    var v = JSON.parse(localStorage.getItem(HB_OPEN_KEY) || "[]");
+    return (Object.prototype.toString.call(v) === "[object Array]") ? v : [];
+  } catch (e) { return []; }   /* private mode, or a key someone hand-edited */
+}
+function hbRemember(key, open) {
+  var list = hbOpenList().filter(function (k) { return k !== key; });
+  if (open) list.push(key);
+  try { localStorage.setItem(HB_OPEN_KEY, JSON.stringify(list)); } catch (e) { /* ignore */ }
+}
+
+/* A top-level handbook section: closed unless it was open last time. */
+function hbSection(key, title, sub) {
+  var d = el("details", "panel hb");
+  if (hbOpenList().indexOf(key) !== -1) d.open = true;
+  add(d, el("summary", "sect-summary", title));
+  d.addEventListener("toggle", function () { hbRemember(key, d.open); });
+  if (sub) add(d, el("p", "hint", sub));
+  var body = el("div", "hb-body");
+  add(d, body);
+  d.bodyEl = body;
+  return d;
+}
+
+function hbP(text) { return el("p", "hb-p", text); }
+function hbH(text) { return el("h3", "hb-h", text); }
+function hbNote(text, cls) { return el("div", "note" + (cls ? " " + cls : ""), text); }
+
+/* A run of short paragraphs, which is what most of this page is. */
+function hbPs(parent, list) {
+  list.forEach(function (t) { add(parent, hbP(t)); });
+  return parent;
+}
+
+function hbList(items, ordered) {
+  var l = el(ordered ? "ol" : "ul", "hb-list");
+  items.forEach(function (t) { add(l, el("li", null, t)); });
+  return l;
+}
+
+/* term / value rows. Used for ports, settings and the topic map, so all three
+   line up the same way down the page. */
+function hbKV(pairs) {
+  var dl = el("dl", "kv");
+  pairs.forEach(function (kv) {
+    add(dl, el("dt", null, kv[0]));
+    add(dl, el("dd", kv[2] ? "mono" : null, kv[1]));
+  });
+  return dl;
+}
+
+/* A literal topic, command or code, on its own line and horizontally
+   scrollable rather than wrapped: a broken topic string is worse than a
+   scrollbar, because half of one looks like a whole one. */
+function hbCode(text) {
+  var w = el("div", "hb-code");
+  add(w, el("code", null, text));
+  return w;
+}
+
+/* ---------------------------------------------------- the node reference --
+
+   Keyed by the SAME type string as NODE_TYPES. `ports` is derived, not stored:
+   the group already decides it and two sources of truth would eventually
+   disagree. Everything here is from the node editors, docs/automations.md and
+   docs/API.md -- no invented defaults. */
+var NODE_DOC = {
+  "signal.rx": {
+    what: "One stored 433 MHz code, listening. When the receiver hears that code on air, this " +
+          "node fires and everything wired after it runs.",
+    settings: [
+      ["Signal", "Which stored code it watches for. Learn one from a remote, or enter one by hand."]
+    ],
+    notes: ["Output only. It never transmits — not when a burst matches it, not when you fire it " +
+            "by hand from its card. Its ▶ button means “pretend the code just arrived”."]
+  },
+  "signal.tx": {
+    what: "One stored 433 MHz code, sending. Whenever something linked into it fires, the code " +
+          "goes out over the radio.",
+    settings: [
+      ["Signal", "Which stored code it transmits."],
+      ["Repeats", "How many copies go out per firing. Defaults to the radio policy: 6."],
+      ["Gap", "Microseconds between copies. Defaults to 8000 µs."]
+    ],
+    notes: ["Repeats are not cosmetic. A real remote transmits for as long as the button is held, " +
+            "and real receivers integrate several consistent copies before they act — a single " +
+            "replay is routinely ignored.",
+            "Input only. It never listens, so hearing its own code on air does not start it. That " +
+            "is what stops the box echoing back everything it hears."]
+  },
+  "source.gpio": {
+    what: "Fires when a button wired to one of the board's pins is pressed. Optional — a box with " +
+          "no wired button never needs one.",
+    settings: [
+      ["Pin", "Chosen here, not compiled in. The picker lists what is free; the six pins the radio " +
+              "uses are not offered."],
+      ["Active low", "On by default: the internal pull-up is enabled and the button pulls the pin " +
+                     "to GND, so an unconnected pin reads as “not pressed” rather than floating."],
+      ["Debounce", "50 ms by default. Without it one press fires the chain several times."]
+    ],
+    notes: ["If this box's firmware has no wired-button support the node type does not appear at " +
+            "all — the palette is built from what the box answers, not from this manual."]
+  },
+  "source.virtual": {
+    what: "Fires on demand: from the ▶ button on its own card, from the REST API, or from an MQTT " +
+          "topic. This is how Home Assistant, a script or your own finger starts a chain.",
+    settings: [
+      ["Topic", "A suffix. The box subscribes to <base>/trigger/<suffix>; any message on it fires " +
+                "the node, whatever the payload says. Leave it empty and the node still works from " +
+                "the ▶ button and the API — it simply gets no topic and no Home Assistant entity."]
+    ],
+    notes: ["A virtual node with a topic appears in Home Assistant as a button entity."]
+  },
+  "source.any_rf": {
+    what: "A wildcard. It fires on every burst the receiver hears, registered or not — including " +
+          "the neighbour's car remote.",
+    settings: [["—", "No parameters."]],
+    notes: ["It fires IN ADDITION to any matching Signal receiver. A recognised burst legitimately " +
+            "drives both the specific chain and the wildcard chain in one pass. That is intended — " +
+            "but wire both to the same chime and it rings twice.",
+            "On a busy band, put a Rate limit between it and whatever it drives."]
+  },
+  "logic.group": {
+    what: "Two genuinely different jobs under one node, chosen by its mode.",
+    settings: [
+      ["Mode — ANY", "A merge point. Anything arriving is passed straight on, immediately. It does " +
+                     "not wait, does not compare its inputs, and never looks at the window at all."],
+      ["Mode — ALL", "A coincidence detector. Nothing passes until every inbound link has carried " +
+                     "an event inside the window. Then it fires once, forgets them all and re-arms."],
+      ["Window", "Seconds. Applies to ALL only — the editor hides it in ANY mode for that reason."]
+    ],
+    notes: ["An ALL group with no inbound links can never be satisfied, so it never fires.",
+            "ANY is the one to reach for far more often: it is how several remotes end up ringing " +
+            "one chime with no special node type."]
+  },
+  "logic.throttle": {
+    what: "A cooldown. The first event passes through immediately; everything inside the window " +
+          "after it is dropped.",
+    settings: [["Window", "Seconds of cooldown after each event that got through."]],
+    notes: ["Leading edge, so the bell rings at once and then stays quiet — someone leaning on the " +
+            "button gets one ring, not silence followed by a ring.",
+            "Source-agnostic: an RF remote, a wired button and an MQTT trigger are all limited " +
+            "identically."]
+  },
+  "logic.repeat": {
+    what: "One event in, several out. It passes the event on immediately, then emits it again a " +
+          "few more times at an interval.",
+    settings: [
+      ["Repeats", "Total firings, including the immediate one. 1–20, default 3."],
+      ["Interval", "Seconds between them. Default 5."]
+    ],
+    notes: ["A new event restarts the run rather than queueing a second one, so pressing again " +
+            "mid-sequence starts the count over."]
+  },
+  "logic.switch": {
+    what: "A switch in the wire. While it is ON events pass through untouched; while it is OFF " +
+          "nothing gets past it and everything wired after it is dead until it is switched back.",
+    settings: [
+      ["Position", "ON or OFF. This IS the node's enabled flag — there is no second field, which " +
+                   "is why a switched-off Switch draws its wire broken on the map."],
+      ["Topic", "A suffix. With one set, Home Assistant gets a real switch entity for it. Leave it " +
+                "empty and the node still works from this page and the API."]
+    ],
+    notes: ["Three ways to move it: the ON/OFF button here, the REST API, or MQTT.",
+            "Several Switch nodes may share one topic. A command then moves all of them, and Home " +
+            "Assistant shows one entity per topic rather than one per node — one wall switch " +
+            "feeding several lamps."]
+  },
+  "sink.mqtt": {
+    what: "Publishes to your broker when the chain reaches it, so Home Assistant or anything else " +
+          "on the LAN learns that something happened.",
+    settings: [["Topic", "A suffix. Published to <base>/<suffix>."]],
+    notes: ["The message carries the signal id, the label, the fingerprint, the RSSI, the repeat " +
+            "count and the decode when there is one. For an unregistered burst arriving through " +
+            "Any RF signal the signal id is 0 and the decode may be absent."]
+  },
+  "sink.monitor": {
+    what: "The one node that does nothing. It exists to be looked at: a lamp that lights whenever " +
+          "the chain reaches it, and a rolling timeline of when it did.",
+    settings: [["Hold", "How long the lamp stays lit per hit. 1–60 seconds, default 3."]],
+    notes: ["Nothing is sent, nothing is published, no pin moves. That is what makes it safe to " +
+            "leave wired beside a real sink forever.",
+            "Its hits live in RAM only — capped at 64 per node, pruned to the last 10 minutes, and " +
+            "gone after a reboot. Nothing is written to flash."]
+  }
+};
+
+var PORT_TEXT = {
+  source: "Output only — it starts chains and has nothing to link into it.",
+  logic:  "Input and output — it sits in the middle of a chain.",
+  sink:   "Input only — it is the end of a chain and acts."
+};
+
+function hbNodeReference(body) {
+  add(body, hbP(
+    "Every node this box offers, generated from the palette itself so it cannot fall behind the " +
+    "firmware. A node's group decides its ports, with no exceptions: sources start chains, sinks " +
+    "end them, logic sits in between."));
+
+  NODE_TYPES.forEach(function (ty) {
+    var doc = NODE_DOC[ty.t] || {};
+    var d = el("details", "hb-node");
+    var sum = el("summary", "hb-nodesum");
+    add(sum, el("span", "hb-nodeico", ty.ico));
+    var t = el("span", "hb-nodetext");
+    add(t, el("span", "hb-nodename", ty.label));
+    add(t, el("span", "hb-nodetype", ty.t));
+    add(sum, t);
+    add(d, sum);
+
+    add(d, hbP(doc.what || ty.help));
+    add(d, el("div", "hb-ports", PORT_TEXT[ty.g] || ""));
+    if (doc.settings) {
+      add(d, hbH("Settings"));
+      add(d, hbKV(doc.settings));
+    }
+    (doc.notes || []).forEach(function (n) { add(d, hbP(n)); });
+    add(body, d);
+  });
+
+  add(body, hbNote(
+    "Limits, so a graph does not fail in a way you have to guess at: 24 nodes, a chain at most 8 " +
+    "nodes deep, node names up to 32 characters, MQTT topic suffixes up to 48, and any time " +
+    "window between 1 and 6000 seconds."));
+}
+
+/* ------------------------------------------------------------- recipes --
+   Moved here from the Dashboard word for word. They are reference material,
+   not a control, and reference material belongs in the manual. */
+var HB_RECIPES = [
+  ["Repeat a doorbell to a second chime",
+   "Signal receiver (Front door) → Signal sender (Virtual chime 1). Two nodes, one each way: " +
+   "the receiver fires when the doorbell is heard, the sender puts the chime's code on air."],
+  ["Several buttons, one chime",
+   "Signal receiver (Front) + Signal receiver (Back) → Group (mode: ANY) → Signal sender " +
+   "(Virtual chime 1). ANY is a merge point — it passes on whatever reaches it — so this is " +
+   "how you fold several remotes into a single virtual signal with no special node."],
+  ["Two buttons pressed together",
+   "Same as above but set the Group to mode ALL and give it a window (e.g. 3 s). Now nothing " +
+   "passes until BOTH receivers have fired inside that window."],
+  ["Ring several times from one press",
+   "Signal receiver (Front door) → Repeat (3 times, 5 s) → Signal sender (chime). The chime " +
+   "rings at once and then twice more, five seconds apart — the one Repeat node does it all. " +
+   "Press again mid-run and the count starts over."],
+  ["Stop a stuck button ringing forever",
+   "Signal receiver (Front door) → Rate limit (10 s cooldown) → Signal sender (chime)."],
+  ["Ring the chime from Home Assistant",
+   "Virtual trigger (topic: front_gate) → Signal sender (chime). Publish anything to the " +
+   "trigger topic and the code goes out."],
+  ["Relay a code you hear as a different code",
+   "Signal receiver (neighbour's remote) → Signal sender (your chime). Two nodes, so the map " +
+   "reads left to right and you can put a Rate limit or a Switch between them. The same code " +
+   "on both sides is legal too — the box ignores its own transmission for a second afterwards, " +
+   "so it does not hear itself and go round again."],
+  ["Turn the inside bell off from Home Assistant, keep the outside one",
+   "Signal receiver (Front door) → Switch “Outside bell” (topic: outside_bell) → Signal sender " +
+   "(outside chime), and the SAME receiver → Switch “Inside bell” (topic: inside_bell) → " +
+   "Signal sender (inside chime). Two toggles appear in Home Assistant. Switch one off and that branch goes dead — " +
+   "on the map its wire is drawn broken — while the other still rings. Nothing is deleted and " +
+   "nothing has to be re-wired to put it back."],
+  ["One toggle, several paths",
+   "Give two or more Switch nodes the SAME topic. They become one Home Assistant switch that " +
+   "gates every one of them at once — the way one wall switch feeds several lamps."],
+  ["Tell Home Assistant someone rang",
+   "Signal receiver (Front door) → MQTT publish (topic: front)."],
+  ["Proxy the whole band to Home Assistant",
+   "Any RF signal → MQTT publish. Every press within range reaches HA, including buttons you " +
+   "never registered. Add a Rate limit in the middle if the band is busy."],
+  ["Test any chain without ringing anything",
+   "Virtual trigger (▶) → Monitor (💡). Tap ▶ on the trigger — on its card or straight on the " +
+   "map — and watch the monitor's lamp light and a mark land on its timeline. No transmitter, " +
+   "no doorbell press, nothing audible."],
+  ["Check a chain fires without hearing the chime",
+   "… → Signal sender (chime)  and  … → Monitor. Link the SAME upstream node into both. The monitor " +
+   "changes nothing, so it can sit beside a real sink permanently — its lamp tells you the " +
+   "chain reached that point even when the chime is unplugged or you are three rooms away."]
+];
+
+var DIAG_PLAIN = [
+  ["CC1101_NOT_DETECTED", "The radio module did not answer at all. Nothing can be received or sent " +
+   "until it does — start with 3V3, GND and the four SPI wires."],
+  ["SPI_ERROR", "The bus transaction itself failed, which points at the wiring rather than the " +
+   "module: a shorted pin, or something else holding the peripheral."],
+  ["CC1101_OK", "The radio answered with a plausible chip id. Anything still wrong is downstream " +
+   "of the module."],
+  ["RADIO_CONFIG_SUSPECT", "The chip is configured but the band looks wrong — no carrier ever seen " +
+   "and an implausible noise floor. Check the frequency in Settings, and that an antenna is fitted."],
+  ["RF_ENERGY_NO_PULSES", "Energy is arriving but nothing survives the filter: usually a mis-tuned " +
+   "frequency or bandwidth, or a transmitter using a modulation this box is not set to."],
+  ["PULSES_CAPTURED", "Raw frames are being captured. If presses still do nothing, the problem is " +
+   "matching or routing — not reception."],
+  ["REPEAT_FRAME_DETECTED", "Several identical copies arrived together, which is what a real remote " +
+   "does and noise does not."],
+  ["PROTOCOL_DECODED", "A decoder recognised the frame and read its identity out of it."],
+  ["UNKNOWN_PROTOCOL_RAW", "Captured but not decoded. Fully supported: the exact timings are stored " +
+   "and replay works. Only the human-readable identity is missing."],
+  ["TX_OK", "The pulses left the radio. A software claim only — the box cannot know whether any " +
+   "receiver reacted."],
+  ["TX_FAILED", "The transmit path did not complete. Check that nothing else is holding the radio, " +
+   "and look for an SPI error above it."]
+];
+
+function rebuildHandbook() {
+  if (!S.built.handbook) return;
+  S.built.handbook = false;
+  buildHandbook();
+}
+
+function buildHandbook() {
+  if (S.built.handbook) return;
+  S.built.handbook = true;
+  var root = clear($("#tab-handbook"));
+  var base = mqttBase();
+
+  var intro = el("div", "panel");
+  var ih = el("div", "panel-head");
+  add(ih, el("h2", null, "Handbook"));
+  add(ih, el("p", null,
+    "The manual, flashed into the box. It works with no internet — which matters, because the " +
+    "first time you set this thing up your phone is joined to its access point and has none. " +
+    "Tap a heading to open it."));
+  add(intro, ih);
+  add(root, intro);
+
+  /* ------------------------------------------------------ 1. how it works */
+  var s1 = hbSection("how", "How it works",
+    "Three ideas, and everything else follows from them.");
+  hbPs(s1.bodyEl, [
+    "The receiver is always listening. It has to be: a button you have already registered must " +
+    "ring the moment it is pressed, so there is no “receive mode” to switch on and nothing to " +
+    "remember to turn off.",
+    "A signal is a stored waveform, not a decoded code. When something recognises the protocol " +
+    "you get a readable identity as a bonus, but an undecodable capture is a first-class " +
+    "citizen — the raw pulse timings are what is stored, matched and replayed, so a remote no " +
+    "decoder has ever seen still works completely.",
+    "Nodes route those events. A press arrives at a source, optional logic decides whether it " +
+    "passes, and a sink acts on it — transmits a code, publishes to MQTT, lights a monitor. " +
+    "Left to right, one direction, and the map on the Dashboard is the whole of it."
+  ]);
+  add(s1.bodyEl, hbNote(
+    "The radio ignores what the box itself has just transmitted for about a second afterwards, " +
+    "so a sender never feeds its own receiver and goes round in a loop."));
+
+  /* Off the old Dashboard intro. It is the one thing about this graph that is
+     genuinely non-obvious, and it was three paragraphs above the map. */
+  add(s1.bodyEl, hbH("One code, two nodes"));
+  hbPs(s1.bodyEl, [
+    "A 433 MHz code gets one node per direction. A Signal receiver fires when that code is " +
+    "heard on air; a Signal sender puts a code on air when something triggers it. They draw " +
+    "from the same stored codes, so a doorbell that rings a chime is simply a receiver wired " +
+    "to a sender — and every wire on the map then runs the one way events actually travel.",
+    "Two more are worth knowing early: Any RF signal is a wildcard that fires on every burst " +
+    "on the band, and a Group lets several buttons drive one action."
+  ]);
+
+  /* Off the top of the canvas, where it was a nine-line legend permanently
+     covering the picture it described. */
+  add(s1.bodyEl, hbH("Reading the map"));
+  hbPs(s1.bodyEl, [
+    "Drag a node to rearrange it; tap it to edit. Nodes are linked by tapping, never by " +
+    "dragging a wire.",
+    "A wire drawn broken and faded carries nothing: the node at one of its ends is switched " +
+    "off. Everything on the map can also be done from the list view, which is the only view " +
+    "below 900 px."
+  ]);
+  add(s1.bodyEl, hbH("The badges on a node"));
+  add(s1.bodyEl, hbKV([
+    ["✕", "Deletes the node, after a confirmation."],
+    ["▶", "Does that node's own thing, now. What that MEANS differs by type and they are " +
+          "opposite directions, so each ▶ says which in its tooltip: a Virtual trigger fires, " +
+          "a Signal receiver pretends its code was just heard, and a Signal sender actually " +
+          "TRANSMITS its code over the air."],
+    ["💡", "A Monitor's lamp. It lights whenever the chain reaches it."],
+    ["I / O", "Flips a Switch node between conducting and not."]
+  ]));
+  add(root, s1);
+
+  /* --------------------------------------------------- 2. node reference */
+  var s2 = hbSection("nodes", "Node reference",
+    "Every type, what it does, its ports and its settings.");
+  hbNodeReference(s2.bodyEl);
+  add(root, s2);
+
+  /* ------------------------------------------------------------ 3. recipes */
+  var s3 = hbSection("recipes", "Recipes",
+    "Patterns that need no special node type — just links.");
+  HB_RECIPES.forEach(function (r) {
+    var b = el("div", "hb-recipe");
+    add(b, el("div", "hb-recipe-t", r[0]));
+    add(b, el("div", "hint mono", r[1]));
+    add(s3.bodyEl, b);
+  });
+  add(root, s3);
+
+  /* ------------------------------- 4. learning and virtual signals */
+  var s4 = hbSection("learn", "Learning and virtual signals",
+    "Registering a real remote, and inventing a code of your own.");
+  var b4 = s4.bodyEl;
+  add(b4, hbH("What learn mode actually does"));
+  hbPs(b4, [
+    "Learn mode changes exactly one thing: the fate of a signal the box does NOT recognise. " +
+    "Normally such a burst is dropped with one line in Activity. While the box is armed, it is " +
+    "offered to you for registration instead. Signals you already know behave identically either " +
+    "way — they keep ringing whatever the chimes do, armed or not.",
+    "A candidate is only offered once the burst has repeated at least twice and decoded with at " +
+    "least 65 % confidence. Both thresholds come from bench measurement rather than taste: real " +
+    "presses score in the high sixties and up, while ambient noise scores in the twenties and " +
+    "rarely repeats. Without the filters the box would happily register an amplifier's hum as a " +
+    "doorbell.",
+    "Learn mode always expires on its own, so the box is never left armed behind your back."
+  ]);
+  add(b4, hbH("Learning a button"));
+  add(b4, hbList([
+    "Add a Signal receiver node, or open one you already have, and choose to learn a signal.",
+    "The box arms itself and counts down. Press the button on your remote several times, within " +
+    "a few metres.",
+    "The candidate appears with its decode, its repeat count, its signal strength and a " +
+    "confidence bar. Give it a name — that name is what you will see in Activity and on the map.",
+    "Accept it. It is stored immediately and the node is wired to it."
+  ], true));
+  add(b4, hbP(
+    "Backing out of the sheet cancels learn mode, so closing it never leaves the box armed."));
+
+  add(b4, hbH("Virtual signals"));
+  hbPs(b4, [
+    "A virtual signal is a brand-new EV1527 code that no remote in the world is using yet. It " +
+    "exists so you can pair YOUR OWN receivers to this box: a plug-in chime, a relay, a socket.",
+    "A hand-made code does nothing on its own. Nothing on the band answers to an address that was " +
+    "invented ten seconds ago — a Signal receiver carrying it stays silent because that code is " +
+    "never heard, and a Signal sender carrying it transmits into a world where nothing is " +
+    "listening. That is expected, and it is not a fault."
+  ]);
+  add(b4, hbNote(
+    "This is the single most reported “the virtual signal is broken”. It is not broken. It has " +
+    "not been paired yet.", "warn"));
+  add(b4, hbH("Pairing one to a chime"));
+  add(b4, hbP("The order is the whole trick, and almost everyone tries it the other way round."));
+  add(b4, hbList([
+    "Put your receiver into its learning mode — usually hold its button until it beeps or its " +
+    "LED blinks.",
+    "Within a few seconds, tap “Pair now” on the signal here in the UI. It sends the code 20 " +
+    "times in about three quarters of a second, which no receiver that has just entered " +
+    "learning mode can miss.",
+    "The receiver stores the code and rings for it from then on. Test it with Transmit."
+  ], true));
+  add(b4, hbP(
+    "If nothing happened, the receiver almost certainly was not in learning mode when the code " +
+    "went out. Put it back and tap Pair now again — sending it twice is harmless."));
+  add(root, s4);
+
+  /* ------------------------------------------ 5. MQTT and Home Assistant */
+  var s5 = hbSection("mqtt", "MQTT & Home Assistant",
+    "The topic map, and what discovery puts in your dashboard.");
+  var b5 = s5.bodyEl;
+  hbPs(b5, [
+    "MQTT is off until you turn it on under Settings. There is no TLS: this is a trusted-LAN " +
+    "appliance, and it talks to a broker on your own network."
+  ]);
+  add(b5, hbP(
+    "Every topic below starts with the base topic, which on this box is currently:"));
+  add(b5, hbCode(base));
+  add(b5, hbP("Written “<base>” from here on. The examples use this box's real value."));
+
+  add(b5, hbH("What the box publishes"));
+  add(b5, hbKV([
+    [base + "/status", "online or offline. Retained, and also the Last Will — it flips to offline " +
+     "by itself if the box drops off the network without saying goodbye. Every discovered entity " +
+     "uses it to decide whether it is available."],
+    [base + "/button/<name>/state", "One recognised press. The name is a slug of the signal's " +
+     "name: “Front door” becomes front_door."],
+    [base + "/unknown/state", "A burst matching no stored signal."],
+    [base + "/unknown", "Retained: the last unregistered burst, so you can go and look up the code " +
+     "of the remote you are about to learn."],
+    [base + "/event", "Every node firing, plus system events."],
+    [base + "/radio", "Retained radio telemetry — noise floor, whether a CC1101 is present, the " +
+     "last press. Refreshed every 10 seconds."],
+    [base + "/<topic>", "Whatever an MQTT publish node has been given as its topic."]
+  ]));
+  add(b5, hbNote(
+    "Presses are never retained, on purpose. A press is a moment, not a condition — a retained " +
+    "press payload would ring every chime in the house each time Home Assistant restarts."));
+
+  add(b5, hbH("What the box listens to"));
+  add(b5, hbKV([
+    [base + "/button/<name>/press", "Any message transmits that stored signal."],
+    [base + "/trigger/<topic>", "Any message fires the Virtual trigger node carrying that topic. " +
+     "The payload is ignored entirely."],
+    [base + "/switch/<topic>/set", "Moves every Switch node on that topic. Accepts ON, OFF, 1, 0, " +
+     "true, false, open, close in any case, or a JSON object."]
+  ]));
+  add(b5, hbP("A Switch reports back, retained, on:"));
+  add(b5, hbCode(base + "/switch/<topic>/state    ->  ON | OFF"));
+  add(b5, hbP(
+    "It is republished when the switch moves, on every reconnect and after a reboot, so Home " +
+    "Assistant never shows a stale position."));
+
+  add(b5, hbH("From the command line"));
+  add(b5, hbCode("mosquitto_sub -h <broker> -t '" + base + "/#' -v"));
+  add(b5, hbCode("mosquitto_pub -h <broker> -t '" + base + "/trigger/chime' -m ''"));
+  add(b5, hbCode("mosquitto_pub -h <broker> -t '" + base + "/switch/outside_bell/set' -m OFF"));
+
+  add(b5, hbH("Home Assistant discovery"));
+  add(b5, hbP(
+    "With discovery on, everything below arrives by itself as ONE device — identified by the " +
+    "box's MAC address rather than its hostname, so renaming the box does not orphan your " +
+    "automations."));
+  add(b5, hbKV([
+    ["Per stored signal", "TWO things: a device trigger that fires on each press (for receiving) " +
+     "and a button entity that replays it (for transmitting)."],
+    ["Per Virtual trigger with a topic", "A button entity, so you can fire the chain from a " +
+     "dashboard."],
+    ["Per Switch topic", "A real switch entity — one per topic, not one per node, named after the " +
+     "first node on it."],
+    ["Unregistered presses", "A device trigger that fires on any burst matching no stored signal."],
+    ["Last unknown code", "A diagnostic sensor holding the fingerprint of the last unknown burst."],
+    ["Radio RSSI", "A diagnostic sensor: the live noise floor, in dBm."],
+    ["Radio", "A diagnostic binary sensor: is a CC1101 actually there."]
+  ]));
+  add(b5, hbP(
+    "Presses are deliberately NOT binary sensors. A binary sensor has to be reset, the reset can " +
+    "be lost, and the entity then sits “on” forever with nothing to clear it. A trigger cannot " +
+    "get stuck."));
+  add(b5, hbP(
+    "Deleting a signal tells Home Assistant to forget its entities. Renaming one changes its " +
+    "topic but not its entity, because entities are keyed on the signal's number."));
+  add(root, s5);
+
+  /* -------------------------------------------------------- 6. wired button */
+  var s6 = hbSection("wired", "Wired button",
+    "A physical button on a pin, for when there is no radio in the loop at all.");
+  var b6 = s6.bodyEl;
+  hbPs(b6, [
+    "Any free GPIO will do, and the pin is chosen here in the UI rather than compiled in — no " +
+    "rebuild, no reflash. Add a Wired button node and its picker lists what is available on this " +
+    "board; the six pins the radio uses are never offered."
+  ]);
+  add(b6, hbP("The wiring is one wire and a button:"));
+  add(b6, hbCode(
+    "GPIO  ---+--- button --- GND\n" +
+    "         |\n" +
+    "         +--- internal pull-up, enabled by the firmware"));
+  hbPs(b6, [
+    "That is all of it. The pull-up is internal, so there is no resistor to add, and an " +
+    "unpressed — or entirely unconnected — pin reads as “not pressed” rather than floating and " +
+    "firing at random.",
+    "A 50 ms debounce is applied by default. Without it a single press fires the chain several " +
+    "times, because a mechanical contact bounces."
+  ]);
+  add(root, s6);
+
+  /* --------------------------------------------- 7. when it does not work */
+  var s7 = hbSection("trouble", "When something does not work",
+    "Start at Diagnostics. It tells the five causes apart.");
+  var b7 = s7.bodyEl;
+  hbPs(b7, [
+    "“It does not work” has at least five different causes on an RF box: a dead SPI bus, a " +
+    "mis-tuned radio, a noisy band, an unrecognised protocol, or a transmit that never keyed the " +
+    "carrier. The Diagnostics tab shows which one you have, because every layer of the firmware " +
+    "reports into the same list of named states — the serial log, the API and that page can never " +
+    "drift apart.",
+    "A state that has never fired is greyed out. The named states mean:"
+  ]);
+  add(b7, hbKV(DIAG_PLAIN));
+  add(b7, hbH("Two more things worth checking first"));
+  add(b7, hbList([
+    "No antenna. Sensitivity collapses without one — a 17.3 cm piece of wire is a quarter wave " +
+    "at 433 MHz and is enough to judge by.",
+    "A weak USB supply. A transmitting CC1101 draws tens of milliamps in bursts, so a marginal " +
+    "supply browns out during transmit and not during receive. If captures work but replays " +
+    "fail, suspect the power before the wiring."
+  ]));
+  add(b7, hbP(
+    "If the chime rings twice for one press, look for an Any RF signal node and a Signal receiver " +
+    "both reaching the same sink. Both are firing, both are correct, and one of them is one too " +
+    "many."));
+  add(root, s7);
+}
+
+/* ======================================================================
    RECOVERY FIRST-RUN WIZARD
    Replaces the entire page. This is served through a captive portal on a
    phone, so it must be perfect at 360 px and must never depend on a tab bar.
@@ -4801,7 +5597,7 @@ loadSystem().then(function () {
   if (S.recovery) return;
   /* Radio parameters feed the dashboard status chips; a failure here is not
      fatal, it only removes a chip. */
-  api("/api/radio").then(function (r) { S.radio = r; renderDashStatus(); })
+  api("/api/radio").then(function (r) { S.radio = r; renderStatusChips(); })
     .catch(function () { S.has.radioCfg = false; });
   onTabEnter(S.tab, false);
 }).catch(function () {
@@ -4810,5 +5606,14 @@ loadSystem().then(function () {
   onTabEnter(S.tab, false);
 });
 poll("system", 10000, function () { loadSystem().catch(function () { /* badge already shows it */ }); });
+
+/* The only always-on 1 Hz timer, and it is not a poll — nothing goes on the
+   wire. /api/system arrives every 10 s and uptime is interpolated locally
+   between samples (see uptimeNow), so the header's "up 2m 39s" has to be
+   relabelled far more often than it is fetched. One string assignment, guarded
+   against no-op writes, and skipped entirely while the document is hidden. It
+   is deliberately outside the `timers` map: stopTabPolls() must not reach it,
+   because the header is on every tab. */
+setInterval(function () { if (!document.hidden) tickUptimeChip(); }, 1000);
 
 })();

@@ -42,6 +42,11 @@
   --r-sm: 10px;
   --tap: 2.75rem;            /* 44 px minimum touch target */
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* The <select> chevron. It has to be an image because these are bare
+     <select>s with no wrapper to hang a ::after on, and a data: URI cannot
+     read var(--muted) -- so the whole url() is the token, redefined once per
+     palette below, exactly like every colour here. */
+  --sel-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1.5 2 6 6.2 10.5 2' fill='none' stroke='%23626c7c' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   color-scheme: light dark;
 }
 @media (prefers-color-scheme: dark) {
@@ -65,6 +70,7 @@
     --chip: #232b36;
     --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 6px 18px rgba(0, 0, 0, .3);
     --shadow-lift: 0 8px 34px rgba(0, 0, 0, .6);
+    --sel-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1.5 2 6 6.2 10.5 2' fill='none' stroke='%2394a0b0' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
     color-scheme: dark;
   }
 }
@@ -88,6 +94,7 @@
   --chip: #232b36;
   --shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 6px 18px rgba(0, 0, 0, .3);
   --shadow-lift: 0 8px 34px rgba(0, 0, 0, .6);
+  --sel-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8'%3E%3Cpath d='M1.5 2 6 6.2 10.5 2' fill='none' stroke='%2394a0b0' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   color-scheme: dark;
 }
 :root[data-theme="light"] { color-scheme: light; }
@@ -120,6 +127,41 @@ code, .mono { font-family: var(--mono); font-size: .875em; }
 .nowrap { white-space: nowrap; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
 
+/* ------------------------------------------------------- form controls --
+   Every <select> in this UI, wherever it sits. `appearance: none` was already
+   here and was half the job: it removed the platform chevron and nothing drew
+   one back, so a dropdown rendered as a plain box with no affordance that it
+   opened anything. Beside a search field styled the same way it read as a
+   broken text input.
+
+   padding-right reserves the arrow's lane so a long option never runs
+   underneath it. */
+select {
+  appearance: none; -webkit-appearance: none;
+  background-image: var(--sel-arrow);
+  background-repeat: no-repeat;
+  background-position: right .7rem center;
+  background-size: .7rem .48rem;
+}
+
+/* input[type=search] keeps WebKit's own chrome unless it is told not to --
+   rounded ends and a native cancel button, on top of our border and radius, in
+   a different design language from every other field. The cancel button also
+   cannot be styled and is invisible in some browsers, which is why the Clear
+   affordance on Activity is a real button of ours instead. */
+input[type="search"] { appearance: none; -webkit-appearance: none; }
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-decoration,
+input[type="search"]::-webkit-search-results-button {
+  -webkit-appearance: none; appearance: none; display: none;
+}
+
+/* One focus treatment for all three, so a bare input and a bare select beside
+   it never light up differently. */
+input:focus-visible, select:focus-visible, textarea:focus-visible {
+  border-color: var(--accent); border-radius: var(--r-sm);
+}
+
 /* ---------------------------------------------------------------- header -- */
 .topbar {
   position: sticky; top: 0; z-index: 30;
@@ -140,7 +182,10 @@ code, .mono { font-family: var(--mono); font-size: .875em; }
   font-size: 1rem; letter-spacing: .01em; min-width: 0;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.brand-ver { font-size: .68rem; font-weight: 600; color: var(--muted); margin-left: .3rem; }
+/* Hidden at the base width: with the status chips in the row it is the ~40 px
+   that decides whether "Klingelbox" itself gets ellipsised, and the version is
+   already in the footer and under Settings. It returns at 600 px. */
+.brand-ver { display: none; font-size: .68rem; font-weight: 600; color: var(--muted); margin-left: .3rem; }
 .topbar-right { display: flex; align-items: center; gap: .4rem; flex: none; }
 .theme-toggle {
   appearance: none; border: 1px solid var(--line); background: var(--chip);
@@ -149,7 +194,13 @@ code, .mono { font-family: var(--mono); font-size: .875em; }
   display: inline-flex; align-items: center; justify-content: center;
   font-size: 1.05rem; cursor: pointer;
 }
+/* Hidden at the base width. It and the brand dot say the SAME three things —
+   ready / AP only / no radio — and at 360 px the badge is ~61 px that decides
+   whether "Klingelbox" itself gets ellipsised next to the status chips. The dot
+   carries the identical class and now the identical tooltip, so nothing is lost
+   and the word comes back at 600 px. */
 .status-badge {
+  display: none;
   font-size: .68rem; font-weight: 700; letter-spacing: .03em; text-transform: uppercase;
   padding: .3rem .55rem; border-radius: 999px; white-space: nowrap;
   background: var(--chip); color: var(--muted);
@@ -162,36 +213,83 @@ code, .mono { font-family: var(--mono); font-size: .875em; }
 /* header tab strip — hidden on phones, revealed at 720 px (see enhancements) */
 .tabs { display: none; }
 
-/* -------------------------------------------------------------- bottom nav --
-   Three destinations — the graph is the product, so it is one tab and not a
-   family of them. At 360 px each cell is 120 px wide and 56 px tall, far past
-   44 px in both axes. The strip is still an overflow-x scroller as a safety
-   net for 280 px devices and for very large text settings. */
-.bottomnav {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
-  display: flex;
-  overflow-x: auto; overscroll-behavior-x: contain;
-  scrollbar-width: none;
-  background: var(--panel);
-  border-top: 1px solid var(--line);
-  padding-bottom: env(safe-area-inset-bottom);
+/* ------------------------------------------------------- header status row --
+   Six chips about the BOX, right-aligned. They are a CHILD OF THE HEADER ROW,
+   not a band underneath it: `margin-left: auto` pushes the block against the
+   right edge and the header row simply grows to two chip-lines tall, with the
+   brand and the tab strip staying vertically centred against it.
+
+   The two lines are two elements (see buildStatusChips), not one wrapping row.
+   Two of these values change every second, so a wrap point chosen by the text
+   would move once a second and a chip would hop between lines. Every ticking
+   value lives on line two and both are min-width locked, so neither line can
+   change width and the block cannot push the brand or the tabs sideways.
+
+   TIERS. The header is a fixed budget shared with the brand, five tabs, the
+   theme toggle and the status badge, and the tabs win — five destinations you
+   cannot see is the exact failure this restructure exists to fix. So chips are
+   dropped as the row tightens:
+
+     base       sc-radio + sc-up            "is it listening", "how long"
+     600 px     + sc-t2  (Wi-Fi, dBm floor)          block 215 px
+     720-899    NOTHING. This is where the tab strip arrives in the header and
+                takes essentially all of it. The status badge two inches away
+                still reads ready / AP only / no radio, so nothing unique is
+                lost in this one band.
+     900 px     sc-radio + sc-up again              block 115 px
+     1100 px    + sc-t2                             block 215 px
+     1300 px    + sc-t3 -- all six                  block 338 px
+
+   Those four numbers are arithmetic, not taste. Measured: the brand, the theme
+   toggle, the status badge, the header padding and the gaps come to ~315 px,
+   and the five-tab strip to ~412 px. A tier may therefore appear only once the
+   viewport clears 315 + 412 + its own block width -- 842, 942 and 1065 px, and
+   the breakpoints above are the next round number past each. Getting this wrong
+   does not overflow the page; it silently turns .tabs into a scroller, and five
+   destinations you cannot see is the exact failure this restructure exists to
+   fix.
+
+   The two added last are the ones that never change while you watch:
+   Diagnostics and Settings state both properly. */
+.statuschips {
+  margin-left: auto;
+  flex: 0 1 auto;
+  display: flex; flex-direction: column; align-items: flex-end;
+  gap: .15rem;
+  min-width: 0;
 }
-.bottomnav::-webkit-scrollbar { display: none; }
-.navbtn {
-  appearance: none; border: 0; background: transparent; color: var(--muted);
-  font: inherit; cursor: pointer;
-  flex: 1 0 auto; min-width: 3.5rem;
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: .1rem; padding: .4rem .25rem .45rem; min-height: 3.5rem;
-  border-top: 2px solid transparent; margin-top: -1px;
+.sc-line { display: flex; gap: .3rem; justify-content: flex-end; }
+
+/* THE HEIGHT BUDGET IS 44 px, and it is already spent. What sets this row's
+   height is not the brand text (1rem x 1.25 = 20 px) but the theme toggle,
+   which is var(--tap) = 44 px square because it has to be thumb-sized. So two
+   chip lines are free if they fit inside 44 px, and the header does not grow
+   at all.
+
+   They do, and without touching the font. At .72rem the type is 11.5 px; the
+   cost is leading and padding, not size. line-height 1.15 and .18rem of
+   vertical padding make a chip 19 px, so two of them plus the .15rem gap come
+   to ~40 px — inside the 44 px the toggle already occupies. The font stays
+   readable because it is unchanged; only the air around it is gone. */
+.statuschips .chip {
+  font-variant-numeric: tabular-nums;
+  justify-content: center;
+  line-height: 1.15;
+  /* .05rem tighter horizontally than a body chip too: six of them plus two
+     min-widths is the one row in the UI where 10 px decides the layout. */
+  padding: .18rem .45rem;
 }
-.navbtn .ico { font-size: 1.15rem; line-height: 1.1; }
-.navbtn .lbl { font-size: .62rem; font-weight: 650; letter-spacing: .01em; }
-.navbtn.active { color: var(--accent); border-top-color: var(--accent); }
-.navbtn .badge {
-  position: absolute; margin: -1.35rem 0 0 1.1rem;
-  min-width: .5rem; height: .5rem; border-radius: 999px; background: var(--bad);
-}
+/* Measured, not guessed. At this font a chip's text costs ~6.9 px per
+   character plus .9rem of padding, so the widest plausible string sets the
+   floor: "up 12d 23h" (10) -> 5.4rem, "-101 dBm floor" (14) -> 7.2rem. A
+   min-width BELOW the natural width locks nothing at all, which is the trap
+   here — both of these have to exceed what they normally render at. */
+.statuschips .sc-up    { min-width: 5.4rem; }
+.statuschips .sc-floor { min-width: 7.2rem; }
+/* Scoped to .statuschips on purpose: a bare `.sc-t2` loses to `.chip`, which is
+   defined later in this file and also sets `display`. Same weight, later rule
+   wins — which is how these stayed visible at 360 px the first time. */
+.statuschips .sc-t2, .statuschips .sc-t3 { display: none; }
 
 /* ------------------------------------------------------------------ main -- */
 main {
@@ -294,10 +392,13 @@ main {
   min-height: var(--tap);
   padding: .55rem .7rem;
   border: 1px solid var(--line); border-radius: var(--r-sm);
-  background: var(--sunk); color: var(--text);
+  /* background-COLOR, not the `background` shorthand: the shorthand resets
+     background-image to none, which silently removes the chevron the global
+     `select` rule paints. */
+  background-color: var(--sunk); color: var(--text);
   width: 100%; min-width: 0;
 }
-.field select { appearance: none; background-image: none; }
+.field select { padding-right: 2.1rem; }
 .field input:disabled, .field select:disabled { opacity: .55; }
 .field .hint, .hint { font-size: .76rem; font-weight: 400; color: var(--muted);
   text-transform: none; letter-spacing: 0; }
@@ -364,7 +465,47 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 .listitem .li-ico { font-size: 1.15rem; flex: none; width: 1.5rem; text-align: center; }
 .listitem:disabled { opacity: .5; cursor: default; }
 
-/* --------------------------------------------------------------- event feed -- */
+/* --------------------------------------------------------------- event feed --
+   The Activity tab: a filter row, a count, then the whole list. There is no
+   collapsed height and no max-height — the list IS the page, so the page
+   scrolls it. A nested scroller inside a full-page list is the worst of both
+   on a phone: you flick, the inner box catches it, and the page does not move.
+
+   The filter row stacks at 360 px, because a search field sharing one line with
+   a kind <select> leaves neither wide enough to read. It goes to one line at
+   600 px where there is room for all three controls. */
+.feedtools { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .5rem; }
+/* These two are the only bare controls in the UI — everywhere else a control
+   is wrapped in a .field with a label above it, and here a label would be a
+   third line of chrome above the thing you came to read. So they carry the
+   field styling themselves, 16 px font and all: anything smaller and iOS zooms
+   the whole page the moment the search box is focused. */
+.feedtools input[type="search"], .feedtools select {
+  font: inherit;
+  font-size: 1rem;
+  min-height: var(--tap);
+  padding: .55rem .7rem;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background-color: var(--sunk); color: var(--text);   /* not the shorthand */
+  min-width: 0;
+}
+/* AFTER the padding shorthand above, or it loses to it — same specificity, and
+   the later rule wins. Without it a long option name runs under the chevron. */
+.feedtools select { padding-right: 2.1rem; }
+.feedtools input[type="search"] { flex: 1 1 100%; }
+/* flex-basis 8rem, not auto: the widest option ("❓ Unrecognised signal") is
+   wider than half a 360 px screen, and an `auto` basis takes that as the
+   starting size, so the select claimed a whole row of its own and pushed Clear
+   onto a third. With a basis it shrinks and the two share one line. */
+.feedtools select { flex: 1 1 8rem; }
+/* Plain .btn, not .btn.small: it shares a row with two var(--tap)-tall
+   controls, and a short button beside tall ones reads as disabled. */
+.feedclear { flex: 0 0 auto; }
+.feedcount {
+  font-size: .74rem; color: var(--muted); font-family: var(--mono);
+  padding-bottom: .3rem;
+}
+
 .feed { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
 .feeditem {
   display: flex; align-items: flex-start; gap: .55rem;
@@ -521,8 +662,22 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
    there are no letterboxed bands where a node cannot be placed. */
 .canvas { display: block; touch-action: none; background: var(--sunk); }
 /* Zoom / fit controls above the canvas. */
-.canvas-tools { justify-content: flex-end; gap: .4rem; margin-bottom: .4rem; align-items: center; }
-.canvas-tools .btn.small { min-width: 2.4rem; padding: .35rem .6rem; }
+/* ------------------------------------------------------------ graph toolbar --
+   ONE row: ➕ Add node hard left, the Map|List switch and the canvas zoom
+   controls hard right. `margin-left: auto` on the first right-hand item does
+   the pushing, so removing the zoom controls (List view, or below 900 px where
+   there is no canvas at all) closes up with no gap and without moving the view
+   switch — the switch is anchored to the right edge, not to the zoom bar.
+
+   Below 900 px both right-hand groups are gone and the row is just the one
+   primary button, which stretches to full width there so it reads as a
+   deliberate primary action rather than a toolbar missing its contents. */
+.toolbar { gap: .5rem; align-items: center; }
+.toolbar > .btn.primary { flex: 1 1 auto; }
+.graph-viewswitch { margin-left: auto; }
+.zoomslot { display: flex; gap: .4rem; align-items: center; }
+.zoomslot:empty { display: none; }             /* no gap when there is no canvas */
+.zoomslot .btn.small { min-width: 2.4rem; padding: .35rem .6rem; min-height: var(--tap); }
 .zoom-lbl { min-width: 3.2rem; text-align: center; }
 /* Grab cursor while panning the empty canvas. */
 .canvas.panning { cursor: grabbing; }
@@ -690,7 +845,8 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 @keyframes indet { 0% { margin-left: -40%; } 100% { margin-left: 100%; } }
 
 /* -------------------------------------------------------------- recovery -- */
-body.recovery .bottomnav, body.recovery .tabs { display: none !important; }
+body.recovery .bottomnav, body.recovery .tabs,
+body.recovery .statuschips { display: none !important; }
 body.recovery main { padding-bottom: calc(1.5rem + env(safe-area-inset-bottom)); }
 .wizstep { border-top: 1px solid var(--line); padding: .8rem 0 0; margin-top: .8rem; }
 .wizstep:first-of-type { border-top: 0; padding-top: 0; margin-top: 0; }
@@ -703,6 +859,70 @@ body.recovery main { padding-bottom: calc(1.5rem + env(safe-area-inset-bottom));
 .done-big { text-align: center; padding: 1.5rem .5rem; }
 .done-big .db-ico { font-size: 2.5rem; line-height: 1; }
 .done-big h3 { font-size: 1.15rem; margin: .5rem 0 .4rem; }
+
+/* -------------------------------------------------------------- handbook --
+   Seven closed <details>, which makes the page a table of contents on arrival.
+   The summaries are therefore navigation, not decoration: they reuse
+   .sect-summary (already var(--tap) tall with a chevron) and get a little more
+   vertical room, because on this page there is nothing else to tap.
+
+   Measure matters more here than anywhere else in the UI — this is the only
+   screen that is genuinely READ rather than operated — so the body gets a
+   slightly looser line height and a max-width on wide screens. */
+.hb > .sect-summary { padding: .15rem 0; }
+.hb-body { line-height: 1.55; }
+.hb-p { font-size: .88rem; margin: .55rem 0; overflow-wrap: anywhere; }
+.hb-h {
+  font-size: .82rem; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--muted); margin: 1rem 0 .35rem;
+}
+.hb-list { margin: .5rem 0; padding-left: 1.25rem; font-size: .88rem; }
+.hb-list li { margin: .35rem 0; overflow-wrap: anywhere; }
+.hb-body .kv { margin: .4rem 0 .6rem; }
+.hb-body .note { margin: .7rem 0; }
+
+/* A literal topic or command. Scrolls rather than wraps: half a topic string
+   looks exactly like a whole one, and that is how people mistype them. */
+.hb-code {
+  overflow-x: auto; overscroll-behavior-x: contain;
+  background: var(--sunk); border: 1px solid var(--line); border-radius: var(--r-sm);
+  padding: .5rem .6rem; margin: .4rem 0;
+}
+.hb-code code {
+  white-space: pre; font-size: .78rem; color: var(--text);
+  display: block;
+}
+
+/* The node reference: one nested <details> per type. Two levels of nesting,
+   never three. */
+.hb-node { border-top: 1px solid var(--line-soft); }
+.hb-node:first-of-type { border-top: 0; }
+.hb-nodesum {
+  display: flex; align-items: center; gap: .55rem;
+  min-height: var(--tap); cursor: pointer; list-style: none;
+}
+.hb-nodesum::-webkit-details-marker { display: none; }
+.hb-nodesum::after {
+  content: "\25BE"; margin-left: auto; padding-left: .5rem; color: var(--muted); font-size: .85rem;
+}
+.hb-node[open] > .hb-nodesum::after { content: "\25B4"; }
+.hb-nodeico { flex: none; width: 1.6rem; text-align: center; font-size: 1.2rem; }
+.hb-nodetext { min-width: 0; }
+.hb-nodename { display: block; font-weight: 650; font-size: .92rem; }
+.hb-nodetype {
+  display: block; font-family: var(--mono); font-size: .72rem; color: var(--muted);
+}
+.hb-node > .hb-p:first-of-type { margin-top: .1rem; }
+.hb-ports {
+  font-size: .78rem; color: var(--muted);
+  border-left: 2px solid var(--line); padding-left: .6rem; margin: .5rem 0 .2rem;
+}
+.hb-node > .kv, .hb-node > .hb-p, .hb-node > .hb-h, .hb-node > .hb-ports {
+  margin-left: 2.15rem;   /* line up under the label, clear of the icon column */
+}
+
+.hb-recipe { margin-bottom: .7rem; }
+.hb-recipe-t { font-weight: 600; font-size: .9rem; }
 
 /* ---------------------------------------------------------------- footer -- */
 .foot { text-align: center; font-size: .74rem; color: var(--muted); padding: 1rem .75rem 0; }
@@ -727,6 +947,8 @@ body.recovery main { padding-bottom: calc(1.5rem + env(safe-area-inset-bottom));
 /* --- 600 px: roomier, 2-up grids, sheets become centred dialogs ----------- */
 @media (min-width: 600px) {
   main { padding: 1rem; }
+  .brand-ver { display: inline; }
+  .status-badge { display: block; }
   .panel { padding: 1.1rem; }
   .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
   .counters { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -735,6 +957,11 @@ body.recovery main { padding-bottom: calc(1.5rem + env(safe-area-inset-bottom));
   .sheet { max-width: 34rem; border-radius: var(--r); max-height: 84vh;
            padding-bottom: .85rem; }
   .sheet-grip { display: none; }
+  /* One line for search + kind + clear once there is width for all three. */
+  .feedtools input[type="search"] { flex: 1 1 12rem; }
+  .feedtools select { flex: 0 1 12rem; }
+  /* Tier 2: the Wi-Fi SSID joins line one, the noise floor joins line two. */
+  .statuschips .sc-t2 { display: inline-flex; }
 }
 
 /* --- 720 px: the tab strip moves into the header; bottom bar retires ------ */
@@ -743,32 +970,64 @@ body.recovery main { padding-bottom: calc(1.5rem + env(safe-area-inset-bottom));
   .brand { flex: none; }
   .tabs { display: flex; gap: .2rem; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; }
   .tabs::-webkit-scrollbar { display: none; }
+  /* Five tabs with the full names, and 720 px is where all five have to fit
+     beside the brand, the theme toggle and the status badge. Measured: at
+     .9rem/.55rem they came to 443 px against about 421 px of room and the strip
+     silently became a scroller — five destinations you cannot see is the exact
+     IA failure this restructure exists to fix. .85rem type and .4rem of side
+     padding brings them to ~400 px and all five are visible. Both grow back at
+     1100 px. The strip stays an overflow-x scroller as a last resort for a
+     translation or a large text setting. */
   .tab {
     appearance: none; border: 0; background: transparent; color: var(--muted);
-    font: inherit; font-weight: 650; font-size: .9rem;
-    padding: .45rem .8rem; border-radius: var(--r-sm); cursor: pointer; white-space: nowrap;
+    font: inherit; font-weight: 650; font-size: .85rem;
+    padding: .45rem .4rem; border-radius: var(--r-sm); cursor: pointer; white-space: nowrap;
     min-height: 2.4rem;
   }
   .tab.active { background: var(--accent); color: var(--accent-text); }
   .bottomnav { display: none; }
+  /* 720-899: the tab strip has just moved into this row and needs all of it.
+     Measured, five tabs come to ~412 px against ~405 px of free width, so the
+     chips would push the strip into a scroller. They come back at 900 px --
+     and tier 2 goes back off here, because from 900 px the budget only covers
+     the two-chip block until 1100 px. */
+  .statuschips { display: none; }
+  .statuschips .sc-t2 { display: none; }
   main { padding-bottom: 1.5rem; }
   body.recovery main { padding-bottom: 1.5rem; }
 }
 
 /* --- 900 px: the node-graph canvas becomes available; 2-column forms ------ */
 @media (min-width: 900px) {
+  .statuschips { display: flex; }             /* back after the 720 px squeeze */
   .graph-viewswitch { display: flex; }        /* hidden below this width */
+  /* The toolbar now has right-hand contents, so the primary button stops
+     stretching and sits at its natural width on the left. */
+  .toolbar > .btn.primary { flex: 0 0 auto; }
   .canvas { height: 32rem; }
   .formgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 1rem; }
   .formgrid .full { grid-column: 1 / -1; }
   .kv { grid-template-columns: 9rem 1fr; }
   .sheet { max-width: 38rem; }
+  /* The Handbook is the one screen that is read rather than operated, so its
+     prose gets a measure instead of running the full width of a monitor. */
+  .hb-body { max-width: 46rem; }
+}
+
+/* --- 1300 px: the full six status chips fit beside the five tabs ---------- */
+@media (min-width: 1300px) {
+  .statuschips .sc-t3 { display: inline-flex; }
 }
 
 /* --- 1100 px: centred content column, 3-up cards ------------------------- */
 @media (min-width: 1100px) {
   main { max-width: 70rem; margin: 0 auto; padding: 1.25rem; }
   .topbar { padding-left: 1.5rem; padding-right: 1.5rem; }
+  /* The tab strip deliberately does NOT grow here any more. It used to go back
+     to .9rem/.8rem at this width, which cost ~58 px and was exactly what tipped
+     it into a scroller once the status chips shared the row. That width is
+     worth more as a chip tier than as tab padding. */
+  .statuschips .sc-t2 { display: inline-flex; }
   .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .cards.wide { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
