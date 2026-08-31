@@ -37,6 +37,20 @@ name: flasher-sync
 # comparatively cheap.
 
 on:
+  # NOTE: `release: [published]` alone does NOT work here, and this bit us on the
+  # v0.1.0 release. GitHub deliberately refuses to trigger workflows from events
+  # created by GITHUB_TOKEN -- a recursion guard -- and release.yml publishes the
+  # release with exactly that token. So the release event fires, and no workflow
+  # ever sees it; the mirror silently stayed empty and the browser flasher had
+  # nothing to offer.
+  #
+  # `workflow_run` is the supported way out: it fires on the Release workflow
+  # COMPLETING, which is observable regardless of which token started it. The
+  # release trigger is kept for a release published by a human or a PAT, and
+  # workflow_dispatch for re-running the mirror by hand.
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   release:
     types: [published]
   workflow_dispatch:
@@ -59,6 +73,11 @@ env:
 
 jobs:
   sync:
+    # A failed Release build must not publish a mirror entry pointing at
+    # assets that were never uploaded.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     name: mirror release firmware into docs/flasher
     runs-on: ubuntu-latest
     steps:
