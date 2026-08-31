@@ -122,7 +122,16 @@ jobs:
           # The ESP32-S3 Zero: the 4 MB overrides are layered ON TOP of the base
           # defaults, exactly as documented in firmware/sdkconfig.defaults.4mb.
           - name: "4mb"
-            defaults: "sdkconfig.defaults;sdkconfig.defaults.4mb"
+            # NOTE: deliberately a SINGLE file, not "a;b".
+            # ESP-IDF's own syntax for layering is a semicolon-separated list, but
+            # espressif/esp-idf-ci-action passes `command` through an extra shell
+            # level, and that shell splits on the `;` — leaving the trailing quote
+            # unmatched and failing with "unexpected EOF while looking for
+            # matching \"". (The 16 MB leg passed precisely because it has no
+            # semicolon.) The "Compose 4 MB defaults" step below concatenates the
+            # two files instead, which has identical precedence semantics: later
+            # entries win, and concatenation puts the 4 MB overrides last.
+            defaults: "sdkconfig.defaults.4mb.combined"
             partitions: "partitions-4mb.csv"
             build_dir: "build-4mb"
             sdkconfig: "sdkconfig.4mb"
@@ -154,6 +163,18 @@ jobs:
       #
       # `bash -c "set -o pipefail && ... | tee"` is deliberate: without pipefail the
       # pipeline would report tee's exit status and a failing build would go green.
+      # See the matrix comment: the ci-action's shell layer cannot carry a `;`,
+      # so the 4 MB variant's layered defaults are flattened into one file here.
+      - name: Compose 4 MB defaults
+        if: matrix.name == '4mb'
+        working-directory: firmware
+        run: |
+          set -euo pipefail
+          cat sdkconfig.defaults sdkconfig.defaults.4mb > sdkconfig.defaults.4mb.combined
+          echo "--- composed defaults (overrides last) ---"
+          grep -E '^CONFIG_(ESPTOOLPY_FLASHSIZE|PARTITION_TABLE_CUSTOM_FILENAME)' \
+            sdkconfig.defaults.4mb.combined
+
       - name: Build firmware (ESP-IDF ${{ env.IDF_VERSION }}, esp32s3)
         uses: espressif/esp-idf-ci-action@v1
         with:

@@ -2,5 +2,10 @@
 #
 # Apply on top of sdkconfig.defaults:
 #   SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.4mb" idf.py build
+# Explicitly clear the 16 MB choice first. Kconfig takes the last assignment,
+# so the ordering alone would work — but leaving two members of the same
+# choice set to 'y' is ambiguous to read and relies on file order to be
+# correct. Being explicit costs one line and cannot be misread.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=n
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions-4mb.csv"
