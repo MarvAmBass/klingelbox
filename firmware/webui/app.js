@@ -4425,6 +4425,7 @@ function buildSettings() {
   add(root, sectionRadio());
   add(root, sectionSignals());
   add(root, sectionFirmware());
+  add(root, sectionBackup());
   add(root, sectionReboot());
 }
 
@@ -5215,6 +5216,601 @@ function sectionFirmware() {
   add(body, uploadRow("Firmware image (klingelbox.bin)", "/api/ota/upload", "firmware"));
   add(body, uploadRow("Web UI image (storage.bin)", "/api/ota/webui/upload", "web UI"));
   add(body, prog, upMsg);
+  return s;
+}
+
+/* ---------------------------------------------------------------- backup --
+
+   Move a box's learned signals AND its automations to another Klingelbox.
+
+   THE BROWSER ORCHESTRATES; THE FIRMWARE NEVER HOLDS THE DOCUMENT. Please do
+   not "simplify" the four functions below into one GET /api/backup and one
+   POST /api/backup. Measured on the live box: ~126 KB of free heap, and a full
+   backup of a filled store is ~86 KB of JSON (32 signals x ~2.7 KB of
+   durations_us, plus the graph). cJSON needs the body string AND a parse tree
+   of two to three times the document alive at the same moment, so a
+   whole-bundle endpoint would ask for roughly 300 KB on a box that has 126 KB
+   -- while Wi-Fi buffers and this very connection are also holding heap. It
+   would not be slow. It would run the box out of memory.
+
+   So the bundle is assembled HERE out of endpoints that already exist and are
+   already streamed (GET /api/signals, GET /api/signals/{id}, GET /api/graph),
+   and restored HERE one item at a time through per-item endpoints that ordinary
+   use exercises every day. Every request stays a few kilobytes. The price is
+   that an import is NOT atomic, and the price is paid honestly: the summary
+   says what actually got in, and what did not, and why.
+
+   ID REMAPPING is the whole difficulty. Signal ids and node ids are handed out
+   by whichever box you are restoring INTO, so a graph carried over from another
+   box points at nothing -- or, worse, at somebody else's doorbell. The order is
+   not negotiable:
+     1. signals first, recording old id -> new id as the device assigns them;
+     2. nodes next, with signal_id rewritten through that map, recording
+        old node id -> new node id;
+     3. links last, with BOTH endpoints rewritten.
+
+   NO SECRETS EVER LEAVE. A backup file gets mailed around and dropped in cloud
+   folders. It carries what the doorbell KNOWS -- waveforms and wiring -- and
+   never what it can LOG IN TO: no Wi-Fi SSID or passphrase, no AP password, no
+   MQTT host or credentials, not even hashes. */
+
+var BACKUP_KIND = "klingelbox-backup";
+var BACKUP_VERSION = 1;
+
+/* The firmware's ceilings, from signal_store.h and node_graph.h. Duplicated
+   here for one reason only: a Replace has to be REFUSABLE BEFORE it destroys
+   anything. The single worst outcome this feature can produce is a wiped box
+   plus an import that then does not fit. */
+var LIM_SIGNALS = 32;
+var LIM_NODES = 24;
+var LIM_LINKS = 48;
+
+function isArr(v) { return Object.prototype.toString.call(v) === "[object Array]"; }
+
+/* Run `step` over `list` strictly one at a time, resolving when the last has
+   settled. Sequential and NOT Promise.all(): the box serves this from a handful
+   of httpd workers, each of which mallocs a 1 KB frame buffer for a waveform,
+   and firing 32 of those at once is how you turn a working feature into an
+   out-of-memory report. Latency is not the constraint here; heap is. */
+function serialEach(list, step) {
+  var i = 0;
+  function next() {
+    if (i >= list.length) return Promise.resolve();
+    var item = list[i];
+    i++;
+    return Promise.resolve(step(item)).then(next);
+  }
+  return next();
+}
+
+/* klingelbox-<hostname>-<yyyymmdd>.json -- the two things you need to tell two
+   backup files apart in a downloads folder six months from now. */
+function backupFilename(host) {
+  function p2(n) { return (n < 10 ? "0" : "") + n; }
+  var d = new Date();
+  var h = String(host || "klingelbox").toLowerCase().replace(/[^a-z0-9-]+/g, "-");
+  return "klingelbox-" + (h || "klingelbox") + "-" +
+         d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate()) + ".json";
+}
+
+/* Assemble the bundle client-side. `onStep(done, total, text)` drives the bar. */
+function buildBundle(onStep) {
+  var bundle = {
+    kind: BACKUP_KIND,
+    version: BACKUP_VERSION,
+    /* The BROWSER's clock, deliberately. The box may have no time source at
+       all, which is why signals carry created_at: 0 -- and a date you can read
+       beats a zero that is technically the device's own opinion. */
+    exported_at: Math.floor(Date.now() / 1000),
+    device: {},
+    signals: [],
+    graph: { nodes: [], links: [] }
+  };
+  var total = 1;
+  var done = 0;
+  function tick(text) { done++; if (onStep) onStep(done, total, text); }
+
+  return api("/api/system").then(function (sys) {
+    /* Descriptive only, and deliberately just these three: nothing here names a
+       network, and nothing here authenticates to anything. */
+    bundle.device = {
+      hostname: sys.hostname || "",
+      version: sys.version || "",
+      idf: sys.idf || ""
+    };
+    return api("/api/radio").catch(function () { return null; });
+  }).then(function (r) {
+    /* Radio settings are device BEHAVIOUR, not identity, so they travel in
+       their own clearly separated object and are optional on import. rssi_dbm
+       is left out: it is a live measurement of the room, not a setting. */
+    if (r) {
+      bundle.radio = {
+        freq_hz: r.freq_hz, modulation: r.modulation, datarate_bps: r.datarate_bps,
+        bandwidth_hz: r.bandwidth_hz, tx_power_dbm: r.tx_power_dbm,
+        tx_repeats: r.tx_repeats, tx_gap_us: r.tx_gap_us
+      };
+    }
+    return api("/api/signals");
+  }).then(function (res) {
+    var list = res.signals || [];
+    total = list.length + 1;
+    return serialEach(list, function (meta) {
+      return api("/api/signals/" + meta.id).then(function (sig) {
+        bundle.signals.push({
+          id: sig.id,
+          name: sig.name,
+          origin: sig.origin,
+          first_level: numOr(sig.first_level, 0),
+          durations_us: sig.durations_us || []
+        });
+        tick("Read “" + signalLabel(meta) + "”…");
+      });
+    });
+  }).then(function () {
+    return api("/api/graph");
+  }).then(function (g) {
+    /* Nodes travel VERBATIM. A node object is routing configuration end to end
+       -- there is no credential-shaped field anywhere in it (see node_json() in
+       http_api.c) -- so copying it whole is both safe and future-proof: a node
+       field added to the firmware later is backed up without touching this. */
+    bundle.graph.nodes = (g.nodes || []).slice();
+    bundle.graph.links = (g.links || []).map(function (l) {
+      return { from: l.from, to: l.to };
+    });
+    tick("Read the node graph.");
+    return bundle;
+  });
+}
+
+function downloadBundle(bundle, name) {
+  var text = JSON.stringify(bundle);
+  var url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  /* This anchor exists for exactly one click and must never join the layout. */
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  /* Safari needs the object URL to outlive the click by more than a tick. */
+  setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+  return text.length;
+}
+
+/* Refuse an unknown kind or a newer version with a sentence, rather than
+   importing nonsense approximately. Returns null when the bundle is readable. */
+function validateBundle(b) {
+  if (!b || typeof b !== "object" || isArr(b))
+    return "That file is not a Klingelbox backup — it is not even a JSON object.";
+  if (b.kind !== BACKUP_KIND)
+    return "That is not a Klingelbox backup. Its “kind” is " +
+           (b.kind ? "“" + String(b.kind) + "”" : "missing") +
+           ", and a backup says “" + BACKUP_KIND + "”.";
+  var v = numOr(b.version, 0);
+  if (v < 1) return "That backup has no usable version number, so it cannot be read.";
+  if (v > BACKUP_VERSION)
+    return "That backup is version " + v + " and this box understands version " +
+           BACKUP_VERSION + ". Update the firmware first — importing it " +
+           "half-understood would be worse than not importing it at all.";
+  if (!isArr(b.signals) || !b.graph || !isArr(b.graph.nodes) || !isArr(b.graph.links))
+    return "That backup is missing its signals or its graph, so it cannot be read.";
+  return null;
+}
+
+/*
+ * THE ARITHMETIC THAT RUNS BEFORE ANYTHING IS DESTROYED.
+ *
+ * Returns { rows, error }. `rows` is [what, have, incoming, limit] for the
+ * summary; `error` is a sentence when the import cannot fit, in which case the
+ * caller must refuse — for Replace especially, because by the time a POST is
+ * rejected the old configuration is already gone.
+ */
+function capacityCheck(b, mode) {
+  var wipe = (mode === "replace");
+  var rows = [
+    ["Signals", wipe ? 0 : (S.signals || []).length, b.signals.length, LIM_SIGNALS],
+    ["Nodes", wipe ? 0 : ((S.graph && S.graph.nodes) || []).length, b.graph.nodes.length, LIM_NODES],
+    ["Links", wipe ? 0 : ((S.graph && S.graph.links) || []).length, b.graph.links.length, LIM_LINKS]
+  ];
+  var bad = rows.filter(function (r) { return r[1] + r[2] > r[3]; });
+  if (!bad.length) return { rows: rows, error: null };
+
+  var parts = bad.map(function (r) {
+    return (r[1] + r[2]) + " " + r[0].toLowerCase() + " (the limit is " + r[3] + ")";
+  });
+  if (wipe) {
+    return { rows: rows, error:
+      "Even on an empty box this backup does not fit: it needs " + parts.join(", and ") +
+      ". Nothing has been changed. Trim the backup on the box it came from and export it again." };
+  }
+  return { rows: rows, error:
+    "Merging would need " + parts.join(", and ") +
+    ". Nothing has been changed. Delete what you no longer need first, or use Replace, " +
+    "which clears this box before importing." };
+}
+
+/*
+ * Replay the bundle. Not atomic — see the section header — so every outcome is
+ * recorded and reported rather than assumed.
+ */
+function runImport(bundle, mode, withRadio, onStep, onLog) {
+  var rep = { signals: 0, nodes: 0, links: 0, unbound: 0, radio: false,
+              clearedNodes: 0, clearedSignals: 0, skipped: [] };
+  var sigMap = {};    /* old signal id -> new signal id */
+  var nodeMap = {};   /* old node id   -> new node id   */
+  var storeFull = false;
+
+  var oldNodes = (mode === "replace") ? ((S.graph && S.graph.nodes) || []).slice() : [];
+  var oldSigs = (mode === "replace") ? (S.signals || []).slice() : [];
+  var total = oldNodes.length + oldSigs.length + bundle.signals.length +
+              bundle.graph.nodes.length + bundle.graph.links.length + (withRadio ? 1 : 0);
+  var done = 0;
+  function tick(text) { done++; if (onStep) onStep(done, total, text); }
+  function skip(text) { rep.skipped.push(text); if (onLog) onLog(text, "bad"); }
+  function note(text) { if (onLog) onLog(text, "ok"); }
+
+  /* 1. Replace only: clear. Nodes before signals, because deleting a node also
+     drops its links and leaves nothing dangling in between. */
+  function clearPhase() {
+    if (mode !== "replace") return Promise.resolve();
+    return serialEach(oldNodes, function (n) {
+      return api("/api/graph/nodes/" + n.id, { method: "DELETE" }).then(function () {
+        rep.clearedNodes++;
+      }).catch(function (e) {
+        skip("Could not delete node “" + (n.name || n.id) + "”: " + e.message);
+      }).then(function () { tick("Clearing the graph…"); });
+    }).then(function () {
+      return serialEach(oldSigs, function (s) {
+        return api("/api/signals/" + s.id, { method: "DELETE" }).then(function () {
+          rep.clearedSignals++;
+        }).catch(function (e) {
+          skip("Could not delete signal “" + signalLabel(s) + "”: " + e.message);
+        }).then(function () { tick("Clearing the signal store…"); });
+      });
+    });
+  }
+
+  /* 2. Signals, recording old id -> new id as the DEVICE assigns them. */
+  function signalsPhase() {
+    return serialEach(bundle.signals, function (s) {
+      var label = s.name || ("Signal " + s.id);
+      if (storeFull) {
+        skip("“" + label + "” — no room left in the signal store.");
+        tick("");
+        return;
+      }
+      var pulses = isArr(s.durations_us) ? s.durations_us : [];
+      if (!pulses.length) {
+        skip("“" + label + "” — the backup carries no waveform for it.");
+        tick("");
+        return;
+      }
+      return postJSON("/api/signals/import", {
+        name: label,
+        first_level: numOr(s.first_level, 0),
+        durations_us: pulses,
+        origin: s.origin || "imported"
+      }).then(function (created) {
+        if (s.id) sigMap[s.id] = created.id;
+        rep.signals++;
+        note("Signal “" + label + "” → #" + created.id);
+      }).catch(function (e) {
+        /* 507 is "nothing more will ever fit", not "this one was wrong", so the
+           rest are skipped with an honest reason instead of 30 identical
+           failures scrolling past. */
+        if (e.status === 507) storeFull = true;
+        skip("“" + label + "” — " + e.message);
+      }).then(function () { tick("Importing signals…"); });
+    });
+  }
+
+  /* 3. Nodes, with signal_id rewritten through sigMap. */
+  function nodesPhase() {
+    return serialEach(bundle.graph.nodes, function (n) {
+      var body = {};
+      Object.keys(n).forEach(function (k) { if (k !== "id") body[k] = n[k]; });
+      var wanted = numOr(n.signal_id, 0);
+      var unbound = false;
+      if (wanted) {
+        if (sigMap[wanted]) {
+          body.signal_id = sigMap[wanted];
+        } else {
+          /* NEVER carry a foreign signal_id through unchanged. On this box that
+             number is a DIFFERENT doorbell, or nothing at all, and a node
+             quietly bound to the wrong bell is the worst bug this feature could
+             ship. The node is created UNBOUND and SWITCHED OFF rather than
+             dropped: the wiring is the part that is laborious to rebuild by
+             hand, and a node you can see and re-point beats a link that
+             silently vanished. It is reported either way. */
+          body.signal_id = 0;
+          body.enabled = false;
+          unbound = true;
+        }
+      }
+      return postJSON("/api/graph/nodes", body).then(function (created) {
+        if (n.id) nodeMap[n.id] = created.id;
+        rep.nodes++;
+        if (unbound) {
+          rep.unbound++;
+          skip("Node “" + (n.name || created.id) + "” was created unbound and switched " +
+               "off — its signal did not import. Pick a signal for it, then enable it.");
+        } else {
+          note("Node “" + (n.name || created.id) + "” → #" + created.id);
+        }
+      }).catch(function (e) {
+        skip("Node “" + (n.name || n.id) + "” — " + e.message);
+      }).then(function () { tick("Importing nodes…"); });
+    });
+  }
+
+  /* 4. Links, with BOTH endpoints rewritten. */
+  function linksPhase() {
+    return serialEach(bundle.graph.links, function (l) {
+      var from = nodeMap[numOr(l.from, 0)];
+      var to = nodeMap[numOr(l.to, 0)];
+      if (!from || !to) {
+        skip("A link (" + l.from + " → " + l.to + ") was dropped: " +
+             (!from && !to ? "neither of its nodes"
+                           : (!from ? "the node it starts at" : "the node it ends at")) +
+             " could be created.");
+        tick("");
+        return;
+      }
+      return postJSON("/api/graph/links", { from: from, to: to }).then(function () {
+        rep.links++;
+      }).catch(function (e) {
+        skip("A link (" + l.from + " → " + l.to + ") — " + e.message);
+      }).then(function () { tick("Importing links…"); });
+    });
+  }
+
+  function radioPhase() {
+    if (!withRadio || !bundle.radio) return Promise.resolve();
+    return postJSON("/api/radio", bundle.radio).then(function () {
+      rep.radio = true;
+    }).catch(function (e) {
+      skip("Radio settings — " + e.message);
+    }).then(function () { tick("Applying radio settings…"); });
+  }
+
+  return clearPhase().then(signalsPhase).then(nodesPhase)
+    .then(linksPhase).then(radioPhase).then(function () { return rep; });
+}
+
+function sectionBackup() {
+  var s = section("Backup",
+    "Save this box's signals and automations to a file, and restore them here or on another Klingelbox.");
+  var body = s.bodyEl;
+
+  add(body, el("div", "note",
+    "A backup holds the learned waveforms and the whole node graph. It deliberately holds " +
+    "NO passwords: not the Wi-Fi passphrase, not the hotspot password, not the MQTT " +
+    "credentials, not even their hashes. Set those up again on the new box."));
+
+  /* ---- export ---- */
+  add(body, el("h3", null, "Export"));
+  var exMsg = el("div", "formmsg");
+  var exProg = el("div", "progress hidden");
+  var exBar = el("i");
+  add(exProg, exBar);
+  var exBtn = el("button", "btn primary", "Export backup file");
+  exBtn.type = "button";
+  exBtn.addEventListener("click", function () {
+    exBtn.disabled = true;
+    exProg.classList.remove("hidden");
+    exBar.style.width = "0%";
+    setMsg(exMsg, "Reading the box…");
+    buildBundle(function (done, total, text) {
+      exBar.style.width = Math.round(done * 100 / Math.max(1, total)) + "%";
+      if (text) setMsg(exMsg, text);
+    }).then(function (bundle) {
+      var name = backupFilename(bundle.device && bundle.device.hostname);
+      var bytes = downloadBundle(bundle, name);
+      exBar.style.width = "100%";
+      setMsg(exMsg, "Saved " + name + " — " + bundle.signals.length + " signals, " +
+                    bundle.graph.nodes.length + " nodes, " + bundle.graph.links.length +
+                    " links, " + Math.max(1, Math.round(bytes / 1024)) + " KB.", "ok");
+    }).catch(function (e) {
+      exProg.classList.add("hidden");
+      setMsg(exMsg, "Export failed: " + e.message, "err");
+    }).then(function () { exBtn.disabled = false; });
+  });
+  var exFoot = el("div", "formfoot");
+  add(exFoot, exBtn);
+  add(body, exFoot, exProg, exMsg);
+
+  /* ---- import ---- */
+  add(body, el("div", "divider"));
+  add(body, el("h3", null, "Restore"));
+
+  var file = el("input");
+  file.type = "file";
+  file.accept = ".json,application/json";
+  file.style.fontSize = "1rem";
+  file.style.padding = ".55rem 0";
+  add(body, field("Backup file", file, "Nothing is written to the box until you choose Merge or Replace."));
+
+  var radioOpt = checkField("Also restore the radio settings", false,
+    "Frequency, bandwidth, TX power and repeats. Off by default: those are this box's " +
+    "behaviour, and the box you are restoring to may have a different antenna.");
+  var preview = el("div");
+  var log = el("div", "note hidden");
+  /* One-off styles rather than a stylesheet rule, as elsewhere in this file:
+     the running list is the only scrolling box in the UI, and a hundred lines
+     of it must not push the summary off a phone screen. */
+  log.style.maxHeight = "14rem";
+  log.style.overflowY = "auto";
+  var imProg = el("div", "progress hidden");
+  var imBar = el("i");
+  add(imProg, imBar);
+  var imMsg = el("div", "formmsg");
+  var loaded = null;   /* the validated bundle, or null */
+
+  function logLine(text, kind) {
+    log.classList.remove("hidden");
+    add(log, el("div", "small" + (kind === "bad" ? " bad-text" : " muted"), text));
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function resetPreview() {
+    loaded = null;
+    clear(preview);
+    clear(log);
+    log.classList.add("hidden");
+    imProg.classList.add("hidden");
+    setMsg(imMsg, "");
+  }
+
+  function finish(rep, mode) {
+    /* The truthful summary. A partial import that claims success is worse than
+       a visible failure, so the counts come from what the device actually
+       acknowledged and the skips are listed in full above. */
+    var parts = [rep.signals + " signals", rep.nodes + " nodes", rep.links + " links"];
+    if (rep.radio) parts.push("radio settings");
+    var line = (mode === "replace" ? "Replaced. " : "Merged. ") + "Imported " +
+               parts.join(", ") + ".";
+    if (rep.unbound) line += " " + rep.unbound + " node(s) came in unbound and switched off.";
+    if (rep.skipped.length) {
+      line += " " + rep.skipped.length + " item(s) were skipped — see the list above.";
+      setMsg(imMsg, line, "warn");
+    } else {
+      setMsg(imMsg, line, "ok");
+    }
+    /* Drop the loaded bundle and the file input. The buttons are re-enabled by
+       the caller, and leaving a one-tap "do it again" under a summary that says
+       it already happened is how a merge becomes a double merge. */
+    clear(preview);
+    loaded = null;
+    try { file.value = ""; } catch (e) { /* older browsers refuse this */ }
+    return Promise.all([loadSignals(), loadGraph()]);
+  }
+
+  function start(mode) {
+    var bundle = loaded;
+    if (!bundle) return;
+    /* Re-read the box first: Settings is built once, the user may have edited
+       the graph on the Dashboard since, and the capacity arithmetic below is
+       only worth anything if it is arithmetic about the CURRENT box. */
+    setMsg(imMsg, "Checking what will fit…");
+    Promise.all([loadSignals(), loadGraph()]).then(function () {
+      var cap = capacityCheck(bundle, mode);
+      if (cap.error) { setMsg(imMsg, cap.error, "err"); return; }
+
+      var lines;
+      if (mode === "replace") {
+        lines = [
+          "This DELETES all " + (S.signals || []).length + " stored signals and all " +
+          ((S.graph && S.graph.nodes) || []).length + " nodes with their " +
+          ((S.graph && S.graph.links) || []).length + " links on this box, and cannot be undone.",
+          "Then it imports " + bundle.signals.length + " signals, " +
+          bundle.graph.nodes.length + " nodes and " + bundle.graph.links.length + " links.",
+          "Wi-Fi, hotspot and MQTT settings are not touched.",
+          "The import is not atomic: if it fails half way, what got in stays in."
+        ];
+      } else {
+        lines = [
+          "Nothing existing is deleted. " + bundle.signals.length + " signals, " +
+          bundle.graph.nodes.length + " nodes and " + bundle.graph.links.length +
+          " links are ADDED, with new ids.",
+          "Signals identical to ones you already have will be duplicated — a merge " +
+          "cannot tell a re-import from a second doorbell.",
+          "The import is not atomic: if it fails half way, what got in stays in."
+        ];
+      }
+      return confirmSheet(mode === "replace" ? "Replace everything on this box?" : "Merge this backup in?",
+                          lines, mode === "replace" ? "Erase & import" : "Merge",
+                          mode === "replace").then(function (ok) {
+        if (!ok) { setMsg(imMsg, ""); return; }
+        clear(log);
+        log.classList.remove("hidden");
+        imProg.classList.remove("hidden");
+        imBar.style.width = "0%";
+        setMsg(imMsg, "Importing…");
+        $$("button", preview).forEach(function (b) { b.disabled = true; });
+        file.disabled = true;
+        return runImport(bundle, mode, !!radioOpt.input.checked, function (done, total, text) {
+          imBar.style.width = Math.round(done * 100 / Math.max(1, total)) + "%";
+          if (text) setMsg(imMsg, text + " " + done + "/" + total);
+        }, logLine).then(function (rep) {
+          imBar.style.width = "100%";
+          return finish(rep, mode);
+        });
+      });
+    }).catch(function (e) {
+      setMsg(imMsg, "Import failed: " + e.message, "err");
+    }).then(function () {
+      file.disabled = false;
+      $$("button", preview).forEach(function (b) { b.disabled = false; });
+    });
+  }
+
+  function showPreview(bundle) {
+    clear(preview);
+    var dev = bundle.device || {};
+    var when = fmtEpoch(numOr(bundle.exported_at, 0));
+    add(preview, el("div", "note ok",
+      "From “" + (dev.hostname || "an unnamed box") + "”" +
+      (dev.version ? ", firmware " + dev.version : "") +
+      (when ? ", exported " + when : "") + "."));
+    var dl = el("dl", "kv");
+    [["Signals", String(bundle.signals.length)],
+     ["Nodes", String(bundle.graph.nodes.length)],
+     ["Links", String(bundle.graph.links.length)],
+     ["Radio settings", bundle.radio ? "included (optional below)" : "not in this file"]
+    ].forEach(function (kv) {
+      add(dl, el("dt", null, kv[0]), el("dd", null, kv[1]));
+    });
+    add(preview, dl);
+    if (bundle.radio) add(preview, radioOpt);
+
+    add(preview, el("p", "small muted",
+      "Signal and node numbers are re-assigned by this box, and the graph is rewritten to " +
+      "match as it is imported. A node whose signal cannot be imported is created unbound " +
+      "and switched off rather than pointed at whatever happens to have that number here."));
+
+    var row = el("div", "btnrow");
+    var merge = el("button", "btn primary", "Merge");
+    merge.type = "button";
+    merge.addEventListener("click", function () { start("merge"); });
+    var repl = el("button", "btn danger", "Replace everything");
+    repl.type = "button";
+    repl.addEventListener("click", function () { start("replace"); });
+    add(row, merge, repl);
+    add(preview, row);
+    add(preview, el("div", "hint",
+      "Merge adds to what is here. Replace erases this box's signals and graph first — " +
+      "capacity is checked before anything is deleted."));
+  }
+
+  file.addEventListener("change", function () {
+    resetPreview();
+    var f = file.files && file.files[0];
+    if (!f) return;
+    if (f.size > 4 * 1024 * 1024) {
+      setMsg(imMsg, "That file is " + Math.round(f.size / 1048576) + " MB. A full backup is " +
+                    "well under one — that is not a Klingelbox backup.", "err");
+      return;
+    }
+    setMsg(imMsg, "Reading " + f.name + "…");
+    var fr = new FileReader();
+    fr.onerror = function () { setMsg(imMsg, "Could not read that file.", "err"); };
+    fr.onload = function () {
+      var b;
+      try { b = JSON.parse(fr.result); }
+      catch (e) { setMsg(imMsg, "That file is not valid JSON, so it cannot be a backup.", "err"); return; }
+      var bad = validateBundle(b);
+      if (bad) { setMsg(imMsg, bad, "err"); return; }
+      loaded = b;
+      setMsg(imMsg, "");
+      showPreview(b);
+    };
+    fr.readAsText(f);
+  });
+
+  /* The running list sits ABOVE the summary, so "see the list above" is true
+     and the last thing on the page is the verdict. */
+  add(body, preview, imProg, log, imMsg);
   return s;
 }
 
@@ -6180,6 +6776,72 @@ function buildHandbook() {
     "verdict line: it says which of the four thresholds threw your remote away. The section " +
     "above walks through it."));
   add(root, s7);
+
+  /* ------------------------------------------------- 8. moving to a new box */
+  var s8 = hbSection("backup", "Moving a box's configuration",
+    "Backup, restore, and replacing a box without teaching it everything again.");
+  var b8 = s8.bodyEl;
+  hbPs(b8, [
+    "Settings › Backup writes one file that holds everything this box has LEARNED: every " +
+    "stored waveform, and the whole node graph with its wiring. Restore it here to undo a bad " +
+    "afternoon, or on a second Klingelbox to move a working setup across.",
+    "The file holds no passwords. Not the Wi-Fi passphrase, not the hotspot password, not the " +
+    "MQTT credentials — not even hashes of them. A backup is a thing you email to yourself and " +
+    "leave in a cloud folder, so it carries what the doorbell KNOWS and never what it can LOG " +
+    "IN TO. Network and broker settings are typed in again on the new box, once."
+  ]);
+
+  add(b8, hbH("Moving to a new box, in order"));
+  add(b8, hbList([
+    "On the old box: Settings › Backup › Export backup file. It downloads as " +
+    "klingelbox-<name>-<date>.json.",
+    "Flash and set up the new box far enough that you can reach its web UI — Wi-Fi, and a " +
+    "hostname if you want one.",
+    "On the new box: Settings › Backup › Restore, choose the file, and read what it says the " +
+    "file contains.",
+    "Choose Replace on a fresh box (it has nothing to lose), or Merge to add this backup " +
+    "alongside what is already there.",
+    "Set up MQTT again if you use it, and re-pair any of your own chimes that were paired to a " +
+    "synthesized code — the code itself moved, but the chime is still listening for the old box."
+  ], true));
+
+  add(b8, hbH("Merge or Replace"));
+  add(b8, hbKV([
+    ["Merge", "Adds the backup to what is already here. Nothing is deleted. Signals you " +
+              "already have come in a second time — a merge cannot tell a re-import from a " +
+              "second doorbell."],
+    ["Replace", "Deletes every stored signal and every node on this box first, then imports. " +
+                "It cannot be undone, and it asks first, naming exactly what goes."]
+  ]));
+  add(b8, hbNote(
+    "Whether it will FIT is checked before anything is deleted. A box holds 32 signals, 24 " +
+    "nodes and 48 links; if the arithmetic does not work the import is refused with the numbers " +
+    "and your box is left exactly as it was."));
+
+  add(b8, hbH("Numbers change, and that is handled"));
+  hbPs(b8, [
+    "Signals and nodes are numbered by whichever box they live on, so a graph carried over " +
+    "from another box would point at the wrong things — or at nothing. The restore renumbers " +
+    "as it goes: signals first, then nodes pointed at their new signal numbers, then links " +
+    "pointed at their new node numbers.",
+    "If a signal could not be imported, the nodes that used it are still created — unbound and " +
+    "switched off, and listed in the summary. Their wiring is the laborious part to rebuild by " +
+    "hand, and a node you can see and re-point is far better than one silently bound to " +
+    "whatever else happened to have that number here."
+  ]);
+  add(b8, hbNote(
+    "A restore is not one single operation — it cannot be, on a box with this little memory, " +
+    "because the whole file never fits in it at once. So it reports as it runs and tells you " +
+    "the truth at the end: how many signals, nodes and links went in, and what was skipped and " +
+    "why. If it stops half way, what got in stays in.", "warn"));
+
+  add(b8, hbH("Radio settings"));
+  add(b8, hbP(
+    "Frequency, bandwidth, transmit power and repeat counts travel in the file too, but they " +
+    "are OFF by default when you restore. They describe how a particular box behaves, with a " +
+    "particular antenna, and the new one may not be the same build. Tick the box only if you " +
+    "meant to copy them."));
+  add(root, s8);
 }
 
 /* ======================================================================

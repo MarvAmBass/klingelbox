@@ -140,6 +140,19 @@ static db_config_t *s_cfg;   /* live config, owned by app_main */
  * OTA uploads, which are streamed and never go through read_body(). */
 #define BODY_MAX 4096
 
+/*
+ * POST /api/signals/import gets its own, larger ceiling.
+ *
+ * One imported signal is a whole rf_frame_t written out as JSON: 512 durations
+ * of up to five digits plus separators is ~3.1 KB before the name and the rest
+ * of the envelope. BODY_MAX would *just* fit that today and would start
+ * silently rejecting perfectly valid signals the moment a field is added, so
+ * the ceiling that route needs is stated where it can be seen. It is still
+ * small on purpose — see api_signal_import() for why a backup never arrives as
+ * one document.
+ */
+#define IMPORT_BODY_MAX 8192
+
 /* ------------------------------------------------------------------ helpers */
 
 /* Serialize and send `root`, then FREE IT. Every response path funnels through
@@ -215,10 +228,10 @@ static esp_err_t send_esp_err(httpd_req_t *req, esp_err_t err, const char *what)
 }
 
 /* Read the whole (bounded) request body into a NUL-terminated heap buffer. */
-static char *read_body(httpd_req_t *req)
+static char *read_body_max(httpd_req_t *req, int max)
 {
     int total = req->content_len;
-    if (total < 0 || total > BODY_MAX) return NULL;
+    if (total < 0 || total > max) return NULL;
     char *buf = malloc((size_t)total + 1);
     if (!buf) return NULL;
     int off = 0, timeouts = 0;
@@ -238,14 +251,19 @@ static char *read_body(httpd_req_t *req)
 /* Parse the body as JSON. An EMPTY body is accepted as an empty object, because
  * API.md documents several routes as taking `{}` and browsers happily POST
  * nothing at all. Returns NULL only for genuinely malformed input. */
-static cJSON *read_json(httpd_req_t *req)
+static cJSON *read_json_max(httpd_req_t *req, int max)
 {
     if (req->content_len == 0) return cJSON_CreateObject();
-    char *body = read_body(req);
+    char *body = read_body_max(req, max);
     if (!body) return NULL;
     cJSON *j = cJSON_Parse(body);
     free(body);
     return j;
+}
+
+static cJSON *read_json(httpd_req_t *req)
+{
+    return read_json_max(req, BODY_MAX);
 }
 
 /* True when `uri` is exactly `path`, ignoring any query string. */
@@ -601,6 +619,16 @@ static const char *origin_str(uint8_t origin)
     }
 }
 
+/* The inverse, for POST /api/signals/import. An unrecognised (or absent) word
+ * becomes DB_ORIGIN_IMPORTED rather than an error: the origin is provenance
+ * trivia, and refusing a whole waveform over it would be absurd. */
+static db_signal_origin_t origin_from_str(const char *s)
+{
+    if (s && strcmp(s, "captured") == 0)    return DB_ORIGIN_CAPTURED;
+    if (s && strcmp(s, "synthesized") == 0) return DB_ORIGIN_SYNTHESIZED;
+    return DB_ORIGIN_IMPORTED;
+}
+
 /*
  * The decoded summary line. rf_decoded_t carries its own `text`, but the
  * resident metadata does not keep it (80 bytes each is the whole point of the
@@ -892,6 +920,156 @@ static esp_err_t api_signal_virtual(httpd_req_t *req)
 
     const db_signal_meta_t *m = db_signals_get(id);
     if (!m) return send_error(req, "500 Internal Server Error", "signal vanished after creation");
+    return send_json(req, signal_json(m), "200 OK");
+}
+
+/*
+ * POST /api/signals/import — create ONE signal from raw pulses.
+ *
+ *   {"name":"Front door","first_level":1,"durations_us":[919,273,...],
+ *    "origin":"captured"}
+ *
+ * ONE SIGNAL PER REQUEST. THIS IS THE DESIGN, NOT A MISSING FEATURE.
+ *
+ * The obvious shape for backup/restore is a single POST /api/backup that takes
+ * the whole bundle. Do not "simplify" this into that. The numbers, measured on
+ * the live box: free heap is ~126 KB, and a full backup of a filled store is
+ * ~86 KB of JSON (32 signals x ~2.7 KB of durations_us, plus the graph). cJSON
+ * needs the body string AND a parse tree of two to three times the document
+ * live at the same moment, so a whole-bundle endpoint would ask for ~300 KB on
+ * a box that has 126 KB — while Wi-Fi buffers and an open HTTP connection are
+ * also holding heap. It would not be slow. It would OOM.
+ *
+ * So the browser orchestrates and the firmware never holds the document:
+ *
+ *   export — the UI assembles the bundle client-side out of GET /api/signals,
+ *            GET /api/signals/{id} (already streamed, precisely because one
+ *            waveform is already big) and GET /api/graph, and saves it with a
+ *            Blob. There is deliberately no export endpoint at all.
+ *   import — the UI parses the file and replays it one item at a time through
+ *            this route and the graph routes that already exist. Every request
+ *            stays a few KB, and every one of them is a path that was already
+ *            tested by ordinary use.
+ *
+ * The cost of that choice is that an import is not atomic; the UI pays it by
+ * reporting truthfully what got in and what did not. The cost of the other
+ * choice is that the feature cannot exist on this hardware.
+ *
+ * WHY db_signals_add_frame() AND NOT A METADATA COPY. Only the waveform is
+ * carried over the wire. Base width, confidence, fingerprint and the decode are
+ * re-derived here from the pulses, exactly as they are for a frame that just
+ * came off the air — so an imported signal is not merely similar to a locally
+ * learned one, it is produced by the same code and is indistinguishable from
+ * one. Trusting the exporter's fingerprint instead would let a stale or
+ * hand-edited file poison db_signals_match().
+ */
+static esp_err_t api_signal_import(httpd_req_t *req)
+{
+    /* Checked before reading rather than letting read_json_max() return NULL,
+     * so an oversized body gets its own sentence instead of "invalid JSON". */
+    if (req->content_len > (size_t)IMPORT_BODY_MAX) {
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+                 "that is %u bytes for one signal; the limit is %d. This route takes a "
+                 "single waveform, not a whole backup file — import the signals one at a time.",
+                 (unsigned)req->content_len, IMPORT_BODY_MAX);
+        return send_error(req, "413 Payload Too Large", msg);
+    }
+
+    cJSON *j = read_json_max(req, IMPORT_BODY_MAX);
+    if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
+
+    const char *raw = NULL;
+    char name[DB_SIGNAL_NAME_MAX] = "";
+    if (json_str(j, "name", &raw)) trim_copy(raw, name, sizeof(name));
+    if (!name[0]) {
+        cJSON_Delete(j);
+        return send_error(req, "400 Bad Request", "name must be a non-empty string");
+    }
+
+    const char *os = NULL;
+    json_str(j, "origin", &os);
+    db_signal_origin_t origin = origin_from_str(os);
+
+    const cJSON *arr = cJSON_GetObjectItem(j, "durations_us");
+    if (!cJSON_IsArray(arr)) {
+        cJSON_Delete(j);
+        return send_error(req, "400 Bad Request",
+                          "durations_us must be an array of pulse widths in microseconds");
+    }
+    int n = cJSON_GetArraySize(arr);
+    if (n <= 0) {
+        cJSON_Delete(j);
+        return send_error(req, "400 Bad Request",
+                          "durations_us is empty — there is no waveform to store");
+    }
+    if (n > RF_FRAME_MAX_PULSES) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "a signal holds at most %d pulses and this one has %d",
+                 RF_FRAME_MAX_PULSES, n);
+        cJSON_Delete(j);
+        return send_error(req, "400 Bad Request", msg);
+    }
+
+    /* 1 KB on the heap, not on the httpd worker's stack — same rule as every
+     * other frame in this file. */
+    rf_frame_t *frame = malloc(sizeof(*frame));
+    if (!frame) {
+        cJSON_Delete(j);
+        return send_error(req, "500 Internal Server Error", "out of memory");
+    }
+    rf_frame_reset(frame);
+
+    double d;
+    /* Levels alternate by construction (rf_frame.h), so first_level is the only
+     * thing that says whether the burst opens keyed or silent. Anything other
+     * than 0 reads as 1 rather than being rejected: it is a single bit. */
+    frame->first_level = (json_num(j, "first_level", &d) && (int)d != 0) ? 1 : 0;
+
+    const cJSON *it = NULL;
+    int i = 0;
+    cJSON_ArrayForEach(it, arr) {
+        /* A zero-width pulse is not a conservative value to let through: it
+         * would go straight into base-width estimation, which divides by it. */
+        if (!cJSON_IsNumber(it) || it->valuedouble < 1.0 || it->valuedouble > 65535.0) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "durations_us[%d] is not a pulse width between 1 and 65535 microseconds",
+                     i);
+            free(frame);
+            cJSON_Delete(j);
+            return send_error(req, "400 Bad Request", msg);
+        }
+        frame->durations_us[i++] = (uint16_t)it->valuedouble;
+    }
+    frame->count = (uint16_t)i;
+    cJSON_Delete(j);
+
+    uint16_t id = 0;
+    esp_err_t err = db_signals_add_frame(frame, NULL, name, origin, &id);
+    uint16_t stored = frame->count;
+    free(frame);
+
+    /* 507, not the store's 409: the request is correct in every way and the box
+     * simply has no room left, which is a different thing for a UI to say — and
+     * an importer walking a bundle needs to tell "this one signal was rejected"
+     * apart from "stop, nothing more will fit". */
+    if (err == ESP_ERR_NO_MEM) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "the signal store is full (%d signals). Delete a signal you no longer "
+                 "need, then import this one again.", DB_SIGNAL_MAX);
+        return send_error(req, "507 Insufficient Storage", msg);
+    }
+    if (err != ESP_OK) return send_esp_err(req, err, "could not store the imported signal");
+
+    db_mqtt_on_signals_changed();
+
+    const db_signal_meta_t *m = db_signals_get(id);
+    if (!m) return send_error(req, "500 Internal Server Error", "signal vanished after creation");
+    db_events_push(DB_EV_LEARN, id, 0, 0, 0, "imported \"%s\" (%u pulses)",
+                   name, (unsigned)stored);
     return send_json(req, signal_json(m), "200 OK");
 }
 
@@ -2587,6 +2765,7 @@ static esp_err_t post_router(httpd_req_t *req)
     if (uri_is(u, "/api/radio"))            return api_radio_post(req);
 
     if (uri_is(u, "/api/signals/virtual"))  return api_signal_virtual(req);
+    if (uri_is(u, "/api/signals/import"))   return api_signal_import(req);
     if (uri_starts(u, "/api/signals/")) {
         uint16_t id = path_id(u, "/api/signals/", tail, sizeof(tail));
         if (id && !tail[0])                       return api_signal_rename(req, id);

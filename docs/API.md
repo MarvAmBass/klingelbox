@@ -121,6 +121,114 @@ nibbles is an ordinary multi-button remote and is accepted without comment.
 code you have captured as a *synthesized* one, e.g. to check that the box can
 generate a code it can otherwise only replay.
 
+### `POST /api/signals/import`
+Creates **one** signal from raw pulses. This is the restore half of backup /
+restore (see [Backup bundles](#backup-bundles) below).
+
+```json
+{ "name": "Front door", "first_level": 1, "durations_us": [919,273,297],
+  "origin": "captured" }
+```
+
+| field | required | meaning |
+|---|---|---|
+| `name` | yes | non-empty, trimmed, truncated to 32 bytes |
+| `durations_us` | yes | 1..512 pulse widths, each 1..65535 µs, strictly alternating levels |
+| `first_level` | no | level of `durations_us[0]`; 0 or 1, default 0 |
+| `origin` | no | `captured` / `synthesized` / `imported`; anything else, or absent, becomes `imported` |
+
+Returns the created signal, in exactly the shape `GET /api/signals/{id}` reports
+it (without the waveform).
+
+**Only the waveform crosses the wire.** `base_us`, `confidence`, `fingerprint`
+and the decode are re-derived here from the pulses by the same code that
+analyses a burst arriving off the air — so an imported signal is not merely
+similar to a locally learned one, it is produced identically and matches
+identically. A `fingerprint` in the request body is ignored; trusting a
+hand-edited one would poison matching.
+
+* **400** — bad name, missing/empty `durations_us`, more than 512 pulses, or a
+  duration outside 1..65535 µs (the message names the offending index).
+* **413** — body over 8192 bytes. This route takes one waveform, not a file.
+* **507** — the signal store is full (32 signals).
+
+---
+
+## Backup bundles
+
+Moving a box's learned signals and its node graph to another box is done **by
+the client**, out of endpoints that already exist. There is deliberately **no
+`GET /api/backup` and no `POST /api/backup`**.
+
+**Why.** Free heap on the device is ~126 KB. A full backup of a filled store is
+~86 KB of JSON (32 signals × ~2.7 KB of `durations_us`, plus the graph), and
+cJSON needs the body string *and* a parse tree of two to three times the
+document live simultaneously — roughly 300 KB, on a box that has 126 KB, while
+Wi-Fi buffers and an open HTTP connection also hold heap. A whole-bundle
+endpoint would not be slow; it would run the box out of memory. So the firmware
+never holds the document, and the client streams it in and out one item at a
+time. Please do not "simplify" this into a single endpoint.
+
+**Export** — assemble client-side:
+
+1. `GET /api/signals` for the list.
+2. `GET /api/signals/{id}` per signal, for `first_level` + `durations_us`
+   (already a chunked, streamed response for the same memory reason).
+3. `GET /api/graph` for nodes and links.
+
+**Import** — replay item by item, and **remap ids in this order**, because a
+graph from another box references signal ids and node ids that will not exist
+here:
+
+1. `POST /api/signals/import` per signal → record `old signal id → new id`.
+2. `POST /api/graph/nodes` per node, with `signal_id` rewritten through that map
+   → record `old node id → new node id`.
+3. `POST /api/graph/links` per link, with **both** `from` and `to` rewritten.
+
+A node whose signal did not import must not be created carrying a dangling
+`signal_id`. The web UI's importer creates it **unbound** (`signal_id: 0`,
+`enabled: false`) and says so in the summary, rather than dropping the node and
+silently losing its wiring.
+
+An import is **not atomic** — it cannot be, given the above. A client must
+report what actually got in.
+
+### Bundle format
+
+```json
+{ "kind": "klingelbox-backup", "version": 1,
+  "exported_at": 1756600000,
+  "device": { "hostname": "klingelbox", "version": "0.1.0", "idf": "v5.3.1" },
+  "radio": { "freq_hz": 433920000, "modulation": "ook", "datarate_bps": 5000,
+             "bandwidth_hz": 203000, "tx_power_dbm": 10,
+             "tx_repeats": 6, "tx_gap_us": 8000 },
+  "signals": [ { "id": 1, "name": "Front door", "origin": "captured",
+                 "first_level": 1, "durations_us": [919,273] } ],
+  "graph": { "nodes": [ { "id": 1, "type": "signal.rx", "signal_id": 1, "...": "..." } ],
+             "links": [ { "from": 1, "to": 2 } ] } }
+```
+
+`kind` and `version` are checked before anything is written: an unknown `kind`
+or a `version` newer than the reader is refused with a sentence rather than
+imported approximately. The `id` fields inside `signals` and `graph.nodes` are
+the *source* box's ids and exist only so the remapping above can be performed;
+they are never restored as-is.
+
+`device` is descriptive only — it is shown to the user before an import and is
+otherwise ignored.
+
+`radio` is the settable subset of `GET /api/radio` — the live `rssi_dbm` reading
+is a measurement, not a setting, and is left out. It is **optional on import**
+and off by default in the UI: frequency, bandwidth, TX power and repeat counts
+are device *behaviour*, not identity, and the receiving box may be a different
+build with a different antenna. When accepted it is applied with one
+`POST /api/radio`.
+
+**A bundle carries no secrets.** No Wi-Fi SSID or passphrase, no AP password, no
+MQTT host or credentials — not even hashes. A backup is a file that gets mailed
+around and dropped in cloud folders; it holds what a doorbell *knows*, never
+what it can *log in to*. Re-enter network and broker settings on the new box.
+
 ---
 
 ## Listening sessions

@@ -420,6 +420,7 @@ Five tabs, plus the recovery wizard that replaces the whole page.
 | ↳ *node editor, signal inline* | `/api/signals`, `/api/signals/{id}` (GET/POST), `/api/signals/{id}/transmit` |
 | **Settings** | `/api/config`, `/api/ap`, `/api/radio`, `/api/wifi/scan`, `/api/system/hostname`, `/api/ota*`, `/api/update*`, `/api/restart` |
 | ↳ *Stored signals* | `/api/signals`, `/api/signals/{id}` (GET/POST/DELETE), `/api/signals/{id}/transmit`, `/api/graph` (to say who uses what) |
+| ↳ *Backup* — export/import | export: `/api/system`, `/api/radio`, `/api/signals`, `/api/signals/{id}`, `/api/graph`. import: `/api/signals/import`, `/api/graph/nodes` (POST/DELETE), `/api/graph/links`, `/api/signals/{id}` (DELETE), `/api/radio` (optional) |
 | **Diagnostics** | `/api/diagnostics` |
 | **Recovery wizard** | `/api/system`, `/api/wifi/scan`, `/api/wifi` |
 
