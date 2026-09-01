@@ -16,6 +16,8 @@ written against this document; neither may invent endpoints.
   `error` is always a **human sentence** — an `ESP_ERR_*` constant is never part
   of it. A few failures add machine-readable fields next to the sentence; those
   are documented at the endpoint that produces them.
+* A response that is too large to build on the free heap is a **503** with an
+  `error` sentence, never a silently empty body.
 * `POST` bodies are JSON unless stated otherwise (the OTA upload routes take raw
   binary).
 
@@ -121,25 +123,210 @@ generate a code it can otherwise only replay.
 
 ---
 
-## Learn mode
+## Listening sessions
 
-The receiver always listens; learn mode only decides whether an *unrecognized*
-burst is offered for registration.
+**There is no `/api/learn` any more.** It was removed, not renamed: it admitted
+an unrecognized burst as a candidate only when it repeated at least twice *and*
+normalized to at least 65 % confidence, and both numbers were measured on
+EV1527-class remotes. That made it, in effect, an endpoint for one protocol
+family — a transmitter of any other shape produced no candidate at all and no
+explanation either, which is the opposite of what this box promises.
 
-### `GET /api/learn`
+Registering a button now goes through a **listening session** under `/api/raw`,
+which was already the permissive, protocol-agnostic recorder. Detection keeps
+everything; what the box does instead is **rank**:
+
+* the number of times a waveform was heard **dominates** the order, because a
+  real remote repeats itself and band noise does not — and counting that
+  requires no knowledge of any protocol;
+* a decoded protocol and a high normalization confidence raise a candidate
+  further, but only ever as a tie-break. **An undecoded candidate is
+  first-class**: it can rank first, and it saves, replays and matches exactly
+  like a decoded one.
+
+Saving a candidate produces an ordinary stored signal with `origin: "captured"`,
+indistinguishable from any other in `GET /api/signals`.
+
+---
+
+## Listening / raw sessions
+
+A time-boxed recording of **everything the radio hears**, with the filters that
+normally sit in front of the receiver relaxed. It exists because those filters
+encode assumptions that are correct for EV1527-class remotes and may be wrong
+for anything else, and a transmitter that violates one of them is not merely
+mis-decoded — it is *invisible*, with nothing said about it anywhere.
+
+| filter | normal path | raw session |
+|---|---|---|
+| RSSI squelch | −75 dBm, fixed | `rssi_floor_dbm`, default −80, `-120` = off |
+| minimum frame length | 32 pulses | `min_pulses`, 2–64, default 4 |
+| frame boundary (idle) | 8000 µs, fixed | `idle_us`, 1000–32000, default 8000 |
+| burst coalescing | 250 ms window, fuzzy merge | none — every frame kept separately |
+
+A session holds **32 frames in RAM, never flash**, and stops when the slots are
+full or the time runs out, whichever comes first. Stopping does **not** free the
+frames — you cannot trim what has been freed — so the memory goes back on
+`DELETE /api/raw`, when the next session starts, or after 10 minutes with no
+`GET /api/raw`.
+
+While a session runs the box keeps working normally: only frames that would have
+passed the *ordinary* thresholds are still routed to the node graph, so noise
+recorded here can never fire a node.
+
+`from` / `to` are **zero-based indices into `durations_us`**, `from` inclusive
+and `to` exclusive (`Array.prototype.slice` semantics). `to: 0` means "to the
+end". Levels alternate, so a slice starting on an odd index starts on the
+opposite level; `first_level` is adjusted for you.
+
+### `POST /api/raw/start` — all fields optional
 ```json
-{ "active": true, "remaining_s": 42,
-  "candidate": { "fingerprint":"...", "base_us":292, "confidence":88,
-                 "pulse_count":49, "repeats":4, "rssi_dbm":-31,
-                 "decoded": { "protocol":"ev1527", "id":681562, "button":8,
-                              "text":"EV1527 id=0xA685A btn=0x8" } } }
+{ "seconds": 30, "idle_us": 8000, "min_pulses": 4, "rssi_floor_dbm": -80 }
 ```
-`candidate` is `null` until a qualifying burst arrives (needs `repeats >= 2` and
-`confidence >= 65` — noise measured 24-28%, real presses 67-92%).
+Out-of-range values are clamped, not rejected. Returns the session state below.
+**409** if a session is already running, **503** with no radio, and **503** with
+a sentence about memory if the ~36 KB of frame slots cannot be allocated (in
+which case nothing is allocated and capture is left exactly as it was).
 
-### `POST /api/learn/arm` — `{"timeout_s":60}` (optional)
-### `POST /api/learn/cancel` — `{}`
-### `POST /api/learn/accept` — `{"name":"Front door"}` → the created signal. 409 if no candidate.
+### `POST /api/raw/stop` — `{}` → the session state. Stops recording, keeps the frames.
+### `DELETE /api/raw` — `{}` → `{"ok":true}`. Stops if needed, then frees the frames.
+
+### `GET /api/raw`
+```json
+{ "running": true, "held": true, "elapsed_s": 3, "remaining_s": 27,
+  "count": 2, "capacity": 32, "stop_reason": "",
+  "settings": { "seconds": 30, "idle_us": 8000, "min_pulses": 4,
+                "rssi_floor_dbm": -80, "squelch_off": false },
+  "dropped": { "below_floor": 118, "too_short": 39, "too_long": 0,
+               "overruns": 0, "no_room": 0 },
+  "radio": { "heard": 2, "carrier_seen": true, "peak_rssi_dbm": -41,
+             "quiet_rssi_dbm": -85, "present": true },
+  "fragmentation": { "detected": true, "runs": 3, "frames": 6, "rejoined": 1,
+                     "max_gap_us": 11800, "suggest_idle_us": 36000 },
+  "candidates_total": 12,
+  "candidates": [ { "id": 1, "seen": 3, "merged": false, "pulse_count": 49,
+                    "airtime_us": 24310, "base_us": 292, "confidence": 88,
+                    "rssi_dbm": -41, "score": 3714, "age_s": 1.2,
+                    "truncated": false, "frames": [1,3,5],
+                    "why": "seen 3 times, decoded ev1527, 88% confidence",
+                    "decoded": { "protocol":"ev1527", "id":681562, "button":8,
+                                 "text":"EV1527 id=0xA685A btn=0x8" } } ],
+  "limits": { "seconds_min": 5, "seconds_max": 300, "idle_us_min": 1000,
+              "idle_us_max": 32000, "min_pulses_min": 2, "min_pulses_max": 64,
+              "rssi_off_dbm": -120, "max_pulses": 512, "normal_squelch_dbm": -75 },
+  "frames": [ { "index": 1, "ts_s": 16, "age_s": 3.29, "pulse_count": 49,
+                "rssi_dbm": -41, "airtime_us": 24310, "base_us": 292,
+                "confidence": 88, "truncated": false,
+                "decoded": { "protocol":"ev1527", "id":681562, "button":8,
+                             "text":"EV1527 id=0xA685A btn=0x8" } } ] }
+```
+`held` is true whenever frames are in memory, running or not. `stop_reason` is
+`""`, `"full"`, `"time"`, `"user"` or `"radio"`.
+
+**The `dropped` object is the diagnostic**, and it is split by cause on purpose:
+"nothing was received" and "something was received but did not fit our
+assumptions" are completely different faults and only the second one is fixable
+by trimming. `too_long` counts frames that hit the 512-pulse ceiling and were
+therefore thrown away whole — a truncated recording would replay as a different
+waveform. `radio.carrier_seen` plus `peak_rssi_dbm` answer "did the radio see
+*any* energy", which is what separates a wrong frequency or a missing antenna
+from a wrong threshold. `peak_rssi_dbm`/`quiet_rssi_dbm` are `null` until the
+band has been sampled at least once.
+
+`decoded` is `null` for an unknown protocol — the ordinary, fully supported
+state. A raw session changes what *reaches* the decoders, never what they do.
+
+`index` is 1-based and stable for the life of the session.
+
+### Candidates — the ranked list
+
+`candidates` is the list a UI should build its screen around; `frames` is the
+unranked raw material underneath it, kept so grouping can never hide anything.
+
+`GET /api/raw` embeds only the **top 10**, because a full session already holds
+~43 KB and the state + every candidate + every frame will not fit beside it.
+`candidates_total` is the real count, so a truncated list is never mistaken for
+a complete one. `GET /api/raw/candidates` returns all of them (with no frame
+array), and that is the endpoint to use when the count matters.
+
+Every frame becomes a candidate. Frames that are the same waveform repeated are
+collapsed into one candidate with `seen` counting the repeats. **Nothing is
+filtered**: a candidate seen once, with `confidence: 0` and `decoded: null`, is
+still listed and still fully usable.
+
+| field | meaning |
+|---|---|
+| `id` | 1-based **rank**. Stable only while no new frame arrives, i.e. after the session stops. |
+| `seen` | how many times this waveform was heard — the dominant ranking term |
+| `merged` | true when this was assembled from fragments rather than heard whole |
+| `frames` | the frame `index` values it is built from (one, unless `merged`) |
+| `gaps_us` | present when `merged`: the **measured** silence before each piece |
+| `score` | the ranking number. Exposed for debugging; `why` is what to show a human. |
+| `why` | e.g. `"seen 5 times, decoded ev1527, 92% confidence"` |
+| `decoded` | `null` for an unknown protocol, which is an ordinary supported state |
+
+The weights guarantee that **one extra repeat outranks every decode and
+confidence bonus combined**, so a candidate no decoder understands legitimately
+sits above a pristine decoded one that was heard fewer times.
+
+### Fragmentation — a diagnosis, not a statistic
+
+A frame ends after `idle_us` of silence. Set that shorter than a transmitter's
+own inter-word gap and **one press arrives as several dissimilar pieces**, none
+of which replays the whole thing. `fragmentation.detected` says that happened.
+The test is deliberately narrow: the silence between two frames was no more than
+twice `idle_us` (so the threshold cut it rather than the transmitter stopping)
+**and** the two frames are not similar to each other (identical neighbours are
+honest repeats, not fragments).
+
+`suggest_idle_us` is what `idle_us` should become — derived from the widest gap
+actually measured, not from a table — and is `null` when there is nothing to
+suggest. `rejoined` counts the runs that were stitched back into a candidate of
+their own, using the measured gaps rather than an invented one; those appear in
+`candidates` with `merged: true`.
+
+### `GET /api/raw/candidates`
+The **complete** ranked list on its own, for a client that does not want the
+frame array — and the endpoint to use when a session is full:
+```json
+{ "running": false, "count": 6, "candidates_total": 12, "candidates": [ ... ] }
+```
+
+### `GET /api/raw/candidates/{n}`
+One candidate as above, plus its waveform (streamed):
+```json
+{ "id": 1, "...": "...", "first_level": 0, "durations_us": [919,273,297,...] }
+```
+For a `merged` candidate this is the **stitched-together whole**, so what you
+inspect is what `/transmit` sends and what `/save` stores. **404** if there is no
+such candidate; **409** if it could not be assembled.
+
+### `POST /api/raw/candidates/{n}/transmit`
+### `POST /api/raw/candidates/{n}/save`
+Identical bodies, semantics and status codes to the `/api/raw/{i}` forms below,
+operating on the candidate's waveform instead of one recorded frame.
+
+### `GET /api/raw/{i}`
+One frame as above, plus its waveform (streamed, like `GET /api/signals/{id}`):
+```json
+{ "index": 1, "...": "...", "first_level": 0, "durations_us": [919,273,297,...] }
+```
+**404** if there is no such frame in the current session.
+
+### `POST /api/raw/{i}/transmit` — `{"from":0,"to":50,"repeats":6,"gap_us":8000}` (all optional)
+Replays the frame, or the selected pulses of it, **without storing anything** —
+the fast loop for "does this actually trigger the bell?". Same `gap_us`
+semantics and the same software-level-success caveat as
+`POST /api/signals/{id}/transmit`. **503** with no radio, **404** for an unknown
+frame or an empty selection.
+
+### `POST /api/raw/{i}/save` — `{"name":"Front door","from":0,"to":50}`
+Stores the (optionally trimmed) frame as an ordinary signal with
+`origin: "captured"`, and returns it in the `GET /api/signals` shape. The store
+re-analyses it exactly as it would any registration, so a trim that turns out to
+be a known protocol acquires its decoded identity at this point. **400** without
+a name, **404** for an unknown frame or an empty selection, **409** when the
+signal store is full.
 
 ---
 
@@ -392,7 +579,8 @@ Newest first. `serial` lets the UI poll cheaply and skip re-rendering.
     "rssi_dbm": -31, "repeats": 4, "text": "Front door" } ] }
 ```
 `kind`: `rf_unmatched`, `button_press`, `wired_press`, `node_fired`,
-`transmit`, `learn`, `system`.
+`transmit`, `learn`, `system`. (`learn` is a wire name kept for compatibility;
+it means "a signal was registered".)
 
 ### MQTT sink payloads carry the trigger
 A `sink.mqtt` publishes what CAUSED it to fire, not merely that it fired:

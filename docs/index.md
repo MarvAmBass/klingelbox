@@ -39,9 +39,14 @@ The practical consequence is the thing most 433 MHz projects cannot do:
 
 ## What you can do with it
 
-- **Register your doorbell buttons** in a learn mode that ignores noise (a real press and
-  the receiver's own AGC noise are ~50 dB apart in signal strength — the box uses that,
-  not pulse counts, to tell them apart).
+- **Register your doorbell buttons** by listening: the box keeps everything it hears and
+  ranks it, most likely first. Repetition is what does the ranking — a real remote sends
+  the same word several times and noise never does — so a protocol nothing on the box can
+  decode still lands at the top of the list and still works.
+
+- **See when a threshold is hiding your remote.** If one press arrives cut into pieces,
+  or a burst was thrown away for being too quiet or too short, the box says so and offers
+  the fix, instead of showing you an empty screen.
 - **Replay** any stored signal on demand, from the web UI, the REST API, or a node graph.
 - **Synthesise virtual signals** so you can pair your own chimes to a code the box
   invented, instead of hunting for the remote's.

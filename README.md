@@ -103,12 +103,13 @@ SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.4mb" idf.py build
 firmware/
 ├── components/
 │   ├── cc1101/     chip driver: SPI, registers, async OOK, RSSI. No app knowledge.
-│   └── rfpulse/    pulse frames, RMT capture/replay, normalization, decoders.
+│   └── rfpulse/    pulse frames, RMT capture/replay, normalization, decoders,
+│                    similarity grouping, candidate ranking, fragment rejoin.
 ├── main/
 │   ├── board_pins.h      every GPIO, in one place
 │   ├── db_diag.*         the shared diagnostic vocabulary
 │   ├── rf_service.*      sole radio owner; RX/TX handover, burst coalescing
-│   ├── signal_store.*    persisted signals, matching, learn mode
+│   ├── signal_store.*    persisted signals, matching
 │   ├── node_graph.*      sources → logic → sinks routing engine
 │   ├── event_log.*       recent activity ring for the UI
 │   ├── http_api.*        REST + web UI serving

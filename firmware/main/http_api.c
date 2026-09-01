@@ -16,8 +16,20 @@
  *   DEL  /api/signals/<id>
  *   POST /api/signals/<id>/transmit      {"repeats":6,"gap_us":8000}
  *   POST /api/signals/virtual            synthesize an EV1527 signal
- *   GET  /api/learn                      armed state + pending candidate
- *   POST /api/learn/arm|cancel|accept
+ *   GET  /api/raw                        listening session: state, ranked
+ *                                        candidates, every frame, fragmentation
+ *   POST /api/raw/start|stop             {"seconds":30,"idle_us":8000,...}
+ *   DEL  /api/raw                        free the session's frames
+ *   GET  /api/raw/<i>                    ... plus one frame's waveform (streamed)
+ *   POST /api/raw/<i>/transmit           replay it (optionally trimmed), no save
+ *   POST /api/raw/<i>/save               {"name":"...","from":0,"to":50}
+ *   GET  /api/raw/candidates             the ranked list on its own
+ *   GET  /api/raw/candidates/<n>         one candidate's waveform (streamed)
+ *   POST /api/raw/candidates/<n>/transmit|save    same bodies as /api/raw/<i>
+ *
+ * There is deliberately no /api/learn any more. It was a second, narrower way of
+ * doing the same job, and its admission gate made a whole class of transmitter
+ * invisible; see rf_raw.h. A listening session does both jobs.
  *   GET  /api/graph                      nodes + links
  *   POST /api/graph/nodes                create; POST /api/graph/nodes/<id> update
  *   DEL  /api/graph/nodes/<id>           delete (drops its links)
@@ -93,6 +105,7 @@
 #include "rf_capture.h"
 #include "rf_decode.h"
 #include "rf_frame.h"
+#include "rf_raw.h"
 #include "rf_service.h"
 #include "signal_store.h"
 #include "update_check.h"
@@ -134,11 +147,26 @@ static db_config_t *s_cfg;   /* live config, owned by app_main */
 static esp_err_t send_json(httpd_req_t *req, cJSON *root, const char *status)
 {
     char *body = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    /* Printing only fails when the heap could not hold the string, and the old
+     * behaviour here was to send "{}" — a valid, empty, entirely untrue answer
+     * that a client cannot tell apart from "there is nothing to report". Say so
+     * instead. This is not hypothetical: a full listening session ties up ~43 KB
+     * and its response is the largest this API produces. */
+    if (body == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req,
+            "{\"error\":\"not enough memory to build this response right now. "
+            "Discard the listening session (DELETE /api/raw) or reboot the box.\"}");
+        return ESP_OK;
+    }
+
     httpd_resp_set_status(req, status ? status : "200 OK");
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr(req, body ? body : "{}");
+    httpd_resp_sendstr(req, body);
     cJSON_free(body);
-    cJSON_Delete(root);
     return ESP_OK;
 }
 
@@ -867,94 +895,554 @@ static esp_err_t api_signal_virtual(httpd_req_t *req)
     return send_json(req, signal_json(m), "200 OK");
 }
 
-/* ------------------------------------------------------------------ learn mode */
-
-/*
- * The learn view. The candidate's `repeats` comes from the metadata's
- * seen_count — a pending candidate has been "seen" exactly as many times as the
- * burst repeated, which is the admission evidence signal_store weighs most
- * heavily. `rssi_dbm`/`repeats` come from db_signals_learn_candidate_info(),
- * since they describe one reception rather than the stored signal.
+/* ------------------------------------------------------------------ raw capture
+ *
+ * The escape hatch from every assumption the normal receive path makes. See
+ * rf_raw.h for what a session is and why; this layer only translates.
+ *
+ * TWO THINGS ARE WORTH SAYING HERE RATHER THAN THERE.
+ *
+ * `from`/`to` are indices into `durations_us`, zero-based, `from` inclusive and
+ * `to` exclusive — Array.prototype.slice() semantics, because the UI that sends
+ * them is JavaScript and any other convention would be mistranslated exactly
+ * once. `to: 0` means "to the end", which is the only place the two disagree and
+ * is documented at every endpoint that takes them.
+ *
+ * A trim is applied by rf_raw, not here, because getting `first_level` right for
+ * an odd `from` is a property of the frame and belongs next to the frame.
  */
-static cJSON *learn_json(void)
+
+/* How many ranked candidates GET /api/raw embeds beside the frame array. See
+ * add_candidates() for why this is not "all of them". */
+#define DB_RAW_EMBED_CANDIDATES 10
+
+/* One captured frame, as the session list shows it. The decode is whatever the
+ * ordinary decoders made of it — a raw session changes what REACHES them, never
+ * what they do — so `decoded: null` here means the same thing it means
+ * everywhere else in this API: an unknown protocol, which is fine. */
+static cJSON *raw_frame_json(const db_raw_summary_t *f, int64_t now_us)
 {
-    uint32_t remaining = 0;
-    bool active = db_signals_learn_active(&remaining);
-
     cJSON *o = cJSON_CreateObject();
-    cJSON_AddBoolToObject(o, "active", active);
-    cJSON_AddNumberToObject(o, "remaining_s", (double)remaining);
-
-    db_signal_meta_t cand;
-    int16_t cand_rssi = 0;
-    uint8_t cand_repeats = 0;
-    if (!db_signals_learn_candidate_info(&cand, &cand_rssi, &cand_repeats)) {
-        cJSON_AddNullToObject(o, "candidate");
-        return o;
+    cJSON_AddNumberToObject(o, "index", f->index);
+    cJSON_AddNumberToObject(o, "ts_s", (double)(f->ts_us / 1000000));
+    cJSON_AddNumberToObject(o, "age_s", (double)(now_us - f->ts_us) / 1000000.0);
+    cJSON_AddNumberToObject(o, "pulse_count", f->pulse_count);
+    cJSON_AddNumberToObject(o, "rssi_dbm", f->rssi_dbm);
+    cJSON_AddNumberToObject(o, "airtime_us", (double)f->airtime_us);
+    cJSON_AddNumberToObject(o, "base_us", f->base_us);
+    cJSON_AddNumberToObject(o, "confidence", f->confidence);
+    /* A frame at the ceiling lost its tail in the capture layer, so it would
+     * replay as a different waveform. Say so instead of letting somebody save
+     * it and wonder why it does nothing. */
+    cJSON_AddBoolToObject(o, "truncated", f->pulse_count >= RF_FRAME_MAX_PULSES);
+    if (!f->decoded_valid) {
+        cJSON_AddNullToObject(o, "decoded");
+    } else {
+        cJSON *d = cJSON_AddObjectToObject(o, "decoded");
+        cJSON_AddStringToObject(d, "protocol", f->protocol);
+        cJSON_AddNumberToObject(d, "id", (double)f->decoded_id);
+        cJSON_AddNumberToObject(d, "button", f->decoded_button);
+        cJSON_AddStringToObject(d, "text", f->text);
     }
-
-    char fp[9];
-    snprintf(fp, sizeof(fp), "%08" PRIx32, (uint32_t)cand.fingerprint);
-    cJSON *c = cJSON_AddObjectToObject(o, "candidate");
-    cJSON_AddStringToObject(c, "fingerprint", fp);
-    cJSON_AddNumberToObject(c, "base_us", cand.base_us);
-    cJSON_AddNumberToObject(c, "confidence", cand.confidence);
-    cJSON_AddNumberToObject(c, "pulse_count", cand.pulse_count);
-    cJSON_AddNumberToObject(c, "repeats", cand_repeats);
-    cJSON_AddNumberToObject(c, "rssi_dbm", cand_rssi);
-    add_decoded(c, &cand);
     return o;
 }
 
-static esp_err_t api_learn_get(httpd_req_t *req)
+static cJSON *raw_state_json(const db_raw_state_t *st)
 {
-    return send_json(req, learn_json(), "200 OK");
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "running", st->running);
+    cJSON_AddBoolToObject(o, "held", st->held);
+    cJSON_AddNumberToObject(o, "elapsed_s", (double)st->elapsed_s);
+    cJSON_AddNumberToObject(o, "remaining_s", (double)st->remaining_s);
+    cJSON_AddNumberToObject(o, "count", st->count);
+    cJSON_AddNumberToObject(o, "capacity", st->capacity);
+    cJSON_AddStringToObject(o, "stop_reason", st->stop_reason);
+
+    cJSON *c = cJSON_AddObjectToObject(o, "settings");
+    cJSON_AddNumberToObject(c, "seconds", (double)st->cfg.seconds);
+    cJSON_AddNumberToObject(c, "idle_us", (double)st->cfg.idle_us);
+    cJSON_AddNumberToObject(c, "min_pulses", st->cfg.min_pulses);
+    cJSON_AddNumberToObject(c, "rssi_floor_dbm", st->cfg.rssi_floor_dbm);
+    cJSON_AddBoolToObject(c, "squelch_off", st->cfg.rssi_floor_dbm <= DB_RAW_RSSI_OFF);
+
+    /* Split by CAUSE, deliberately. "Nothing arrived" and "plenty arrived and
+     * none of it fitted" are different faults with different fixes, and only the
+     * second one is worth trimming. */
+    cJSON *d = cJSON_AddObjectToObject(o, "dropped");
+    cJSON_AddNumberToObject(d, "below_floor", (double)st->dropped_floor);
+    cJSON_AddNumberToObject(d, "too_short", (double)st->dropped_short);
+    cJSON_AddNumberToObject(d, "too_long", (double)st->dropped_full);
+    cJSON_AddNumberToObject(d, "overruns", (double)st->overruns);
+    cJSON_AddNumberToObject(d, "no_room", (double)st->dropped_capacity);
+
+    /*
+     * The fragmentation verdict. Not a statistic — a diagnosis with a fix
+     * attached. `runs` > 0 means the frame boundary fired INSIDE a transmission
+     * and cut it into pieces, which is the thing that makes a user transmit
+     * scrap after scrap hunting for the one that rings the bell.
+     * `suggest_idle_us` is what to set instead, computed from the widest gap
+     * actually measured here rather than from a table.
+     */
+    cJSON *fr = cJSON_AddObjectToObject(o, "fragmentation");
+    cJSON_AddBoolToObject(fr, "detected", st->frag_runs > 0);
+    cJSON_AddNumberToObject(fr, "runs", st->frag_runs);
+    cJSON_AddNumberToObject(fr, "frames", st->frag_frames);
+    cJSON_AddNumberToObject(fr, "rejoined", st->frag_joined);
+    cJSON_AddNumberToObject(fr, "max_gap_us", (double)st->frag_max_gap_us);
+    if (st->frag_suggest_idle_us)
+        cJSON_AddNumberToObject(fr, "suggest_idle_us", (double)st->frag_suggest_idle_us);
+    else
+        cJSON_AddNullToObject(fr, "suggest_idle_us");
+
+    cJSON *r = cJSON_AddObjectToObject(o, "radio");
+    cJSON_AddNumberToObject(r, "heard", (double)st->heard);
+    cJSON_AddBoolToObject(r, "carrier_seen", st->carrier_seen);
+    if (st->band_sampled) {
+        cJSON_AddNumberToObject(r, "peak_rssi_dbm", st->peak_rssi_dbm);
+        cJSON_AddNumberToObject(r, "quiet_rssi_dbm", st->quiet_rssi_dbm);
+    } else {
+        cJSON_AddNullToObject(r, "peak_rssi_dbm");
+        cJSON_AddNullToObject(r, "quiet_rssi_dbm");
+    }
+    cJSON_AddBoolToObject(r, "present", rf_service_radio_present());
+
+    /* The limits, served rather than hard-coded in the UI, so a firmware that
+     * changes them cannot be misrepresented by an older page. */
+    cJSON *l = cJSON_AddObjectToObject(o, "limits");
+    cJSON_AddNumberToObject(l, "seconds_min", DB_RAW_SECONDS_MIN);
+    cJSON_AddNumberToObject(l, "seconds_max", DB_RAW_SECONDS_MAX);
+    cJSON_AddNumberToObject(l, "idle_us_min", DB_RAW_IDLE_US_MIN);
+    cJSON_AddNumberToObject(l, "idle_us_max", DB_RAW_IDLE_US_MAX);
+    cJSON_AddNumberToObject(l, "min_pulses_min", DB_RAW_MIN_PULSES_MIN);
+    cJSON_AddNumberToObject(l, "min_pulses_max", DB_RAW_MIN_PULSES_MAX);
+    cJSON_AddNumberToObject(l, "rssi_off_dbm", DB_RAW_RSSI_OFF);
+    cJSON_AddNumberToObject(l, "max_pulses", RF_FRAME_MAX_PULSES);
+    cJSON_AddNumberToObject(l, "normal_squelch_dbm", -75);
+    return o;
 }
 
-static esp_err_t api_learn_arm(httpd_req_t *req)
+/*
+ * ONE CANDIDATE — the unit the user actually acts on.
+ *
+ * A candidate is either a waveform that was heard more than once, or a
+ * transmission the frame boundary cut up, stitched back together. Both are
+ * offered the same way and both are fully usable, DECODED OR NOT: `decoded` is
+ * an annotation that ranks a candidate higher, never a condition for it being
+ * here. That inversion is the entire point of this endpoint's existence.
+ *
+ * `why` spells out the ranking in the user's own terms, because "seen 5x,
+ * decoded EV1527, 92% confidence" is something a person can check against what
+ * they just did with their thumb, whereas a score of 5750 is not.
+ */
+static cJSON *raw_candidate_json(const db_raw_candidate_t *c, int64_t now_us)
 {
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddNumberToObject(o, "id", c->id);
+    cJSON_AddNumberToObject(o, "seen", c->seen);
+    cJSON_AddBoolToObject(o, "merged", c->merged);
+    cJSON_AddNumberToObject(o, "pulse_count", c->pulse_count);
+    cJSON_AddNumberToObject(o, "airtime_us", (double)c->airtime_us);
+    cJSON_AddNumberToObject(o, "base_us", c->base_us);
+    cJSON_AddNumberToObject(o, "confidence", c->confidence);
+    cJSON_AddNumberToObject(o, "rssi_dbm", c->best_rssi_dbm);
+    cJSON_AddNumberToObject(o, "score", (double)c->score);
+    cJSON_AddNumberToObject(o, "age_s", (double)(now_us - c->last_us) / 1000000.0);
+    cJSON_AddBoolToObject(o, "truncated", c->pulse_count >= RF_FRAME_MAX_PULSES);
+
+    cJSON *parts = cJSON_AddArrayToObject(o, "frames");
+    for (uint8_t k = 0; k < c->part_count && k < DB_RAW_MAX_PARTS; k++)
+        cJSON_AddItemToArray(parts, cJSON_CreateNumber(c->part_index[k]));
+
+    if (c->merged) {
+        cJSON *gaps = cJSON_AddArrayToObject(o, "gaps_us");
+        for (uint8_t k = 1; k < c->part_count && k < DB_RAW_MAX_PARTS; k++)
+            cJSON_AddItemToArray(gaps, cJSON_CreateNumber((double)c->part_gap_us[k]));
+    }
+
+    if (!c->decoded_valid) {
+        cJSON_AddNullToObject(o, "decoded");
+    } else {
+        cJSON *d = cJSON_AddObjectToObject(o, "decoded");
+        cJSON_AddStringToObject(d, "protocol", c->protocol);
+        cJSON_AddNumberToObject(d, "id", (double)c->decoded_id);
+        cJSON_AddNumberToObject(d, "button", c->decoded_button);
+        cJSON_AddStringToObject(d, "text", c->text);
+    }
+
+    char why[160];
+    int n = snprintf(why, sizeof(why), "seen %u%s", (unsigned)c->seen,
+                     c->seen == 1 ? " time" : " times");
+    if (c->merged && n < (int)sizeof(why))
+        n += snprintf(why + n, sizeof(why) - (size_t)n,
+                      ", rejoined from %u fragments", (unsigned)c->part_count);
+    if (c->decoded_valid && n < (int)sizeof(why))
+        n += snprintf(why + n, sizeof(why) - (size_t)n, ", decoded %s", c->protocol);
+    if (n < (int)sizeof(why))
+        snprintf(why + n, sizeof(why) - (size_t)n, ", %u%% confidence",
+                 (unsigned)c->confidence);
+    cJSON_AddStringToObject(o, "why", why);
+    return o;
+}
+
+/*
+ * Shared by GET /api/raw and GET /api/raw/candidates. `max` caps how many of the
+ * ranked list are embedded.
+ *
+ * WHY THERE IS A CAP AT ALL. A full session holds 32 frames (~36 KB) plus its
+ * analysis (~7 KB), and GET /api/raw carries the state, the ranked candidates
+ * AND every frame. Building that as a cJSON tree and its printed string at once,
+ * on top of 43 KB already spoken for, is how the busiest endpoint on the box
+ * turns into an out-of-memory answer — which it duly did on the first full
+ * session it met. The ranked list is capped there; nobody scrolls past the tenth
+ * candidate of a ranking whose whole promise is that the answer is near the top,
+ * and GET /api/raw/candidates serves the complete list with no frames beside it.
+ * `candidates_total` says when something was left out, so a client is never
+ * silently shown a truncated list.
+ */
+static void add_candidates(cJSON *root, int max)
+{
+    static db_raw_candidate_t cands[DB_RAW_MAX_FRAMES + DB_RAW_MAX_RUNS];
+    int cap = (int)(sizeof(cands) / sizeof(cands[0]));
+    int n = db_raw_get_candidates(cands, cap);
+    int64_t now = esp_timer_get_time();
+
+    cJSON_AddNumberToObject(root, "candidates_total", n);
+    cJSON *arr = cJSON_AddArrayToObject(root, "candidates");
+    for (int i = 0; i < n && i < max; i++)
+        cJSON_AddItemToArray(arr, raw_candidate_json(&cands[i], now));
+}
+
+static esp_err_t api_raw_get(httpd_req_t *req)
+{
+    db_raw_state_t st;
+    db_raw_get_state(&st);
+
+    cJSON *root = raw_state_json(&st);
+
+    /* Candidates first: this is the list the screen is built around, and the
+     * per-frame array below it is the "show me everything" fallback. */
+    add_candidates(root, DB_RAW_EMBED_CANDIDATES);
+
+    /* 32 summaries is ~4 KB of JSON — small enough to print normally. The pulse
+     * arrays are the big thing, and those live behind /api/raw/<i>. */
+    static db_raw_summary_t list[DB_RAW_MAX_FRAMES];
+    int n = db_raw_get_summaries(list, DB_RAW_MAX_FRAMES);
+    int64_t now = esp_timer_get_time();
+    cJSON *arr = cJSON_AddArrayToObject(root, "frames");
+    for (int i = 0; i < n; i++)
+        cJSON_AddItemToArray(arr, raw_frame_json(&list[i], now));
+
+    return send_json(req, root, "200 OK");
+}
+
+/* The ranked list on its own, for a client that does not want the frames. */
+static esp_err_t api_raw_candidates_get(httpd_req_t *req)
+{
+    db_raw_state_t st;
+    db_raw_get_state(&st);
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "running", st.running);
+    cJSON_AddNumberToObject(root, "count", st.count);
+    add_candidates(root, DB_RAW_MAX_FRAMES + DB_RAW_MAX_RUNS);
+    return send_json(req, root, "200 OK");
+}
+
+static esp_err_t api_raw_start(httpd_req_t *req)
+{
+    if (!rf_service_radio_present())
+        return send_error(req, "503 Service Unavailable",
+                          "no CC1101 detected — see /api/diagnostics");
+
+    db_raw_cfg_t cfg;
+    db_raw_cfg_default(&cfg);
+
     cJSON *j = read_json(req);
     if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
     double d;
-    uint32_t timeout = 0;   /* 0 => DB_LEARN_DEFAULT_SECS */
-    if (json_num(j, "timeout_s", &d)) timeout = (uint32_t)clampl(d, 5, 600);
+    if (json_num(j, "seconds", &d))
+        cfg.seconds = (uint32_t)clampl(d, DB_RAW_SECONDS_MIN, DB_RAW_SECONDS_MAX);
+    if (json_num(j, "idle_us", &d))
+        cfg.idle_us = (uint32_t)clampl(d, DB_RAW_IDLE_US_MIN, DB_RAW_IDLE_US_MAX);
+    if (json_num(j, "min_pulses", &d))
+        cfg.min_pulses = (uint16_t)clampl(d, DB_RAW_MIN_PULSES_MIN, DB_RAW_MIN_PULSES_MAX);
+    if (json_num(j, "rssi_floor_dbm", &d))
+        cfg.rssi_floor_dbm = (int16_t)clampl(d, DB_RAW_RSSI_MIN, DB_RAW_RSSI_MAX);
     cJSON_Delete(j);
 
-    db_signals_learn_arm(timeout);
-    db_events_push(DB_EV_LEARN, 0, 0, 0, 0, "learn armed for %" PRIu32 " s",
-                   timeout ? timeout : (uint32_t)DB_LEARN_DEFAULT_SECS);
-    return send_json(req, learn_json(), "200 OK");
+    esp_err_t err = rf_service_raw_start(&cfg);
+    if (err == ESP_ERR_INVALID_STATE) {
+        /* Either a session is already recording, or the radio went away between
+         * the check above and here. The first is by far the likelier. */
+        if (db_raw_active())
+            return send_error(req, "409 Conflict",
+                              "a raw capture session is already running — stop it first");
+        return send_error(req, "503 Service Unavailable",
+                          "no CC1101 detected — see /api/diagnostics");
+    }
+    if (err == ESP_ERR_NO_MEM)
+        return send_error(req, "503 Service Unavailable",
+                          "not enough free memory for a capture session right now. "
+                          "A session needs about 36 KB of RAM for its frames; "
+                          "reboot the box and try again before opening other pages.");
+    if (err != ESP_OK)
+        return send_esp_err(req, err, "could not start the capture session");
+
+    db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0, "raw capture started (%lus)",
+                   (unsigned long)cfg.seconds);
+
+    db_raw_state_t st;
+    db_raw_get_state(&st);
+    cJSON *root = raw_state_json(&st);
+    cJSON_AddArrayToObject(root, "frames");
+    return send_json(req, root, "200 OK");
 }
 
-static esp_err_t api_learn_cancel(httpd_req_t *req)
+static esp_err_t api_raw_stop(httpd_req_t *req)
 {
-    db_signals_learn_cancel();
-    db_events_push(DB_EV_LEARN, 0, 0, 0, 0, "learn cancelled");
-    return send_json(req, learn_json(), "200 OK");
+    rf_service_raw_stop();
+    return api_raw_get(req);
 }
 
-static esp_err_t api_learn_accept(httpd_req_t *req)
+/* DELETE /api/raw — hand the memory back. Stop keeps the frames on purpose (you
+ * cannot trim what has been freed), so there has to be a way to say "done". */
+static esp_err_t api_raw_discard(httpd_req_t *req)
+{
+    rf_service_raw_stop();
+    db_raw_discard();
+    return send_ok(req);
+}
+
+/*
+ * GET /api/raw/<i> — one frame's full waveform.
+ *
+ * Streamed exactly like GET /api/signals/<id>, and for the same reason: 512
+ * durations rendered as JSON is several kilobytes, and building that as a cJSON
+ * tree AND its printed string at once, on a box that is simultaneously running a
+ * capture session holding 36 KB, is how a diagnostic feature turns into an
+ * out-of-memory reboot.
+ */
+/* Print `head` with its closing brace replaced by the frame's waveform. Takes
+ * ownership of neither argument; `head` is deleted here because every caller
+ * built it purely to be sent. */
+static esp_err_t send_frame_json(httpd_req_t *req, cJSON *head, const rf_frame_t *frame)
+{
+    char *text = cJSON_PrintUnformatted(head);
+    cJSON_Delete(head);
+    if (!text) return send_error(req, "500 Internal Server Error", "out of memory");
+
+    size_t hl = strlen(text);
+    if (hl && text[hl - 1] == '}') text[--hl] = '\0';   /* re-opened below */
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send_chunk(req, text, hl);
+    cJSON_free(text);
+
+    char buf[DURATIONS_CHUNK + 16];
+    int len = snprintf(buf, sizeof(buf), ",\"first_level\":%u,\"durations_us\":[",
+                       frame->first_level);
+    httpd_resp_send_chunk(req, buf, len);
+
+    uint16_t count = frame->count;
+    if (count > RF_FRAME_MAX_PULSES) count = RF_FRAME_MAX_PULSES;   /* defensive */
+    len = 0;
+    for (uint16_t i = 0; i < count; i++) {
+        len += snprintf(buf + len, sizeof(buf) - (size_t)len, "%s%u",
+                        i ? "," : "", frame->durations_us[i]);
+        if (len >= DURATIONS_CHUNK) {
+            httpd_resp_send_chunk(req, buf, len);
+            len = 0;
+        }
+    }
+    len += snprintf(buf + len, sizeof(buf) - (size_t)len, "]}");
+    httpd_resp_send_chunk(req, buf, len);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static esp_err_t api_raw_frame(httpd_req_t *req, uint16_t index)
+{
+    db_raw_summary_t sum;
+    if (!db_raw_get_summary(index, &sum))
+        return send_error(req, "404 Not Found", "no such frame in this session");
+
+    rf_frame_t *frame = malloc(sizeof(*frame));
+    if (!frame) return send_error(req, "500 Internal Server Error", "out of memory");
+    if (!db_raw_copy_frame(index, frame)) {
+        free(frame);
+        return send_error(req, "404 Not Found", "no such frame in this session");
+    }
+
+    esp_err_t err = send_frame_json(req, raw_frame_json(&sum, esp_timer_get_time()), frame);
+    free(frame);
+    return err;
+}
+
+/*
+ * GET /api/raw/candidates/<n> — the waveform a candidate stands for.
+ *
+ * For a merged candidate this is the stitched-together whole, not one of its
+ * pieces: what the user inspects, trims, transmits and saves must be the same
+ * waveform throughout, or the trim they settled on would mean something
+ * different at each step.
+ */
+static esp_err_t api_raw_candidate_frame(httpd_req_t *req, uint16_t id)
+{
+    db_raw_candidate_t cand;
+    if (!db_raw_get_candidate(id, &cand))
+        return send_error(req, "404 Not Found", "no such candidate in this session");
+
+    rf_frame_t *frame = malloc(sizeof(*frame));
+    if (!frame) return send_error(req, "500 Internal Server Error", "out of memory");
+    if (!db_raw_copy_candidate(id, 0, 0, frame)) {
+        free(frame);
+        return send_error(req, "409 Conflict",
+                          "this candidate could not be assembled — its frames may "
+                          "have been replaced by a newer session");
+    }
+
+    esp_err_t err = send_frame_json(req, raw_candidate_json(&cand, esp_timer_get_time()),
+                                    frame);
+    free(frame);
+    return err;
+}
+
+/* Read the optional slice out of a request body. Bounds are the caller's to
+ * clamp; rf_raw clamps again against the real frame length. */
+static void raw_slice_from_json(const cJSON *j, uint16_t *from, uint16_t *to)
+{
+    double d;
+    *from = 0;
+    *to   = 0;   /* 0 == to the end */
+    if (j && json_num(j, "from", &d)) *from = (uint16_t)clampl(d, 0, RF_FRAME_MAX_PULSES);
+    if (j && json_num(j, "to", &d))   *to   = (uint16_t)clampl(d, 0, RF_FRAME_MAX_PULSES);
+}
+
+/*
+ * POST /api/raw/<i>/transmit — replay a frame, or a selection of it, WITHOUT
+ * storing anything.
+ *
+ * This is the whole point of the screen: "does this actually ring the bell?" has
+ * to be answerable in one tap and answerable repeatedly, because finding the
+ * right trim is a loop. Making the user save first would fill the store with
+ * thirty near-identical rejects.
+ */
+static bool raw_copy(bool candidate, uint16_t n, uint16_t from, uint16_t to,
+                     rf_frame_t *out)
+{
+    return candidate ? db_raw_copy_candidate(n, from, to, out)
+                     : db_raw_copy_slice(n, from, to, out);
+}
+
+static esp_err_t api_raw_transmit_any(httpd_req_t *req, uint16_t index, bool candidate)
+{
+    if (!rf_service_radio_present())
+        return send_error(req, "503 Service Unavailable",
+                          "no CC1101 detected — see /api/diagnostics");
+
+    cJSON *j = read_json(req);
+    if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
+    double d;
+    uint8_t repeats = s_cfg->tx_repeats;
+    uint32_t gap_us = s_cfg->tx_gap_us;
+    uint16_t from, to;
+    if (json_num(j, "repeats", &d)) repeats = (uint8_t)clampl(d, 1, 32);
+    if (json_num(j, "gap_us", &d))  gap_us = (uint32_t)clampl(d, 0, 200000);
+    raw_slice_from_json(j, &from, &to);
+    cJSON_Delete(j);
+
+    rf_frame_t *frame = malloc(sizeof(*frame));
+    if (!frame) return send_error(req, "500 Internal Server Error", "out of memory");
+    if (!raw_copy(candidate, index, from, to, frame)) {
+        free(frame);
+        return send_error(req, "404 Not Found",
+                          candidate
+                            ? "no such candidate in this session, or the selection is empty"
+                            : "no such frame in this session, or the selection is empty");
+    }
+
+    uint16_t sent = frame->count;
+    esp_err_t err = rf_service_transmit(frame, repeats, gap_us);
+    free(frame);
+    if (err != ESP_OK) return send_esp_err(req, err, "transmit failed");
+
+    db_events_push(DB_EV_TRANSMIT, 0, 0, 0, repeats, "%s %u (%u pulses)",
+                   candidate ? "candidate" : "raw frame",
+                   (unsigned)index, (unsigned)sent);
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    cJSON_AddNumberToObject(o, "pulse_count", sent);
+    cJSON_AddNumberToObject(o, "repeats", repeats);
+    cJSON_AddNumberToObject(o, "gap_us", (double)gap_us);
+    cJSON_AddStringToObject(o, "note",
+        "software-level success only — the box cannot tell whether a receiver reacted");
+    return send_json(req, o, "200 OK");
+}
+
+/*
+ * POST /api/raw/<i>/save — promote a (possibly trimmed) raw frame to a stored
+ * signal, so it becomes an ordinary citizen: it can be bound to a node, matched
+ * against, renamed and transmitted like any other.
+ *
+ * Stored as DB_ORIGIN_CAPTURED because that is what it is — it came off the air.
+ * The store re-analyses it (base width, confidence, fingerprint, a decode
+ * attempt) exactly as it would any registration, so a trimmed frame that DOES
+ * turn out to be a known protocol gets its identity at this point.
+ */
+static esp_err_t api_raw_save_any(httpd_req_t *req, uint16_t index, bool candidate)
 {
     cJSON *j = read_json(req);
     if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
     const char *raw = NULL;
     char name[DB_SIGNAL_NAME_MAX] = "";
     if (json_str(j, "name", &raw)) trim_copy(raw, name, sizeof(name));
+    uint16_t from, to;
+    raw_slice_from_json(j, &from, &to);
     cJSON_Delete(j);
     if (!name[0]) return send_error(req, "400 Bad Request", "name must be a non-empty string");
 
+    rf_frame_t *frame = malloc(sizeof(*frame));
+    if (!frame) return send_error(req, "500 Internal Server Error", "out of memory");
+    if (!raw_copy(candidate, index, from, to, frame)) {
+        free(frame);
+        return send_error(req, "404 Not Found",
+                          candidate
+                            ? "no such candidate in this session, or the selection is empty"
+                            : "no such frame in this session, or the selection is empty");
+    }
+
     uint16_t id = 0;
-    esp_err_t err = db_signals_learn_accept(name, &id);
-    if (err == ESP_OK) db_mqtt_on_signals_changed();
-    if (err == ESP_ERR_INVALID_STATE || err == ESP_ERR_NOT_FOUND)
-        return send_error(req, "409 Conflict", "no learn candidate to accept");
-    if (err != ESP_OK) return send_esp_err(req, err, "could not store the candidate");
+    esp_err_t err = db_signals_add_frame(frame, NULL, name, DB_ORIGIN_CAPTURED, &id);
+    uint16_t saved = frame->count;
+    free(frame);
+    if (err == ESP_ERR_NO_MEM)
+        return send_error(req, "409 Conflict",
+                          "the signal store is full. Delete a signal you no longer "
+                          "need under Settings, then save this one again.");
+    if (err != ESP_OK) return send_esp_err(req, err, "could not store the frame");
+
+    db_mqtt_on_signals_changed();
 
     const db_signal_meta_t *m = db_signals_get(id);
     if (!m) return send_error(req, "500 Internal Server Error", "signal vanished after creation");
-    db_events_push(DB_EV_LEARN, id, 0, 0, 0, "learned \"%s\"", name);
+    db_events_push(DB_EV_LEARN, id, 0, 0, 0, "registered \"%s\" from %s %u (%u pulses)",
+                   name, candidate ? "candidate" : "frame",
+                   (unsigned)index, (unsigned)saved);
     return send_json(req, signal_json(m), "200 OK");
 }
+
+/* The four public spellings. A candidate and a bare frame differ only in how the
+ * waveform is fetched, so they must not differ in anything else — hence one
+ * implementation each and no second copy of the error handling. */
+static esp_err_t api_raw_transmit(httpd_req_t *req, uint16_t i)
+{ return api_raw_transmit_any(req, i, false); }
+static esp_err_t api_raw_save(httpd_req_t *req, uint16_t i)
+{ return api_raw_save_any(req, i, false); }
+static esp_err_t api_raw_cand_transmit(httpd_req_t *req, uint16_t n)
+{ return api_raw_transmit_any(req, n, true); }
+static esp_err_t api_raw_cand_save(httpd_req_t *req, uint16_t n)
+{ return api_raw_save_any(req, n, true); }
 
 /* ------------------------------------------------------------------ node graph */
 
@@ -1446,6 +1934,8 @@ static const char *event_kind_str(uint8_t kind)
     case DB_EV_WIRED_PRESS:  return "wired_press";
     case DB_EV_NODE_FIRED:   return "node_fired";
     case DB_EV_TRANSMIT:     return "transmit";
+    /* The wire name predates the listening session and is kept: it means "a
+     * signal was registered", which is exactly what it always meant. */
     case DB_EV_LEARN:        return "learn";
     default:                 return "system";
     }
@@ -2054,7 +2544,18 @@ static esp_err_t get_router(httpd_req_t *req)
         if (id && !tail[0]) return api_signal_detail(req, id);
         return send_error(req, "404 Not Found", "no such endpoint");
     }
-    if (uri_is(u, "/api/learn"))          return api_learn_get(req);
+    if (uri_is(u, "/api/raw"))            return api_raw_get(req);
+    if (uri_is(u, "/api/raw/candidates")) return api_raw_candidates_get(req);
+    if (uri_starts(u, "/api/raw/candidates/")) {
+        uint16_t n = path_id(u, "/api/raw/candidates/", tail, sizeof(tail));
+        if (n && !tail[0]) return api_raw_candidate_frame(req, n);
+        return send_error(req, "404 Not Found", "no such endpoint");
+    }
+    if (uri_starts(u, "/api/raw/")) {
+        uint16_t i = path_id(u, "/api/raw/", tail, sizeof(tail));
+        if (i && !tail[0]) return api_raw_frame(req, i);
+        return send_error(req, "404 Not Found", "no such endpoint");
+    }
     if (uri_is(u, "/api/graph"))          return api_graph_get(req);
     if (uri_is(u, "/api/monitor"))        return api_monitor_get(req);
     if (uri_is(u, "/api/gpio/available")) return api_gpio_available(req);
@@ -2093,9 +2594,25 @@ static esp_err_t post_router(httpd_req_t *req)
         return send_error(req, "404 Not Found", "no such endpoint");
     }
 
-    if (uri_is(u, "/api/learn/arm"))    return api_learn_arm(req);
-    if (uri_is(u, "/api/learn/cancel")) return api_learn_cancel(req);
-    if (uri_is(u, "/api/learn/accept")) return api_learn_accept(req);
+    /* "start"/"stop" cannot be read as an index (path_id wants digits), but the
+     * literals go first anyway so the order is the same everywhere. */
+    if (uri_is(u, "/api/raw/start"))    return api_raw_start(req);
+    if (uri_is(u, "/api/raw/stop"))     return api_raw_stop(req);
+    /* Candidates before frames: "/api/raw/candidates/3/save" must not be read as
+     * frame "candidates". path_id would reject it, but relying on that would put
+     * the correctness of this route in another function. */
+    if (uri_starts(u, "/api/raw/candidates/")) {
+        uint16_t n = path_id(u, "/api/raw/candidates/", tail, sizeof(tail));
+        if (n && strcmp(tail, "/transmit") == 0) return api_raw_cand_transmit(req, n);
+        if (n && strcmp(tail, "/save") == 0)     return api_raw_cand_save(req, n);
+        return send_error(req, "404 Not Found", "no such endpoint");
+    }
+    if (uri_starts(u, "/api/raw/")) {
+        uint16_t i = path_id(u, "/api/raw/", tail, sizeof(tail));
+        if (i && strcmp(tail, "/transmit") == 0) return api_raw_transmit(req, i);
+        if (i && strcmp(tail, "/save") == 0)     return api_raw_save(req, i);
+        return send_error(req, "404 Not Found", "no such endpoint");
+    }
 
     if (uri_is(u, "/api/graph/nodes"))  return api_node_create(req);
     if (uri_is(u, "/api/graph/links"))  return api_link_edit(req, true);
@@ -2119,6 +2636,7 @@ static esp_err_t delete_router(httpd_req_t *req)
     char tail[24];
 
     if (uri_is(u, "/api/graph/links")) return api_link_edit(req, false);
+    if (uri_is(u, "/api/raw"))         return api_raw_discard(req);
     if (uri_starts(u, "/api/signals/")) {
         uint16_t id = path_id(u, "/api/signals/", tail, sizeof(tail));
         if (id && !tail[0]) return api_signal_delete(req, id);

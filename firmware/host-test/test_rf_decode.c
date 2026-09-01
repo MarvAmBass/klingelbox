@@ -23,6 +23,7 @@
 
 #include "rf_decode.h"
 #include "rf_frame.h"
+#include "rf_group.h"
 
 /* ---- micro test harness -------------------------------------------------- */
 
@@ -581,6 +582,459 @@ static void test_frame_primitives(void)
     CHECK(rf_frame_duration_us(NULL) == 0, "duration of NULL");
 }
 
+/* ======================================================================
+   GROUPING, RANKING AND FRAGMENT REJOINING (rf_group.c)
+
+   These replace an admission gate that used to decide, before a user saw
+   anything at all, whether a captured frame was allowed to become a candidate.
+   The gate demanded two repeats and 65 % normalization confidence, both tuned on
+   EV1527 — so a remote of any other shape was silently invisible. The tests
+   below therefore assert the INVERSION as hard as they assert the mechanics:
+   nothing is ever filtered, and repetition (which needs no protocol knowledge)
+   outranks decoding (which does).
+   ====================================================================== */
+
+/* Fill an observation. `frame` is borrowed, exactly as rf_raw borrows its slots. */
+static void obs_set(rf_obs_t *o, const rf_frame_t *f, uint16_t index,
+                    int64_t ts_us, int16_t rssi, uint8_t conf, bool decoded)
+{
+    o->frame         = f;
+    o->index         = index;
+    o->ts_us         = ts_us;
+    o->airtime_us    = rf_frame_duration_us(f);
+    o->rssi_dbm      = rssi;
+    o->confidence    = conf;
+    o->decoded_valid = decoded;
+}
+
+/* Scale every duration by pct/100 — a same-press oscillator drift, small enough
+ * to stay inside the grouping tolerance. */
+static void scale_frame(rf_frame_t *f, uint32_t pct)
+{
+    for (uint16_t i = 0; i < f->count; i++) {
+        uint32_t d = (uint32_t)f->durations_us[i] * pct / 100u;
+        f->durations_us[i] = (uint16_t)(d < 1 ? 1 : (d > 65535 ? 65535 : d));
+    }
+}
+
+/* A frame no decoder claims: short, and with no coherent symbol structure. */
+static void make_odd_frame(rf_frame_t *f, uint16_t base)
+{
+    static const uint16_t shape[] = { 3, 7, 2, 11, 4, 5, 9, 2 };
+    rf_frame_reset(f);
+    f->first_level = 1;
+    for (unsigned i = 0; i < sizeof(shape) / sizeof(shape[0]); i++) {
+        rf_frame_push(f, (uint16_t)(shape[i] * base));
+    }
+}
+
+static void test_group_basics(void)
+{
+    rf_frame_t a, a2, a3, b;
+    rf_obs_t obs[4];
+    rf_group_t g[8];
+
+    CASE("grouping: repeats collapse into one candidate");
+
+    rf_ev1527_build(0x0ABCDu, 0x5u, 350, &a);
+    a2 = a; scale_frame(&a2, 103);      /* the same press, 3 % slower */
+    a3 = a; scale_frame(&a3,  97);
+    rf_ev1527_build(0x13579u, 0x2u, 350, &b);
+
+    obs_set(&obs[0], &a,  1, 1000000, -40, 90, true);
+    obs_set(&obs[1], &b,  2, 2000000, -70, 88, true);
+    obs_set(&obs[2], &a2, 3, 3000000, -38, 92, true);
+    obs_set(&obs[3], &a3, 4, 4000000, -41, 85, true);
+
+    int n = rf_group_build(obs, 4, g, 8);
+    CHECK(n == 2, "4 frames, 2 distinct waveforms -> 2 groups, got %d", n);
+    CHECK(g[0].count == 3, "the thrice-seen waveform must lead, count %u", g[0].count);
+    CHECK(g[1].count == 1, "the once-seen waveform is second, count %u", g[1].count);
+    CHECK(g[0].score > g[1].score, "3 repeats must outscore 1");
+
+    /* Membership is in arrival order and complete. */
+    CHECK(g[0].member[0] == 0 && g[0].member[1] == 2 && g[0].member[2] == 3,
+          "members in arrival order");
+    CHECK(g[0].first_us == 1000000 && g[0].last_us == 4000000, "first/last timestamps");
+    CHECK(g[0].best_rssi_dbm == -38, "best RSSI across the group, got %d",
+          g[0].best_rssi_dbm);
+
+    /* The exemplar is the cleanest member, not simply the first. */
+    CHECK(g[0].rep == 2, "exemplar must be the 92%% member, got %u", g[0].rep);
+    CHECK(g[0].confidence == 92, "exemplar confidence, got %u", g[0].confidence);
+
+    /* Every observation is accounted for exactly once. */
+    unsigned total = 0;
+    for (int i = 0; i < n; i++) total += g[i].count;
+    CHECK(total == 4, "no observation may be dropped, total %u", total);
+}
+
+static void test_group_repeats_dominate_decoding(void)
+{
+    rf_frame_t odd, odd2, odd3, ev;
+    rf_obs_t obs[5];
+    rf_group_t g[8];
+
+    CASE("ranking: repetition outranks a decode");
+
+    /* THE REGRESSION TEST FOR THE WHOLE FEATURE. The undecoded frame is short,
+     * scores badly on confidence and would have failed the old gate on every
+     * count. It was heard three times; the pristine decoded EV1527 twice. The
+     * undecoded one must win, because repetition is the stronger evidence and it
+     * is evidence we can collect without knowing the protocol. */
+    make_odd_frame(&odd, 120);
+    odd2 = odd; scale_frame(&odd2, 104);
+    odd3 = odd; scale_frame(&odd3,  96);
+    rf_ev1527_build(0x0ABCDu, 0x5u, 350, &ev);
+
+    obs_set(&obs[0], &ev,   1, 1000000, -30, 100, true);
+    obs_set(&obs[1], &odd,  2, 2000000, -60,  20, false);
+    obs_set(&obs[2], &ev,   3, 3000000, -30, 100, true);
+    obs_set(&obs[3], &odd2, 4, 4000000, -62,  18, false);
+    obs_set(&obs[4], &odd3, 5, 5000000, -61,  22, false);
+
+    int n = rf_group_build(obs, 5, g, 8);
+    CHECK(n == 2, "two waveforms, got %d groups", n);
+    CHECK(g[0].count == 3 && !g[0].decoded_valid,
+          "the 3x undecoded candidate must rank first");
+    CHECK(g[1].count == 2 && g[1].decoded_valid,
+          "the 2x decoded candidate must rank second");
+
+    /* Stated as the invariant rather than as two numbers, so an edit to the
+     * weights that breaks the intent fails here. */
+    CHECK(RF_SCORE_PER_REPEAT >
+          RF_SCORE_DECODED + 100u * RF_SCORE_CONF_MUL + RF_SCORE_LEN_CAP,
+          "one repeat must outweigh every non-repeat bonus combined");
+}
+
+static void test_group_undecoded_is_first_class(void)
+{
+    rf_frame_t f;
+    rf_obs_t obs[1];
+    rf_group_t g[4];
+
+    CASE("ranking: nothing is ever filtered out");
+
+    /* Two pulses, zero confidence, no decode, seen once: the weakest thing that
+     * can arrive. The old gate rejected it outright. It must still be offered —
+     * the user is the one who decides whether it is their bell. */
+    rf_frame_reset(&f);
+    f.first_level = 1;
+    rf_frame_push(&f, 400);
+    rf_frame_push(&f, 900);
+    obs_set(&obs[0], &f, 1, 1000000, -95, 0, false);
+
+    int n = rf_group_build(obs, 1, g, 4);
+    CHECK(n == 1, "a single weak frame is still a candidate, got %d", n);
+    CHECK(g[0].count == 1 && g[0].pulse_count == 2, "reported verbatim");
+    CHECK(g[0].score > 0, "score %u", g[0].score);
+}
+
+static void test_group_tiebreaks(void)
+{
+    rf_frame_t x, y, z;
+    rf_obs_t obs[3];
+    rf_group_t g[8];
+
+    CASE("ranking: decode and confidence break ties, nothing more");
+
+    rf_ev1527_build(0x11111u, 0x1u, 350, &x);
+    make_odd_frame(&y, 100);
+    make_odd_frame(&z, 260);
+
+    /* All seen once. Decoded must lead; between the two undecoded ones the
+     * higher confidence wins. */
+    obs_set(&obs[0], &y, 1, 1000000, -50, 40, false);
+    obs_set(&obs[1], &x, 2, 2000000, -50, 40, true);
+    obs_set(&obs[2], &z, 3, 3000000, -50, 70, false);
+
+    int n = rf_group_build(obs, 3, g, 8);
+    CHECK(n == 3, "three distinct waveforms, got %d", n);
+    CHECK(g[0].decoded_valid, "decoded leads at equal repeats");
+    CHECK(!g[1].decoded_valid && g[1].confidence == 70, "then the cleaner one");
+    CHECK(!g[2].decoded_valid && g[2].confidence == 40, "then the noisier one");
+
+    /* Equal in every respect: arrival order decides, and stays decided. */
+    obs_set(&obs[0], &y, 1, 1000000, -50, 40, false);
+    obs_set(&obs[1], &z, 2, 2000000, -50, 40, false);
+    n = rf_group_build(obs, 2, g, 8);
+    CHECK(n == 2 && g[0].member[0] == 0, "ties keep arrival order");
+}
+
+static void test_group_degenerate(void)
+{
+    rf_obs_t obs[2];
+    rf_frame_t empty, good;
+    rf_group_t g[4];
+
+    CASE("grouping: degenerate inputs");
+
+    rf_frame_reset(&empty);
+    rf_ev1527_build(0x22222u, 0x3u, 350, &good);
+    obs_set(&obs[0], &empty, 1, 1000, -50, 0, false);
+    obs_set(&obs[1], &good,  2, 2000, -50, 90, true);
+
+    CHECK(rf_group_build(NULL, 3, g, 4) == 0, "NULL observations");
+    CHECK(rf_group_build(obs, 2, NULL, 4) == 0, "NULL output");
+    CHECK(rf_group_build(obs, 2, g, 0) == 0, "zero capacity");
+    CHECK(rf_group_build(obs, 0, g, 4) == 0, "no observations");
+    CHECK(rf_group_build(obs, 2, g, 4) == 1, "an empty frame is not an observation");
+    CHECK(rf_group_score(NULL) == 0, "score of NULL");
+}
+
+/* ---- fragmentation ------------------------------------------------------- */
+
+/* Split `src` at the LOW pulse `at`, which becomes the silence the capture layer
+ * would have thrown away. Models exactly what a too-short idle threshold does. */
+static void split_at_low(const rf_frame_t *src, uint16_t at,
+                         rf_frame_t *head, rf_frame_t *tail, uint32_t *gap_us)
+{
+    slice_frame(src, 0, at, head);
+    slice_frame(src, (uint16_t)(at + 1), (uint16_t)(src->count - at - 1), tail);
+    *gap_us = src->durations_us[at];
+}
+
+static void test_frag_detects_a_chopped_transmission(void)
+{
+    rf_frame_t whole, head, tail, rejoined;
+    rf_obs_t obs[2];
+    rf_run_t runs[4];
+    uint32_t gap = 0;
+
+    CASE("fragmentation: a cut transmission is found and rejoined");
+
+    rf_ev1527_build(0x0ABCDu, 0x5u, 350, &whole);
+    /* Index 25 is a LOW (first_level is 1, so odd indices are LOW). */
+    CHECK(rf_frame_level_at(&whole, 25) == 0, "pick a LOW to split on");
+    split_at_low(&whole, 25, &head, &tail, &gap);
+
+    /* The threshold that cut it was just under the gap. */
+    uint32_t idle = gap - 100u;
+    int64_t t0 = 1000000;
+    obs_set(&obs[0], &head, 1, t0, -40, 80, false);
+    obs_set(&obs[1], &tail, 2,
+            t0 + (int64_t)gap + (int64_t)rf_frame_duration_us(&tail), -40, 75, false);
+
+    int n = rf_frag_find_runs(obs, 2, idle, runs, 4);
+    CHECK(n == 1, "the pair must be reported as one run, got %d", n);
+    CHECK(runs[0].count == 2, "run length %u", runs[0].count);
+    CHECK(runs[0].gap_us[1] == gap, "the gap must be MEASURED (%u), got %u",
+          gap, runs[0].gap_us[1]);
+    CHECK(runs[0].joinable, "this run must be joinable");
+
+    /* And the join is exact: rebuilding from the pieces plus the measured
+     * silence reproduces the original waveform pulse for pulse. An invented gap
+     * would pass every other check here and still never ring a bell. */
+    CHECK(rf_frame_join_run(&rejoined, obs, &runs[0]), "join must succeed");
+    CHECK(rejoined.count == whole.count, "rejoined %u pulses, original %u",
+          rejoined.count, whole.count);
+    /* The prediction and the join must never disagree: callers describe a
+     * merged candidate (and size its trim handles) from the prediction long
+     * before anyone asks for the waveform. */
+    CHECK(rf_run_joined_pulses(obs, &runs[0]) == rejoined.count,
+          "predicted %u pulses, joined %u",
+          rf_run_joined_pulses(obs, &runs[0]), rejoined.count);
+    CHECK(rejoined.first_level == whole.first_level, "first_level preserved");
+    int same = 1;
+    for (uint16_t i = 0; i < whole.count && i < rejoined.count; i++) {
+        if (rejoined.durations_us[i] != whole.durations_us[i]) same = 0;
+    }
+    CHECK(same, "every duration must survive the round trip");
+}
+
+static void test_frag_ignores_honest_repeats(void)
+{
+    rf_frame_t a, b;
+    rf_obs_t obs[3];
+    rf_run_t runs[4];
+
+    CASE("fragmentation: identical neighbours are repeats, not fragments");
+
+    /* A transmitter whose inter-word gap is shorter than the threshold gets
+     * split too — but into IDENTICAL pieces. That is a repeat group and must
+     * never be reported as fragmentation, or the UI would tell the user to
+     * raise a threshold that is doing its job. */
+    rf_ev1527_build(0x0ABCDu, 0x5u, 350, &a);
+    b = a; scale_frame(&b, 102);
+
+    int64_t t = 1000000;
+    uint32_t air = rf_frame_duration_us(&a);
+    obs_set(&obs[0], &a, 1, t, -40, 90, true);
+    obs_set(&obs[1], &b, 2, t + 9000 + (int64_t)air, -40, 90, true);
+    obs_set(&obs[2], &a, 3, t + 18000 + 2 * (int64_t)air, -40, 90, true);
+
+    CHECK(rf_frag_find_runs(obs, 3, 8000, runs, 4) == 0,
+          "similar frames must never be called fragments");
+}
+
+static void test_frag_ignores_separate_presses(void)
+{
+    rf_frame_t a, b;
+    rf_obs_t obs[2];
+    rf_run_t runs[4];
+
+    CASE("fragmentation: a real pause is not a cut");
+
+    rf_ev1527_build(0x0ABCDu, 0x5u, 350, &a);
+    make_odd_frame(&b, 400);
+
+    /* Different waveforms, but a whole second apart: the transmitter stopped. */
+    obs_set(&obs[0], &a, 1, 1000000, -40, 90, true);
+    obs_set(&obs[1], &b, 2, 2000000, -40, 30, false);
+    CHECK(rf_frag_find_runs(obs, 2, 8000, runs, 4) == 0,
+          "a 1 s pause is not the idle threshold cutting anything");
+
+    /* And the boundary itself: just inside the window is a cut, just outside
+     * is not. */
+    uint32_t air = rf_frame_duration_us(&b);
+    obs_set(&obs[1], &b, 2, 1000000 + 15000 + (int64_t)air, -40, 30, false);
+    CHECK(rf_frag_find_runs(obs, 2, 8000, runs, 4) == 1, "15 ms after an 8 ms idle is a cut");
+    obs_set(&obs[1], &b, 2, 1000000 + 17000 + (int64_t)air, -40, 30, false);
+    CHECK(rf_frag_find_runs(obs, 2, 8000, runs, 4) == 0, "17 ms is past 2x the idle");
+
+    CHECK(rf_frag_find_runs(obs, 2, 0, runs, 4) == 0, "idle_us 0 means no verdict");
+    CHECK(rf_frag_find_runs(NULL, 2, 8000, runs, 4) == 0, "NULL observations");
+    CHECK(rf_frag_find_runs(obs, 2, 8000, NULL, 4) == 0, "NULL output");
+}
+
+static void test_frag_three_way_run(void)
+{
+    rf_frame_t whole, p1, p2, p3, mid, rejoined;
+    rf_obs_t obs[3];
+    rf_run_t runs[4];
+    uint32_t g1 = 0, g2 = 0;
+
+    CASE("fragmentation: three pieces rejoin as one");
+
+    rf_ev1527_build(0x7C3E1u, 0xAu, 300, &whole);
+    split_at_low(&whole, 15, &p1, &mid, &g1);
+    /* `mid` starts at index 16 of the original; splitting it again at ITS index
+     * 15 lands on original index 31, another LOW. */
+    CHECK(rf_frame_level_at(&mid, 15) == 0, "second split must also be a LOW");
+    split_at_low(&mid, 15, &p2, &p3, &g2);
+
+    int64_t t = 1000000;
+    t += rf_frame_duration_us(&p1);
+    obs_set(&obs[0], &p1, 1, t, -35, 70, false);
+    t += (int64_t)g1 + rf_frame_duration_us(&p2);
+    obs_set(&obs[1], &p2, 2, t, -35, 65, false);
+    t += (int64_t)g2 + rf_frame_duration_us(&p3);
+    obs_set(&obs[2], &p3, 3, t, -35, 60, false);
+
+    uint32_t idle = (g1 < g2 ? g1 : g2) - 50u;
+    int n = rf_frag_find_runs(obs, 3, idle, runs, 4);
+    CHECK(n == 1 && runs[0].count == 3, "one run of three, got %d runs", n);
+    CHECK(runs[0].gap_us[1] == g1 && runs[0].gap_us[2] == g2, "both gaps measured");
+
+    CHECK(rf_frame_join_run(&rejoined, obs, &runs[0]), "three-way join");
+    CHECK(rejoined.count == whole.count, "rejoined %u vs %u pulses",
+          rejoined.count, whole.count);
+    CHECK(rf_run_joined_pulses(obs, &runs[0]) == rejoined.count,
+          "three-way prediction %u vs joined %u",
+          rf_run_joined_pulses(obs, &runs[0]), rejoined.count);
+    int same = (rejoined.first_level == whole.first_level);
+    for (uint16_t i = 0; i < whole.count && i < rejoined.count; i++) {
+        if (rejoined.durations_us[i] != whole.durations_us[i]) same = 0;
+    }
+    CHECK(same, "a three-piece round trip must be exact");
+
+    /* The rejoined frame is a real EV1527 again — the strongest possible proof
+     * that the reconstruction is faithful rather than merely plausible. */
+    rf_norm_t nrm;
+    rf_decoded_t dec;
+    rf_normalize(&rejoined, &nrm);
+    CHECK(rf_decode(&rejoined, &nrm, &dec) && dec.valid, "rejoined frame must decode");
+    CHECK(dec.id == 0x7C3E1u && dec.button == 0xAu, "and to the original identity");
+}
+
+static void test_frame_join_levels(void)
+{
+    rf_frame_t a, b, out;
+
+    CASE("join: strict level alternation is preserved");
+
+    /* a ends HIGH, b starts HIGH: the gap becomes its own LOW pulse. */
+    rf_frame_reset(&a); a.first_level = 1;
+    rf_frame_push(&a, 100); rf_frame_push(&a, 200); rf_frame_push(&a, 300);
+    rf_frame_reset(&b); b.first_level = 1;
+    rf_frame_push(&b, 400); rf_frame_push(&b, 500);
+    CHECK(rf_frame_join(&out, &a, 7000, &b), "join a(HIGH-end) + b(HIGH-start)");
+    CHECK(out.count == 6, "3 + gap + 2 = 6, got %u", out.count);
+    CHECK(out.durations_us[3] == 7000, "the gap is its own pulse");
+    CHECK(rf_frame_level_at(&out, 3) == 0, "and it is LOW");
+    CHECK(out.durations_us[4] == 400 && out.durations_us[5] == 500, "b follows intact");
+
+    /* a ends LOW: the gap EXTENDS that pulse instead of doubling it. */
+    rf_frame_reset(&a); a.first_level = 1;
+    rf_frame_push(&a, 100); rf_frame_push(&a, 200);
+    CHECK(rf_frame_join(&out, &a, 7000, &b), "join a(LOW-end) + b(HIGH-start)");
+    CHECK(out.count == 4, "2 + 2 with the gap folded in, got %u", out.count);
+    CHECK(out.durations_us[1] == 7200, "gap folded into the trailing LOW, got %u",
+          out.durations_us[1]);
+
+    /* b starts LOW: its first duration is silence and joins the gap. */
+    rf_frame_reset(&b); b.first_level = 0;
+    rf_frame_push(&b, 600); rf_frame_push(&b, 400); rf_frame_push(&b, 500);
+    rf_frame_reset(&a); a.first_level = 1;
+    rf_frame_push(&a, 100); rf_frame_push(&a, 200); rf_frame_push(&a, 300);
+    CHECK(rf_frame_join(&out, &a, 7000, &b), "join a(HIGH-end) + b(LOW-start)");
+    /* 3 + one gap pulse + 2 of b's 3: b's leading silence became part of the gap
+     * rather than a fourth pulse, which is what "absorbed" buys. */
+    CHECK(out.count == 6, "b's leading silence is absorbed, got %u", out.count);
+    CHECK(out.durations_us[3] == 7600, "gap + b[0], got %u", out.durations_us[3]);
+    CHECK(out.durations_us[4] == 400, "b resumes at its first HIGH");
+
+    /* Levels must alternate everywhere, by construction. */
+    for (uint16_t i = 1; i < out.count; i++) {
+        CHECK(rf_frame_level_at(&out, i) != rf_frame_level_at(&out, (uint16_t)(i - 1)),
+              "levels alternate at %u", i);
+    }
+}
+
+static void test_frame_join_refusals(void)
+{
+    rf_frame_t a, b, out;
+
+    CASE("join: refuse rather than corrupt");
+
+    rf_frame_reset(&a); a.first_level = 1;
+    rf_frame_push(&a, 100); rf_frame_push(&a, 200); rf_frame_push(&a, 300);
+    rf_frame_reset(&b); b.first_level = 1;
+    rf_frame_push(&b, 400);
+
+    CHECK(!rf_frame_join(NULL, &a, 0, &b), "NULL output");
+    CHECK(!rf_frame_join(&out, NULL, 0, &b), "NULL a");
+    CHECK(!rf_frame_join(&out, &a, 0, NULL), "NULL b");
+
+    rf_frame_t empty;
+    rf_frame_reset(&empty);
+    CHECK(!rf_frame_join(&out, &empty, 0, &b), "empty a");
+    CHECK(!rf_frame_join(&out, &a, 0, &empty), "empty b");
+
+    /* A gap that will not fit one duration must be refused, not truncated. */
+    CHECK(!rf_frame_join(&out, &a, 70000, &b), "a gap over 65535 us cannot be a pulse");
+    CHECK(out.count == 0, "a refused join must leave the output empty");
+
+    /* b consisting only of silence has nothing to contribute. */
+    rf_frame_t silent;
+    rf_frame_reset(&silent); silent.first_level = 0;
+    rf_frame_push(&silent, 500);
+    CHECK(!rf_frame_join(&out, &a, 100, &silent), "b that is only silence");
+
+    /* Overflowing the pulse ceiling. */
+    rf_frame_t big1, big2;
+    rf_frame_reset(&big1); big1.first_level = 1;
+    rf_frame_reset(&big2); big2.first_level = 1;
+    for (uint16_t i = 0; i < RF_FRAME_MAX_PULSES; i++) {
+        rf_frame_push(&big1, 100);
+        rf_frame_push(&big2, 100);
+    }
+    CHECK(!rf_frame_join(&out, &big1, 1000, &big2), "1024 pulses cannot fit in 512");
+    CHECK(out.count == 0, "and the output is left empty");
+
+    CHECK(!rf_frame_join_run(&out, NULL, NULL), "join_run NULL");
+}
+
 int main(void)
 {
     printf("rfpulse host tests\n");
@@ -600,6 +1054,18 @@ int main(void)
     test_frame_similar();
     test_noise_rejected();
     test_degenerate_frames();
+
+    test_group_basics();
+    test_group_repeats_dominate_decoding();
+    test_group_undecoded_is_first_class();
+    test_group_tiebreaks();
+    test_group_degenerate();
+    test_frag_detects_a_chopped_transmission();
+    test_frag_ignores_honest_repeats();
+    test_frag_ignores_separate_presses();
+    test_frag_three_way_run();
+    test_frame_join_levels();
+    test_frame_join_refusals();
 
     printf("------------------\n");
     printf("%d checks passed, %d failed\n", g_pass, g_fail);

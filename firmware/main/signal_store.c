@@ -1,5 +1,5 @@
 /*
- * signal_store.c - Persisted signals, button matching, learn mode (see the header).
+ * signal_store.c - Persisted signals and button matching (see the header).
  *
  * NVS LAYOUT ("dbsig" namespace)
  *
@@ -11,7 +11,7 @@
  * ~1 KB and is fetched only when someone actually wants to replay or draw it.
  * The frame blob is written in its used length, not sizeof(rf_frame_t): storing
  * the full 1 KB array for a 49-pulse EV1527 frame would waste 90 % of the flash
- * page and, worse, multiply the erase/rewrite cost of every learn.
+ * page and, worse, multiply the erase/rewrite cost of every registration.
  *
  * ONE MUTEX, HELD BRIEFLY. Matching runs on the capture task (which holds the
  * radio lock at that moment), while the REST layer mutates from the HTTP task.
@@ -29,23 +29,26 @@
  * threshold. rf_service's burst coalescing cannot merge it (it is not a similar
  * frame), so it surfaces as its own event a quarter of a second later.
  *
- * Two things must not happen to it. It must not be reported as a DIFFERENT
- * button (it is the same press), and it must not become a learn candidate (the
- * user would register half a waveform and then wonder why replay does nothing).
- * Both are prevented by one rule, applied to every burst before anything else:
+ * It must not be reported as a DIFFERENT button, because it is the same press.
+ * That is prevented by one rule, applied to every burst before anything else:
  * a burst arriving within DB_FRAG_WINDOW_US of the previous one, with fewer than
  * DB_FRAG_MIN_PCT of its pulses, is a tail fragment and is dropped. Pulse count
  * alone is never used as a signal/noise discriminator — the bench proved the two
  * populations overlap — it is only ever used RELATIVE to the burst it follows,
  * which is exactly the relation a clipped tail has to its own frame.
  *
- * The same rule gives learn mode its "prefer the longest frame of a burst"
- * behaviour: a longer frame replaces a pending candidate, a shorter one inside
- * the window never displaces it.
+ * NOTE THAT THIS RULE IS ABOUT MATCHING ONLY. It used to do double duty as an
+ * admission filter for a separate "learn mode", which decided whether a burst
+ * was even allowed to be offered to the user. That mode is gone: registering a
+ * button now goes through a listening session (rf_raw.h), which keeps every
+ * frame, groups the repeats and ranks them, and detects a chopped transmission
+ * properly instead of discarding its pieces. Nothing in this file may filter a
+ * signal out of a user's sight any more; it only decides what an incoming burst
+ * MATCHES.
  *
  * DIAGNOSTICS. This module reports into the shared db_diag vocabulary only where
- * it has something the radio layer could not know: what a learn actually stored
- * (PROTOCOL_DECODED with the identity, or UNKNOWN_PROTOCOL_RAW with the
+ * it has something the radio layer could not know: what a registration actually
+ * stored (PROTOCOL_DECODED with the identity, or UNKNOWN_PROTOCOL_RAW with the
  * fingerprint of the raw frame that is now replayable).
  */
 #include "signal_store.h"
@@ -78,11 +81,6 @@ static const char *TAG = "db_signals";
 #define DB_FRAG_WINDOW_US 750000
 #define DB_FRAG_MIN_PCT   75u
 
-/* An absolute floor on a learn candidate, independent of the relative test
- * above: fewer pulses than this cannot carry a 24-bit payload of any known
- * family, so it is a scrap regardless of what preceded it. */
-#define DB_LEARN_MIN_PULSES 16
-
 /* ---- persisted layout ---------------------------------------------------- */
 
 typedef struct {
@@ -107,30 +105,17 @@ static bool              s_ready;
 
 /* One staging buffer for every NVS transfer, reused under the lock. Sized for
  * the index, which is the larger of the two blobs. No malloc anywhere in this
- * module: a doorbell must not be able to fail a learn because the heap is
- * fragmented. */
+ * module: a doorbell must not be able to fail a registration because the heap
+ * is fragmented. */
 static uint8_t s_blob[sizeof(sig_hdr_t) + DB_SIGNAL_MAX * sizeof(db_signal_meta_t)];
-
-/* Learn mode. The candidate's full frame is kept here so accept() can persist
- * exactly the waveform the user was shown, without asking the radio to hear it
- * again. */
-static struct {
-    bool             armed;
-    int64_t          expires_us;
-    bool             has_candidate;
-    db_signal_meta_t cand;
-    rf_frame_t       cand_frame;
-    uint8_t          cand_repeats;
-    int              cand_rssi_dbm;
-} s_learn;
 
 /* What the previous burst looked like, for the fragment test. */
 static struct {
     int64_t  last_ts_us;    /* rf_event_t.ts_us of the last burst examined     */
     uint16_t ref_pulses;    /* pulse count of the last NON-fragment burst      */
     uint16_t matched_id;    /* what that burst matched, 0 if nothing           */
-    bool     was_fragment;  /* the verdict for last_ts_us, so a second caller
-                               (learn) re-uses it instead of re-deriving it    */
+    bool     was_fragment;  /* the verdict for last_ts_us, cached so a repeat
+                               question about the same burst is free           */
 } s_recent;
 
 /* ---- small helpers ------------------------------------------------------- */
@@ -605,7 +590,35 @@ esp_err_t db_signals_add_frame(const rf_frame_t *frame, const rf_decoded_t *deco
     db_signal_meta_t m;
     meta_from_parts(&m, id, name, origin, frame, &norm, dec, fp);
     esp_err_t err = store(&m, frame, id_out);
+
+    /* Copy out what the report needs before dropping the lock. */
+    bool     rep_decoded = m.decoded_valid;
+    uint32_t rep_id      = m.decoded_id;
+    uint8_t  rep_btn     = m.decoded_button;
+    uint16_t rep_pulses  = m.pulse_count;
+    rf_fingerprint_t rep_fp = m.fingerprint;
+    char rep_name[DB_SIGNAL_NAME_MAX];
+    char rep_proto[RF_PROTOCOL_NAME_MAX];
+    memcpy(rep_name, m.name, sizeof(rep_name));
+    memcpy(rep_proto, m.protocol, sizeof(rep_proto));
     unlock();
+
+    /* Registering something heard off the air is the one moment this module
+     * knows something the radio layer could not: whether what the user just
+     * kept is a protocol we understand or an opaque waveform that is
+     * nonetheless fully replayable. Both are successes and both are reported —
+     * the second one especially, because a box that stayed silent about it is
+     * what made unknown protocols feel unsupported. */
+    if (err == ESP_OK && origin == DB_ORIGIN_CAPTURED) {
+        if (rep_decoded)
+            db_diag_report(DB_DIAG_PROTOCOL_DECODED,
+                           "registered '%s' as %s id=0x%lX btn=0x%X",
+                           rep_name, rep_proto, (unsigned long)rep_id, rep_btn);
+        else
+            db_diag_report(DB_DIAG_UNKNOWN_PROTOCOL_RAW,
+                           "registered '%s' raw: %u pulses, fp %08lx (replayable)",
+                           rep_name, rep_pulses, (unsigned long)rep_fp);
+    }
     return err;
 }
 
@@ -648,8 +661,7 @@ esp_err_t db_signals_delete(uint16_t id)
     erase_frame(id);
     esp_err_t err = save_index();
 
-    /* A pending learn candidate is unaffected (it is not stored yet), but the
-     * recent-burst reference may name the signal we just removed. */
+    /* The recent-burst reference may name the signal we just removed. */
     if (s_recent.matched_id == id)
         s_recent.matched_id = 0;
     unlock();
@@ -664,9 +676,8 @@ esp_err_t db_signals_delete(uint16_t id)
  * Judge a burst against its predecessor and remember it. Returns true when the
  * burst is a trailing fragment of the previous one (see the file header).
  *
- * Called from both db_signals_match() and db_signals_learn_offer(); the second
- * caller re-uses the verdict for the same burst (identified by its ts_us) rather
- * than comparing the burst against itself.
+ * A repeat question about the same burst (identified by its ts_us) re-uses the
+ * verdict rather than comparing the burst against itself.
  *
  * Caller holds the lock.
  */
@@ -727,7 +738,7 @@ uint16_t db_signals_match(const rf_event_t *ev)
         hit = match_decoded(&ev->decoded);
     if (!hit && ev->fingerprint != 0) {
         /* Fingerprint fallback. It already encodes the pulse count and every
-         * pulse as a multiple of the frame's own learned base, so it is stable
+         * pulse as a multiple of the frame's own estimated base, so it is stable
          * across oscillator drift and cannot collide across different lengths. */
         for (int i = 0; i < s_count; i++) {
             if (s_meta[i].fingerprint == ev->fingerprint) {
@@ -761,248 +772,6 @@ uint16_t db_signals_match(const rf_event_t *ev)
 
     unlock();
     return id;
-}
-
-/* ---- learn mode ---------------------------------------------------------- */
-
-/* Caller holds the lock. Expires an armed session that ran out of time. */
-static void learn_check_expiry(void)
-{
-    if (!s_learn.armed)
-        return;
-    if (esp_timer_get_time() < s_learn.expires_us)
-        return;
-
-    s_learn.armed = false;
-    ESP_LOGI(TAG, "learn mode expired");
-    db_events_push(DB_EV_LEARN, 0, 0, 0, 0, "Learn mode expired");
-}
-
-void db_signals_learn_arm(uint32_t timeout_secs)
-{
-    if (timeout_secs == 0)
-        timeout_secs = DB_LEARN_DEFAULT_SECS;
-
-    lock();
-    s_learn.armed         = true;
-    s_learn.expires_us    = esp_timer_get_time() + (int64_t)timeout_secs * 1000000;
-    s_learn.has_candidate = false;
-    memset(&s_learn.cand, 0, sizeof(s_learn.cand));
-    rf_frame_reset(&s_learn.cand_frame);
-    s_learn.cand_repeats  = 0;
-    s_learn.cand_rssi_dbm = 0;
-    unlock();
-
-    ESP_LOGI(TAG, "learn mode armed for %lus (need >=%d repeats, >=%d%% confidence)",
-             (unsigned long)timeout_secs, DB_LEARN_MIN_REPEATS,
-             DB_LEARN_MIN_CONFIDENCE);
-    db_events_push(DB_EV_LEARN, 0, 0, 0, 0, "Learn armed for %lus",
-                   (unsigned long)timeout_secs);
-}
-
-void db_signals_learn_cancel(void)
-{
-    lock();
-    bool was = s_learn.armed;
-    s_learn.armed         = false;
-    s_learn.has_candidate = false;
-    unlock();
-
-    if (was) {
-        ESP_LOGI(TAG, "learn mode cancelled");
-        db_events_push(DB_EV_LEARN, 0, 0, 0, 0, "Learn cancelled");
-    }
-}
-
-bool db_signals_learn_active(uint32_t *remaining_secs)
-{
-    lock();
-    learn_check_expiry();
-    bool active = s_learn.armed;
-    if (remaining_secs) {
-        int64_t left = active ? (s_learn.expires_us - esp_timer_get_time()) : 0;
-        *remaining_secs = (left > 0) ? (uint32_t)(left / 1000000) : 0;
-    }
-    unlock();
-    return active;
-}
-
-bool db_signals_learn_offer(const rf_event_t *ev)
-{
-    if (!ev || ev->frame.count == 0)
-        return false;
-    /* Cheap when disarmed: one read of a bool before anything else. The RF path
-     * calls this for every unmatched burst, armed or not. */
-    if (!s_learn.armed)
-        return false;
-
-    lock();
-    learn_check_expiry();
-    if (!s_learn.armed) {
-        unlock();
-        return false;
-    }
-
-    /* Admission criteria, both required. Repeats is
-     * the strongest filter (a real remote always sends several copies), and the
-     * confidence floor sits in the empty gap between the measured noise and
-     * signal populations. */
-    if (ev->repeats < DB_LEARN_MIN_REPEATS) {
-        ESP_LOGD(TAG, "learn: rejected, %u repeat(s) < %d",
-                 ev->repeats, DB_LEARN_MIN_REPEATS);
-        unlock();
-        return false;
-    }
-    if (ev->norm.confidence < DB_LEARN_MIN_CONFIDENCE) {
-        ESP_LOGI(TAG, "learn: rejected, confidence %u%% < %d%% (%u pulses, %d dBm)",
-                 ev->norm.confidence, DB_LEARN_MIN_CONFIDENCE,
-                 ev->frame.count, ev->rssi_dbm);
-        unlock();
-        return false;
-    }
-    if (ev->frame.count < DB_LEARN_MIN_PULSES) {
-        ESP_LOGI(TAG, "learn: rejected, %u pulses is too short to be a payload",
-                 ev->frame.count);
-        unlock();
-        return false;
-    }
-
-    /* The fragment rule, in its learn-mode guise. Registering the 33-pulse tail
-     * of a 49-pulse press would store an unreplayable stub. */
-    if (judge_burst(ev)) {
-        ESP_LOGI(TAG, "learn: ignoring %u-pulse tail fragment of a %u-pulse frame",
-                 ev->frame.count, s_recent.ref_pulses);
-        unlock();
-        return false;
-    }
-
-    /* Prefer the longest frame of a burst: a candidate is only displaced by a
-     * frame at least as long, or by one arriving after the fragment window (a
-     * deliberate second press of a different button). */
-    if (s_learn.has_candidate &&
-        ev->frame.count < s_learn.cand.pulse_count &&
-        (ev->ts_us - s_learn.cand.last_seen_us) < DB_FRAG_WINDOW_US) {
-        ESP_LOGD(TAG, "learn: keeping the longer candidate (%u vs %u pulses)",
-                 s_learn.cand.pulse_count, ev->frame.count);
-        unlock();
-        return false;
-    }
-
-    meta_from_parts(&s_learn.cand, 0, "", DB_ORIGIN_CAPTURED, &ev->frame,
-                    &ev->norm, &ev->decoded, ev->fingerprint);
-    /* id stays 0 until accept() assigns one. The live-stat fields are reused to
-     * carry the candidate's evidence to the UI: seen_count is the burst's repeat
-     * count and last_seen_us is when it arrived. */
-    s_learn.cand.seen_count   = ev->repeats;
-    s_learn.cand.last_seen_us = ev->ts_us;
-    s_learn.cand_frame        = ev->frame;
-    s_learn.cand_repeats      = ev->repeats;
-    s_learn.cand_rssi_dbm     = ev->rssi_dbm;
-    s_learn.has_candidate     = true;
-
-    unlock();
-
-    ESP_LOGI(TAG, "learn candidate: %u pulses, base %u us, conf %u%%, "
-                  "%u repeats, %d dBm, %s",
-             ev->frame.count, ev->norm.base_us, ev->norm.confidence,
-             ev->repeats, ev->rssi_dbm,
-             ev->decoded.valid ? ev->decoded.text : "unknown protocol");
-    db_events_push(DB_EV_LEARN, 0, 0, ev->rssi_dbm, ev->repeats,
-                   "Learn candidate: %s",
-                   ev->decoded.valid ? ev->decoded.text : "raw frame");
-    return true;
-}
-
-bool db_signals_learn_candidate(db_signal_meta_t *out)
-{
-    lock();
-    bool have = s_learn.has_candidate;
-    if (have && out)
-        *out = s_learn.cand;
-    unlock();
-    return have;
-}
-
-/* The same answer plus the reception quality of the burst behind it. RSSI and
- * repeat count describe ONE reception, not the signal, which is why they are not
- * in db_signal_meta_t — but they are exactly what tells a user whether the
- * candidate on screen is their remote (-30 dBm, 4 copies) or something across
- * the street. Kept from the offered rf_event_t; any out-pointer may be NULL. */
-bool db_signals_learn_candidate_info(db_signal_meta_t *meta,
-                                     int16_t *rssi_dbm, uint8_t *repeats)
-{
-    lock();
-    bool have = s_learn.has_candidate;
-    if (have) {
-        if (meta)
-            *meta = s_learn.cand;
-        if (rssi_dbm)
-            *rssi_dbm = (int16_t)s_learn.cand_rssi_dbm;
-        if (repeats)
-            *repeats = s_learn.cand_repeats;
-    }
-    unlock();
-    return have;
-}
-
-esp_err_t db_signals_learn_accept(const char *name, uint16_t *id_out)
-{
-    lock();
-    if (!s_learn.has_candidate) {
-        unlock();
-        return ESP_ERR_INVALID_STATE;   /* the API maps this to 409 */
-    }
-
-    uint16_t id = next_free_id();
-    if (id == 0) {
-        unlock();
-        return ESP_ERR_NO_MEM;
-    }
-
-    db_signal_meta_t m = s_learn.cand;
-    m.id = id;
-    snprintf(m.name, sizeof(m.name), "%s",
-             (name && name[0]) ? name : "Learned button");
-    m.created_at   = now_unix();
-    m.last_seen_us = 0;
-    m.seen_count   = 0;
-
-    esp_err_t err = store(&m, &s_learn.cand_frame, id_out);
-    if (err == ESP_OK) {
-        /* Learn mode cancels on the first accepted registration:
-         * leaving it armed would invite the next stray burst to overwrite the
-         * candidate the user just confirmed. */
-        s_learn.armed         = false;
-        s_learn.has_candidate = false;
-    }
-    bool decoded  = m.decoded_valid;
-    uint32_t did  = m.decoded_id;
-    uint8_t  btn  = m.decoded_button;
-    uint16_t pc   = m.pulse_count;
-    rf_fingerprint_t fp = m.fingerprint;
-    char nm[DB_SIGNAL_NAME_MAX];
-    memcpy(nm, m.name, sizeof(nm));
-    char proto[RF_PROTOCOL_NAME_MAX];
-    memcpy(proto, m.protocol, sizeof(proto));
-    unlock();
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "learn accept failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    if (decoded)
-        db_diag_report(DB_DIAG_PROTOCOL_DECODED,
-                       "learned '%s' as %s id=0x%lX btn=0x%X",
-                       nm, proto, (unsigned long)did, btn);
-    else
-        db_diag_report(DB_DIAG_UNKNOWN_PROTOCOL_RAW,
-                       "learned '%s' raw: %u pulses, fp %08lx (replayable)",
-                       nm, pc, (unsigned long)fp);
-
-    ESP_LOGI(TAG, "learned signal %u '%s'", (unsigned)id, nm);
-    db_events_push(DB_EV_LEARN, id, 0, 0, 0, "Learned '%s'", nm);
-    return ESP_OK;
 }
 
 /* ---- virtual signals ----------------------------------------------------- */

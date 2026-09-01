@@ -30,6 +30,7 @@
 #include "esp_err.h"
 #include "rf_decode.h"
 #include "rf_frame.h"
+#include "rf_raw.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,6 +77,26 @@ esp_err_t rf_service_transmit(const rf_frame_t *frame, uint8_t repeats, uint32_t
 
 /* Current RSSI in dBm (valid while receiving). */
 esp_err_t rf_service_rssi(int *dbm_out);
+
+/*
+ * Raw capture sessions (rf_raw.h). They live behind the radio owner because
+ * relaxing the filters means RE-CREATING the RMT receive channel with a
+ * different idle threshold and minimum pulse count, and nothing outside this
+ * module is allowed to do that. rf_raw itself never touches the radio, so there
+ * is no lock ordering to get wrong.
+ *
+ * While a session runs the normal pipeline is NOT switched off: frames that
+ * would have passed the ordinary thresholds still go through burst coalescing,
+ * matching and the node graph, so the doorbell keeps working during a session.
+ * Everything BELOW those thresholds goes to the recorder only, and can therefore
+ * never make the graph fire on noise.
+ *
+ * Returns ESP_ERR_INVALID_STATE if a session is already running, ESP_ERR_NO_MEM
+ * if the heap cannot take it (in which case nothing is allocated and capture is
+ * left exactly as it was).
+ */
+esp_err_t rf_service_raw_start(const db_raw_cfg_t *cfg);
+void      rf_service_raw_stop(void);
 
 #ifdef __cplusplus
 }

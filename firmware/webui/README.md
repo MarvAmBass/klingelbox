@@ -19,7 +19,7 @@ rather than control — three paragraphs of intro above the map and a nine-line
 badge legend on top of the canvas. The Dashboard is now a title, one clause, the
 two blocking warnings, one toolbar row and the map.
 
-There is still no Signals screen and no Learn screen: a signal is learned,
+There is still no Signals screen and no Learn screen: a signal is heard,
 synthesized, inspected, replayed and rebound from inside the node that uses it.
 Everything revolves around the nodes.
 
@@ -105,7 +105,7 @@ Concretely:
 ## Signals are reached *through* nodes
 
 The user's framing, and the whole information architecture: *"when we add a
-433 MHz button we're asked to learn or choose a signal, when we create a virtual
+433 MHz button we're asked to listen for or choose a signal, when we create a virtual
 button we can configure the virtual signal — do not make this separate, it all
 revolves around the nodes."*
 
@@ -114,17 +114,47 @@ revolves around the nodes."*
 from, and only then is the node created — already bound, and named after the
 signal:
 
-**Learn · Select · Configure**, in that order:
+**Listen · Select · Configure**, in that order:
 
 | Choice | What happens |
 |---|---|
-| 🎓 **Learn a new button** | `POST /api/learn/arm` (auto-armed), live countdown, `GET /api/learn` at 1 Hz, the candidate with confidence/repeats/RSSI, name it, `POST /api/learn/accept` |
+| 🎧 **Listen for a new button** | `POST /api/raw/start` (auto-started), live countdown, `GET /api/raw` at 1 Hz, a **ranked candidate list**, then inspect → trim → `POST /api/raw/candidates/{n}/transmit` → `POST /api/raw/candidates/{n}/save` |
 | 📚 **Use a signal you already have** | the signal picker: every stored signal, its decoded identity, last seen, and which nodes use it |
 | ✨ **Configure by hand** | name / button nibble / base pulse / 20-bit address → `POST /api/signals/virtual` |
 
 All three are bottom sheets, so they work on a phone; each ends in exactly one
-confirmation and a working node. Closing a learn sheet mid-flow cancels learn
-mode on the box (`POST /api/learn/cancel`) rather than leaving it armed.
+confirmation and a working node. Closing a listening sheet mid-flow stops the
+session on the box (`POST /api/raw/stop`) rather than leaving it recording — the
+frames are kept, so reopening it shows them again.
+
+### One flow, where there used to be two
+
+There was a *Learn* flow and a separate *Raw capture* flow. Learn armed the box
+and waited for a burst that repeated at least twice **and** normalized to 65 %
+confidence; raw capture recorded everything and let you cut a signal out by
+hand. Both thresholds were measured on EV1527 remotes, so learn was in practice
+a flow for one protocol family — a remote of any other shape produced no
+candidate, no error, and no explanation. Raw capture, offered as the escape
+hatch for exactly that case, picked the same remote up without trouble.
+
+They are now one flow. Detection keeps everything; the box **ranks** instead:
+
+* **repetition dominates** — a real remote repeats itself and noise does not, and
+  counting that needs no protocol knowledge;
+* a decode and a high confidence only break ties. An undecoded candidate is
+  first-class and can be top of the list.
+
+Each row shows `why` it is ranked where it is (`"seen 5 times, decoded ev1527,
+92% confidence"`) rather than a score. Under the ranked list, a collapsed
+*Every frame recorded* section holds the unranked frames, so grouping can never
+hide anything from the user.
+
+**Fragmentation** is surfaced in words. If one press arrives cut into several
+dissimilar pieces the box says so, offers a one-tap retry at a longer
+`idle_us` derived from the widest gap it measured, and — where the pieces fit
+back together — lists the rejoined whole as a 🧩 candidate stitched with the
+*measured* silence. That is the fix for "it split the signal into pieces and I
+had to test many of them".
 
 ### Configure by hand, and why its wording no longer forks
 
@@ -165,13 +195,13 @@ decoded identity, base pulse, confidence meter, pulse count, last seen, seen
 count, the inline SVG waveform with the 49-vs-50-pulse note for synthesized
 frames, **📡 Transmit** to test, the **Pair with a receiver** panel with its
 numbered steps and 20× *Pair now* burst for `origin: "synthesized"`, plus
-rename, **🔀 Use a different signal**, **🎓 Re-learn** and (on a transmit sink)
+rename, **🔀 Use a different signal**, **🎧 Listen again** and (on a transmit sink)
 **✨ Create a virtual signal**. Rebinding applies immediately; it is an action,
 not a form field.
 
 ### The store outlives the graph
 
-A learned signal is a *recording of a physical remote*; the graph is only
+A captured signal is a *recording of a physical remote*; the graph is only
 wiring. So **deleting a node, unlinking it or rebinding it never touches the
 store** — the waveform stays under its name and can be picked again tomorrow.
 Rewiring must never cost someone a walk to the front door with a remote in hand.
@@ -180,7 +210,7 @@ Consequently nothing on the Dashboard can destroy a signal: the picker is purely
 constructive. Removing one for good is a separate, deliberate act with exactly
 one home, **Settings → Stored signals**.
 
-That list stays compact — name, decoded identity, learned/virtual, in-use
+That list stays compact — name, decoded identity, captured/virtual, in-use
 marker, age — and a tap opens the full detail sheet, whose body is *the same
 `signalBlock()` the node editor embeds*. So the waveform, confidence meter, base
 pulse, pulse count, RSSI, seen/last-seen, the 49-vs-50 note, the pairing panel
@@ -385,7 +415,7 @@ Five tabs, plus the recovery wizard that replaces the whole page.
 | **Activity** — the live feed | `/api/events?since=` |
 | **Handbook** — the offline manual | `/api/config` (once, for the real MQTT base topic) |
 | *header status chips* — on every tab | `/api/system`, `/api/radio` |
-| ↳ *add-node flow: learn* | `/api/learn`, `/api/learn/arm`, `/api/learn/cancel`, `/api/learn/accept` |
+| ↳ *add-node flow: listen* | `/api/raw`, `/api/raw/start`, `/api/raw/stop`, `/api/raw/candidates/{n}`, `/api/raw/candidates/{n}/transmit`, `/api/raw/candidates/{n}/save` |
 | ↳ *add-node flow: configure by hand* | `/api/signals/virtual` |
 | ↳ *node editor, signal inline* | `/api/signals`, `/api/signals/{id}` (GET/POST), `/api/signals/{id}/transmit` |
 | **Settings** | `/api/config`, `/api/ap`, `/api/radio`, `/api/wifi/scan`, `/api/system/hostname`, `/api/ota*`, `/api/update*`, `/api/restart` |
@@ -458,11 +488,11 @@ node that ends up using one — as the pairing panel on a transmit sink, as the
 "something else has to send this" note on a source — because the screen you are
 no longer looking at by the time nothing rings is the creation form.
 
-**Learn** states plainly that the receiver is always listening and that learn
-mode only changes the fate of an *unrecognised* burst. The admission thresholds
-(`repeats ≥ 2`, `confidence ≥ 65`) are shown with the bench numbers behind them:
-real presses score 67–92 %, band noise 24–48 %. In the flow that copy is
-collapsed behind a `<details>`, so the countdown and the candidate still fit
+**Listening** states plainly that the receiver is always listening and that a
+session only changes the fate of an *unrecognised* burst. It also states that
+nothing is admitted or rejected on how it looks — candidates are ranked, not
+filtered — and says which evidence does the ranking. In the flow that copy is
+collapsed behind a `<details>`, so the countdown and the candidate list still fit
 above the fold in a 360 px bottom sheet.
 
 **Diagnostics** renders each state with its firmware-supplied `help` sentence,
@@ -493,7 +523,7 @@ radio and the battery busy. `visibilitychange` refreshes immediately on return.
 | `events` | 2 s | **Activity** visible — the Dashboard no longer polls it at all |
 | `feedclock` | 1 s | Activity visible — relabels feed ages in place, no re-render |
 | `monitor` | 1 s | Dashboard visible **and** at least one Monitor node exists |
-| `learn` | 1 s | only while a learn sheet is open; torn down on close |
+| `raw` | 1 s | only while a listening sheet is open; torn down on close |
 | `diag` | 5 s | Diagnostics visible |
 | *(uptime tick)* | 1 s | always — **not a poll**, and deliberately outside the `timers` map |
 
@@ -505,11 +535,13 @@ fetched. Its whole body is one comparison and at most one `nodeValue`
 assignment. `dashclock` is gone — its only job was re-rendering the status
 chips, which are in the header now.
 
-`/api/learn` has no loader of its own any more: it is polled by `openLearnFlow`
-for exactly as long as its sheet is on screen. `openSheet` therefore takes an
-`onClose` callback that fires however the sheet goes away — the ✕, Escape, or a
-tap on the scrim — which is what lets the flow stop its timer *and* send
-`POST /api/learn/cancel` when someone backs out of an armed box.
+`/api/raw` has no loader of its own beyond a single boot probe: it is polled by
+`openListenFlow` for exactly as long as its sheet is on screen. `openSheet`
+therefore takes an `onClose` callback that fires however the sheet goes away —
+the ✕, Escape, or a tap on the scrim — which is what lets the flow stop its timer
+*and* send `POST /api/raw/stop` when someone backs out of a recording box. The
+boot probe exists so that a firmware without the feature removes the button
+rather than offering one that 404s.
 
 `GET /api/events?since=<serial>` is guarded by its serial: an unchanged serial
 with no new events returns early and the feed DOM is left completely alone, so

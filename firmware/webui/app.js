@@ -15,7 +15,7 @@
  *    because this box can be reached over its own captive portal with no
  *    internet, so the documentation has to ship inside it.
  *
- *    There is still no Signals screen and no Learn screen: a signal is learned,
+ *    There is still no Signals screen and no Learn screen: a signal is heard,
  *    synthesized, inspected and rebound from inside the node that uses it. The
  *    store itself outlives the graph (deleting a node never deletes a
  *    recording), so the one destructive list lives under Settings.
@@ -171,7 +171,7 @@ var S = {
   signalsErr: null,       /* last /api/signals failure, shown where signals are listed */
   graph: null,
   gpio: null,
-  learn: null,            /* only while a learn flow sheet is open */
+  raw: null,              /* last GET /api/raw; also the "have probed" flag */
   diag: null,
   /* Monitor telemetry from GET /api/monitor: { now_s, at, by: { id -> node } }.
      null = never fetched, which is also the "have not probed yet" state. */
@@ -186,7 +186,8 @@ var S = {
   built: {},              /* tab -> true once its static frame is in the DOM */
 
   /* feature availability, driven purely by response codes */
-  has: { gpio: true, diagnostics: true, radioCfg: true, ap: true, config: true, monitor: true },
+  has: { gpio: true, diagnostics: true, radioCfg: true, ap: true, config: true,
+         monitor: true, raw: true },
   txBlock: null,          /* reason string when transmit is unavailable */
 
   upBase: null,           /* uptime_s at the last /api/system */
@@ -467,6 +468,15 @@ function onTabEnter(name, resumed) {
     case "diagnostics":
       buildDiagnostics();
       poll("diag", 5000, loadDiagnostics);
+      /* One probe, exactly like the Monitor node's: it is what tells a 404
+         (this firmware has no listening sessions — take the button away) apart from
+         "no session has been run yet". Not polled: a session that is running
+         has its own sheet open, and this panel is only a doorway. */
+      if (S.has.raw) loadRaw().then(renderRawPanel).catch(renderRawPanel);
+      /* The suggested squelch floor is derived from the live band level, so make
+         sure /api/radio has been read at least once before anyone opens it. */
+      if (!S.radio) api("/api/radio").then(function (r) { S.radio = r; })
+                       .catch(function () { /* the flow falls back to a fixed default */ });
       break;
     case "handbook":
       /* Static prose — nothing to poll. The only live thing on it is the MQTT
@@ -615,8 +625,10 @@ function loadConfig() {
     .catch(function (e) { if (e.status === 404) S.has.config = false; return null; });
 }
 
-/* /api/learn has no loader of its own any more: it is polled only for as long
-   as a learn flow sheet is open, from inside openLearnFlow(). */
+/* /api/raw is polled only for as long as a listening sheet is open, from
+   inside openListenFlow(). There is no /api/learn any more: registering a
+   button and recording raw frames were two shapes of the same job, and the
+   narrower one made a whole class of transmitter invisible. */
 
 function loadDiagnostics() {
   return api("/api/diagnostics").then(function (res) {
@@ -725,7 +737,12 @@ function txBlockNote() {
    Waveform plot -- durations_us drawn as a HIGH/LOW square wave
    ====================================================================== */
 
-function waveform(durations, firstLevel) {
+/* `sel` is optional: { from, to } as zero-based pulse indices, `from` inclusive
+   and `to` exclusive (Array.slice semantics, which is also what the raw-capture
+   API takes). When present the whole frame is still drawn -- you cannot judge a
+   trim without seeing what you are cutting away -- and the selected span is
+   shaded, with the caption describing the SELECTION rather than the frame. */
+function waveform(durations, firstLevel, sel) {
   if (!durations || !durations.length) return null;
   var MAXP = 800;
   var n = Math.min(durations.length, MAXP);
@@ -736,9 +753,11 @@ function waveform(durations, firstLevel) {
   var W = 1000, HI = 7, LO = 33, H = 40;
   var lvl = firstLevel ? 1 : 0;
   var x = 0;
+  var xs = [0];
   var d = "M0," + (lvl ? HI : LO);
   for (i = 0; i < n; i++) {
     x += (durations[i] || 0) * W / total;
+    xs.push(x);
     d += "H" + x.toFixed(2);
     lvl = lvl ? 0 : 1;
     d += "V" + (lvl ? HI : LO);
@@ -753,6 +772,20 @@ function waveform(durations, firstLevel) {
   var mid = svgEl("path", "mid");
   mid.setAttribute("d", "M0,20 H" + W);
   add(svg, mid);
+
+  var from = 0, to = n, selUs = 0;
+  if (sel) {
+    from = Math.max(0, Math.min(n, numOr(sel.from, 0)));
+    to = Math.max(from, Math.min(n, numOr(sel.to, n)));
+    for (i = from; i < to; i++) selUs += Math.max(0, durations[i] || 0);
+    var band = svgEl("rect", "wave-sel");
+    band.setAttribute("x", xs[from].toFixed(2));
+    band.setAttribute("y", "0");
+    band.setAttribute("width", Math.max(0, xs[to] - xs[from]).toFixed(2));
+    band.setAttribute("height", String(H));
+    add(svg, band);
+  }
+
   var p = svgEl("path");
   p.setAttribute("d", d);
   add(svg, p);
@@ -763,9 +796,12 @@ function waveform(durations, firstLevel) {
 
   var box = el("div");
   add(box, wrap);
-  add(box, el("div", "wave-cap",
-    n + (durations.length > n ? " of " + durations.length : "") + " pulses · " +
-    (total / 1000).toFixed(1) + " ms · starts " + (firstLevel ? "HIGH" : "LOW")));
+  add(box, el("div", "wave-cap", sel
+    ? ((to - from) + " of " + n + " pulses selected · " + (selUs / 1000).toFixed(1) +
+       " ms · starts " + ((firstLevel ^ (from & 1)) ? "HIGH" : "LOW"))
+    : (n + (durations.length > n ? " of " + durations.length : "") + " pulses · " +
+       (total / 1000).toFixed(1) + " ms · starts " + (firstLevel ? "HIGH" : "LOW"))));
+  box.svg = svg;
   return box;
 }
 
@@ -777,10 +813,10 @@ function waveform(durations, firstLevel) {
    everything a signal needs happens where the signal is used:
 
      * a node that needs one is CREATED through the choice of that signal --
-       learn it off the air, pick one already stored, or synthesize a virtual
+       hear it off the air, pick one already stored, or synthesize a virtual
        one -- in a single flow with a single confirmation,
      * a node that HAS one shows it inline in its editor: decode, waveform,
-       pairing, transmit-to-test, rename, re-learn, swap.
+       pairing, transmit-to-test, rename, listen again, swap.
 
    THE STORE IS NOT THE GRAPH. A learned signal is a recording of a physical
    remote; the graph is only wiring. Deleting a node, unlinking it or rebinding
@@ -1035,7 +1071,7 @@ function signalBlock(sig, opts) {
     add(box, el("div", "note",
       "This recording belongs to the box, not to this node. Deleting the node, unlinking it or " +
       "pointing it at a different signal leaves it in the store under its name — you never have " +
-      "to walk to the door and learn a button twice." +
+      "to walk to the door and register a button twice." +
       (others.length ? " " + usedByText(others) + " as well." : "") +
       " To remove it for good: Settings → Stored signals."));
   }
@@ -1054,7 +1090,7 @@ function signalBlock(sig, opts) {
      .title        wording for the calling context
      .onPick       fn(signal)
      .node         the node being configured
-     .onLearn      optional fn() -- offered as "learn one instead"
+     .onListen     optional fn() -- offered as "listen for one instead"
      .onVirtual    optional fn() -- offered as "create one instead"
    ---------------------------------------------------------------------- */
 var pickerRefresh = null;   /* set while a picker sheet is open */
@@ -1070,13 +1106,13 @@ function openSignalPicker(opts) {
   add(sh.body, listWrap);
 
   function alts(where) {
-    if (!opts.onLearn && !opts.onVirtual) return;
+    if (!opts.onListen && !opts.onVirtual) return;
     var row = el("div", "btnrow");
     row.style.marginTop = ".7rem";
-    if (opts.onLearn) {
-      var lb = el("button", "btn", "🎓 Learn a new button");
+    if (opts.onListen) {
+      var lb = el("button", "btn", "🎧 Listen for a new button");
       lb.type = "button";
-      lb.addEventListener("click", function () { sh.close(); opts.onLearn(); });
+      lb.addEventListener("click", function () { sh.close(); opts.onListen(); });
       add(row, lb);
     }
     if (opts.onVirtual) {
@@ -1132,235 +1168,6 @@ function openSignalPicker(opts) {
   /* Cheap and worth it: the store may have changed since this tab was entered. */
   loadSignals();
   return sh;
-}
-
-/* ----------------------------------------------------------------------
-   Learn, as a flow rather than a screen.
-
-   Everything the old Learn tab said is here: the countdown, the "the receiver
-   is always listening" explanation, the admission thresholds with the bench
-   numbers, the candidate with its confidence, repeats and RSSI, and the name
-   field. It resolves with the created signal, so the caller can bind it to a
-   node in the same breath -- one flow, one confirmation.
-
-   On a phone this is a bottom sheet: countdown and candidate sit at the top,
-   the explanation is collapsed underneath so the sheet still fits a 360 px
-   screen without scrolling past the thing you are waiting for.
-   ---------------------------------------------------------------------- */
-function openLearnFlow(opts) {
-  opts = opts || {};
-  return new Promise(function (resolve) {
-    var done = false;
-    var armed = false;
-
-    var sh = openSheet(opts.title || "Learn a button",
-      opts.sub || "Arm the receiver, then press the button on your remote a few times.",
-      function () {
-        stopPoll("learn");
-        if (done) return;
-        done = true;
-        /* Closing the sheet must not leave the box armed behind your back. */
-        if (armed) postJSON("/api/learn/cancel", {}).catch(function () { /* ignore */ });
-        resolve(null);
-      });
-
-    function finish(sig) {
-      if (done) return;
-      done = true;
-      stopPoll("learn");
-      sh.close();
-      resolve(sig || null);
-    }
-
-    var count = el("div", "countdown idle", "—");
-    var state = el("div", "listening");
-    add(sh.body, count, state);
-
-    var candPanel = el("div", "candidate hidden");
-    add(sh.body, candPanel);
-
-    var timeoutSel = selectEl([
-      { value: 30, label: "30 seconds" },
-      { value: 60, label: "1 minute" },
-      { value: 120, label: "2 minutes" },
-      { value: 300, label: "5 minutes" }
-    ], 60);
-    add(sh.body, field("Stay armed for", timeoutSel,
-      "Learn mode always expires on its own, so the box never sits armed forever."));
-
-    var msg = el("div", "formmsg");
-    var ctl = el("div", "btnrow");
-    var armBtn = el("button", "btn primary", "Arm learn mode");
-    armBtn.type = "button";
-    var cancelBtn = el("button", "btn", "Cancel");
-    cancelBtn.type = "button";
-    add(ctl, armBtn, cancelBtn);
-    add(sh.body, ctl, msg);
-
-    armBtn.addEventListener("click", function () {
-      armBtn.disabled = true;
-      setMsg(msg, "Arming…");
-      postJSON("/api/learn/arm", { timeout_s: intOf(timeoutSel, 60) }).then(function () {
-        armed = true;
-        setMsg(msg, "Armed. Press your remote button now — several times.", "ok");
-        poll("learn", 1000, tick);
-      }).catch(function (e) {
-        setMsg(msg, e.message, "err");
-      }).then(function () { armBtn.disabled = false; });
-    });
-    cancelBtn.addEventListener("click", function () {
-      cancelBtn.disabled = true;
-      postJSON("/api/learn/cancel", {}).then(function () { armed = false; return tick(); })
-        .catch(function (e) { setMsg(msg, e.message, "err"); })
-        .then(function () { cancelBtn.disabled = false; });
-    });
-
-    if (opts.note) add(sh.body, el("div", "note", opts.note));
-
-    /* The single most misunderstood part of the box, kept verbatim from the
-       screen this flow replaces -- collapsed, because it is read once. */
-    var ep = section("What learn mode actually does", null, false);
-    add(ep.bodyEl, el("p", "small",
-      "The receiver is ALWAYS listening. It has to be: a button you already registered must " +
-      "ring the moment it is pressed, so there is no on-demand receive mode to switch on."));
-    add(ep.bodyEl, el("p", "small",
-      "Learn mode changes exactly one thing — the fate of a signal the box does NOT recognise. " +
-      "Normally such a signal is dropped with one line in the activity feed. While armed, it is " +
-      "offered to you here for registration instead. Signals you already know behave identically " +
-      "either way."));
-    add(ep.bodyEl, el("div", "note",
-      "A candidate must repeat at least twice and decode with at least 65% confidence before it " +
-      "is offered. Both thresholds come from bench measurements: a real remote always sends " +
-      "several copies (67-92% confidence), while band noise scores 24-48% and rarely repeats. " +
-      "Without those filters the box would happily register the amplifier's own noise as a doorbell."));
-    add(sh.body, ep);
-
-    function tick() {
-      return api("/api/learn").then(function (res) {
-        S.learn = res;
-        render(res, null);
-      }).catch(function (e) {
-        S.learn = null;
-        render(null, e);
-      });
-    }
-
-    function render(L, err) {
-      if (err) {
-        count.textContent = "—";
-        count.className = "countdown idle";
-        clear(state);
-        add(state, el("span", null, "Learn mode is not available: " + err.message));
-        armBtn.disabled = true;
-        cancelBtn.disabled = true;
-        candPanel.classList.add("hidden");
-        stopPoll("learn");
-        return;
-      }
-      var active = !!(L && L.active);
-      armed = active;
-      armBtn.classList.toggle("hidden", active);
-      cancelBtn.classList.toggle("hidden", !active);
-
-      if (active) {
-        var rem = numOr(L.remaining_s, 0);
-        count.textContent = Math.floor(rem / 60) + ":" + ("0" + (rem % 60)).slice(-2);
-        count.className = "countdown";
-        clear(state);
-        add(state, el("span", "pulse"), el("span", null,
-          L.candidate ? "Candidate captured — review it below." : "Armed — press your remote button"));
-      } else {
-        count.textContent = "—";
-        count.className = "countdown idle";
-        clear(state);
-        add(state, el("span", null,
-          "Not armed. The receiver is still listening — known buttons work as usual."));
-        /* Deliberately NOT re-scheduling the poll from here: poll() fires its
-           function immediately, so calling it from inside a render that was
-           itself triggered by that poll would recurse. */
-      }
-      renderCandidate(L && L.candidate);
-    }
-
-    function renderCandidate(c) {
-      if (!c) { candPanel.classList.add("hidden"); clear(candPanel); return; }
-      /* Do not rebuild while the user is typing the name. */
-      if (candPanel.dataset.fp === (c.fingerprint || "") &&
-          $(".cand-name", candPanel) === document.activeElement) return;
-      candPanel.dataset.fp = c.fingerprint || "";
-      candPanel.classList.remove("hidden");
-      clear(candPanel);
-
-      var h = el("div", "panel-head");
-      add(h, el("h2", null, "New button detected"));
-      add(h, el("p", null, "Give it a name and accept it, or ignore it and press a different button."));
-      add(candPanel, h);
-
-      var chips = el("div", "chiprow");
-      if (c.decoded && c.decoded.text) add(chips, el("span", "chip accent mono", c.decoded.text));
-      else add(chips, el("span", "chip warn", "Unknown protocol — will be stored as raw pulses"));
-      if (typeof c.repeats === "number") add(chips, el("span", "chip ok", c.repeats + " repeats"));
-      if (typeof c.rssi_dbm === "number") {
-        add(chips, el("span", "chip " + (c.rssi_dbm > -60 ? "ok" : "warn"), c.rssi_dbm + " dBm"));
-      }
-      add(candPanel, chips);
-
-      if (typeof c.confidence === "number") {
-        var m = el("div", "meter " + (c.confidence >= 65 ? "ok" : "warn"));
-        var f = el("i");
-        f.style.width = Math.max(2, Math.min(100, c.confidence)) + "%";
-        add(m, f);
-        var cwrap = el("div");
-        cwrap.style.margin = ".6rem 0";
-        var r = el("div", "row");
-        r.style.justifyContent = "space-between";
-        add(r, el("span", "small muted", "Confidence"), el("span", "small mono", c.confidence + "%"));
-        add(cwrap, r, m);
-        add(candPanel, cwrap);
-      }
-
-      var kv = el("dl", "kv");
-      if (typeof c.base_us === "number") { add(kv, el("dt", null, "Base pulse")); add(kv, el("dd", "mono", c.base_us + " us")); }
-      if (typeof c.pulse_count === "number") { add(kv, el("dt", null, "Pulses")); add(kv, el("dd", "mono", String(c.pulse_count))); }
-      if (c.fingerprint) { add(kv, el("dt", null, "Fingerprint")); add(kv, el("dd", "mono", c.fingerprint)); }
-      add(candPanel, kv);
-
-      var nameIn = inputEl("text", "", { maxlength: "40", placeholder: "e.g. Front door" });
-      nameIn.className = "cand-name";
-      add(candPanel, field("Name this button", nameIn,
-        "Shown in the activity feed and on the node that uses it."));
-
-      var cmsg = el("div", "formmsg");
-      var foot = el("div", "formfoot");
-      var acc = el("button", "btn primary", opts.acceptLabel || "Accept and use it");
-      acc.type = "button";
-      acc.addEventListener("click", function () {
-        var n = trimOf(nameIn);
-        if (!n) { setMsg(cmsg, "Give the button a name first.", "err"); nameIn.focus(); return; }
-        acc.disabled = true;
-        setMsg(cmsg, "Saving…");
-        postJSON("/api/learn/accept", { name: n }).then(function (created) {
-          armed = false;
-          return loadSignals().then(function (list) {
-            var made = (created && created.id) ? (signalById(created.id) || created)
-                                               : list[list.length - 1];
-            finish(made || null);
-          });
-        }).catch(function (e) {
-          acc.disabled = false;
-          setMsg(cmsg, e.message, "err");
-        });
-      });
-      add(foot, acc, cmsg);
-      add(candPanel, foot);
-      if (!nameIn.value) setTimeout(function () { nameIn.focus(); }, 40);
-    }
-
-    poll("learn", 1000, tick);
-    /* Straight into listening: someone who opened this flow has already said
-       they want to learn a button, and should not have to say it twice. */
-    if (opts.autoArm !== false) setTimeout(function () { armBtn.click(); }, 60);
-  });
 }
 
 /* ----------------------------------------------------------------------
@@ -1564,6 +1371,783 @@ function openVirtualFlow(opts) {
     save.addEventListener("click", function () { submit(false); });
     anyway.addEventListener("click", function () { submit(true); });
   });
+}
+
+/* ======================================================================
+   LISTENING -- the one way a button is registered
+
+   THERE USED TO BE TWO OF THESE, AND THAT WAS THE BUG. "Learn mode" armed the
+   receiver and waited for a burst that repeated at least twice AND normalised
+   to at least 65 % confidence; raw capture recorded everything and let you cut
+   a signal out by hand. Both thresholds were measured on EV1527 remotes, so
+   learn mode was, in effect, a mode for one protocol family. A transmitter of
+   any other shape never produced a candidate at all -- the countdown ran, the
+   screen stayed empty, and the box said nothing about why. Meanwhile raw
+   capture, which was offered as the escape hatch for exactly that case, picked
+   the same remote up without trouble.
+
+   So the gate is gone and the two flows are one. Detection is now permissive
+   and protocol-agnostic: every frame the radio hands up is kept. What the box
+   does instead is RANK, using evidence that needs no protocol knowledge --
+
+     * a real remote repeats itself, and noise does not, so "seen N times" is
+       the strongest signal of authenticity available and it dominates the
+       order;
+     * a decoded protocol and a clean base-width estimate raise a candidate
+       further, but only ever as a tie-break. An undecoded candidate is
+       first-class, fully usable, and can sit at the top of the list.
+
+   Every row says WHY it is where it is ("seen 5 times, decoded ev1527, 92 %
+   confidence") rather than showing a score, because that is a claim the user
+   can check against what they just did with their thumb.
+
+   AND IT UN-CHOPS TRANSMISSIONS. The frame boundary ends a recording after a
+   fixed silence; set it shorter than a remote's own inter-word gap and ONE
+   press arrives as several dissimilar pieces, leaving the user to transmit
+   scraps one at a time hunting for the one that rings the bell. The box detects
+   that shape (see rf_group.h), says so in words, offers a one-tap retry at a
+   longer gap, and -- where the pieces fit back together -- offers the rejoined
+   whole as a candidate in its own right, stitched with the silence that was
+   actually measured between them rather than an invented one.
+
+   WHERE IT LIVES. A flow (a sheet), not a tab: it is both a diagnostic and a
+   way to make a signal, and it is reached from wherever someone realises they
+   need it -- a node that needs a signal, the signal picker, and Diagnostics,
+   where "the box cannot hear my remote" is already investigated.
+   ====================================================================== */
+
+/* Probe once per page load. 404 = this firmware predates listening sessions;
+   hide the feature entirely rather than offering a button that cannot work. */
+function loadRaw() {
+  return api("/api/raw").then(function (res) {
+    S.raw = res;
+    S.has.raw = true;
+    return res;
+  }).catch(function (e) {
+    if (e.status === 404 || e.status === 501) { S.has.raw = false; S.raw = null; }
+    throw e;
+  });
+}
+
+/* The squelch floor to START with.
+ *
+ * No fixed number is right: the AGC noise floor depends on the antenna, the
+ * room and what else is on the band, and it was measured 10 dB hotter on the
+ * author's box than on the bench the firmware default came from. GET /api/radio
+ * already reports the live band level, so use it: sit a few dB above whatever
+ * the band is doing right now, clamped so this can never be stricter than the
+ * normal receiver nor so loose that the buffer fills with hash. */
+function rawSuggestedFloor() {
+  var live = S.radio && numOr(S.radio.rssi_dbm, null);
+  if (live === null) return -80;
+  var v = Math.round((live + 6) / 5) * 5;
+  return Math.max(-100, Math.min(-75, v));
+}
+
+function rawFloorOptions(sel, offValue) {
+  var out = [{ value: offValue, label: "Off — record every burst" }];
+  [-100, -95, -90, -85, -80, -75].forEach(function (v) {
+    out.push({
+      value: v,
+      label: v + " dBm" + (v === -75 ? " (the normal receiver's squelch)"
+                                     : (v === sel ? " (suggested here)" : ""))
+    });
+  });
+  return out;
+}
+
+/* The honest verdict. The whole point of this screen is that "nothing was
+   received" and "something was received but did not fit our assumptions" are
+   different problems with different fixes, so this never says "no results". */
+function rawVerdict(st) {
+  var d = (st && st.dropped) || {};
+  var r = (st && st.radio) || {};
+  var set = (st && st.settings) || {};
+  var heard = numOr(r.heard, 0);
+  var floor = numOr(d.below_floor, 0);
+  var tooLong = numOr(d.too_long, 0);
+  var tooShort = numOr(d.too_short, 0);
+  var count = numOr(st && st.count, 0);
+  var cands = (st && st.candidates) || [];
+
+  if (r.present === false) {
+    return { kind: "bad", text: "No CC1101 detected, so nothing can be recorded. See the states below." };
+  }
+  if (count > 0) {
+    /* Filled to the brim almost immediately, with nothing strong in it: that is
+       the band's own noise, not a remote, and the fix is one number. */
+    var strongest = null;
+    (st.frames || []).forEach(function (f) {
+      var v = numOr(f.rssi_dbm, null);
+      if (v !== null && (strongest === null || v > strongest)) strongest = v;
+    });
+    if (st.stop_reason === "full" && numOr(st.elapsed_s, 99) * 3 <= numOr(set.seconds, 30) &&
+        strongest !== null && strongest <= numOr(set.rssi_floor_dbm, -80) + 8) {
+      return {
+        kind: "warn",
+        suggest: Math.min(-75, Math.round((strongest + 5) / 5) * 5),
+        text: "All " + count + " slots filled in " + numOr(st.elapsed_s, 0) + " s and the "
+          + "loudest thing in them was " + strongest + " dBm. That is the receiver's own "
+          + "amplifier noise, not a transmitter. Raise the squelch floor and run it again."
+      };
+    }
+    /* Something repeated: say so, because that is the evidence the ranking runs
+       on and it is what tells the user the top row is worth trying first. */
+    var best = cands.length ? numOr(cands[0].seen, 1) : 1;
+    if (best > 1) {
+      return {
+        kind: "ok",
+        text: cands.length + " candidate" + (cands.length === 1 ? "" : "s") + " from "
+          + count + " frame" + (count === 1 ? "" : "s") + ". The top one was heard "
+          + best + " times, which is what a real remote does and noise does not — "
+          + "try that one first."
+      };
+    }
+    return {
+      kind: "ok",
+      text: count + " frame" + (count === 1 ? "" : "s") + " recorded"
+        + (strongest !== null ? ", loudest " + strongest + " dBm" : "")
+        + ", but nothing repeated. Press the button several times in one session so the "
+        + "box can tell your remote apart from the band — or just try the candidates below."
+    };
+  }
+  if (st && st.running) return null;   /* still listening; not a verdict yet */
+  if (!st || !st.held) return null;    /* no session has run yet */
+
+  if (!heard && !floor && !r.carrier_seen) {
+    return {
+      kind: "bad",
+      text: "The radio heard NOTHING — not one burst, not even noise, and carrier sense "
+        + "never asserted. That is a radio problem, not a threshold problem: these "
+        + "settings cannot help. Check the antenna is fitted, and that the frequency and "
+        + "modulation under Settings → Radio match what your remote actually sends."
+    };
+  }
+  if (floor > 0) {
+    return {
+      kind: "warn",
+      suggest: numOr(set.rssi_floor_dbm, -80) - 10,
+      text: floor + " burst" + (floor === 1 ? " was" : "s were") + " received and thrown "
+        + "away for being quieter than " + numOr(set.rssi_floor_dbm, -80) + " dBm"
+        + (typeof r.peak_rssi_dbm === "number" ? " (the band peaked at " + r.peak_rssi_dbm + " dBm)" : "")
+        + ". Lower the floor, or press the button closer to the box."
+    };
+  }
+  if (tooLong > 0) {
+    return {
+      kind: "warn",
+      text: tooLong + " frame" + (tooLong === 1 ? " was" : "s were") + " longer than the "
+        + "512-pulse limit and were discarded before they reached us — a truncated "
+        + "recording would replay as a different waveform. Lower the frame boundary so "
+        + "each transmission ends sooner instead of running into the next one."
+    };
+  }
+  if (tooShort > 0) {
+    return {
+      kind: "warn",
+      text: tooShort + " burst" + (tooShort === 1 ? " was" : "s were") + " shorter than "
+        + numOr(set.min_pulses, 4) + " pulses. Lower the minimum — but this is usually "
+        + "the AGC hash rather than a remote."
+    };
+  }
+  if (r.carrier_seen) {
+    return {
+      kind: "warn",
+      text: "Carrier energy was sensed but no pulse stream ever emerged from it. That "
+        + "points at the radio settings rather than these thresholds: the frequency is "
+        + "close but not right, the bandwidth is too narrow, or the transmitter is not "
+        + "using OOK at all. Settings → Radio."
+    };
+  }
+  return {
+    kind: "warn",
+    text: "The session ended with nothing recorded. The radio was alive and the band was "
+      + "quiet — press the button while the countdown is running, and within a few metres."
+  };
+}
+
+/*
+ * The listening session. Resolves with a signal if one was saved (so a caller
+ * can bind it to a node in the same breath), otherwise null.
+ */
+function openListenFlow(opts) {
+  opts = opts || {};
+  return new Promise(function (resolve) {
+    var done = false;
+    var made = null;
+    var running = false;
+
+    var sh = openSheet(opts.title || "Listen for a button",
+      opts.sub || "Press the button on your remote several times. Everything the radio "
+      + "hears is kept — the box ranks what it heard instead of deciding in advance what "
+      + "a real signal is allowed to look like.",
+      function () {
+        stopPoll("raw");
+        if (done) return;
+        done = true;
+        /* Leaving the box recording with relaxed thresholds behind your back is
+           not something to do silently. The FRAMES are kept (stopping is not
+           discarding), so reopening this shows them again. */
+        if (running) postJSON("/api/raw/stop", {}).catch(function () { /* ignore */ });
+        resolve(made);
+      });
+
+    var count = el("div", "countdown idle", "—");
+    var state = el("div", "listening");
+    add(sh.body, count, state);
+
+    var fragWrap = el("div");
+    var verdict = el("div");
+    var candWrap = el("div");
+    add(sh.body, fragWrap, verdict, candWrap);
+
+    var msg = el("div", "formmsg");
+    var ctl = el("div", "btnrow");
+    var startBtn = el("button", "btn primary", "Start listening");
+    startBtn.type = "button";
+    var stopBtn = el("button", "btn hidden", "Stop");
+    stopBtn.type = "button";
+    add(ctl, startBtn, stopBtn);
+    add(sh.body, ctl, msg);
+
+    /* Every frame, unranked — the fallback for the case the ranking got wrong,
+       collapsed because it is not the answer, it is the raw material. */
+    var allSec = section("Every frame recorded", null, false);
+    var allWrap = el("div");
+    add(allSec.bodyEl, allWrap);
+    add(sh.body, allSec);
+
+    /* ---- the relaxed filters, out of the way but not hidden ---- */
+    var lim = (S.raw && S.raw.limits) || {};
+    var offValue = numOr(lim.rssi_off_dbm, -120);
+    var sug = rawSuggestedFloor();
+
+    var setSec = section("Advanced: what the receiver is allowed to hear", null, false);
+
+    var secSel = selectEl([
+      { value: 15, label: "15 seconds" },
+      { value: 30, label: "30 seconds" },
+      { value: 60, label: "1 minute" },
+      { value: 120, label: "2 minutes" }
+    ], 30);
+    add(setSec.bodyEl, field("Listen for", secSel,
+      "A session also stops as soon as its 32 slots are full, and it always stops on "
+      + "its own — the box never keeps recording behind your back."));
+
+    var idleIn = inputEl("number", 8000, {
+      min: String(numOr(lim.idle_us_min, 1000)),
+      max: String(numOr(lim.idle_us_max, 32000)), step: "500"
+    });
+    add(setSec.bodyEl, field("Frame boundary (µs of silence)", idleIn,
+      "How much quiet ends one recording and starts the next. Set it too LOW and one "
+      + "transmission is chopped into pieces — the box detects that and says so — too "
+      + "HIGH and several presses are glued into one frame, and anything over "
+      + numOr(lim.max_pulses, 512) + " pulses is thrown away entirely."));
+
+    var minIn = inputEl("number", 4, {
+      min: String(numOr(lim.min_pulses_min, 2)),
+      max: String(numOr(lim.min_pulses_max, 64)), step: "1"
+    });
+    add(setSec.bodyEl, field("Minimum pulses", minIn,
+      "Shorter bursts are treated as noise and dropped. The normal receiver uses 32, "
+      + "which is exactly why a protocol with a short frame never shows up at all. "
+      + "Low values also let the amplifier's own hash through."));
+
+    var floorSel = selectEl(rawFloorOptions(sug, offValue), sug);
+    add(setSec.bodyEl, field("Squelch floor", floorSel,
+      "Bursts quieter than this are counted but not kept. Pre-set a few dB above "
+      + "whatever the band is doing right now, which is the only value that is correct "
+      + "on both a quiet bench and a busy flat. The normal receiver squelches at "
+      + numOr(lim.normal_squelch_dbm, -75) + " dBm; anything below that is more "
+      + "permissive than the box has ever been."));
+
+    add(sh.body, setSec);
+
+    var ep = section("What a listening session actually does", null, false);
+    [
+      "The receiver is ALWAYS listening. It has to be: a button you already registered "
+      + "must ring the moment it is pressed, so there is no on-demand receive mode to "
+      + "switch on. What a session changes is what happens to a signal the box does NOT "
+      + "recognise — normally dropped with one line in the activity feed, here kept.",
+      "The normal receive path applies four filters before you would ever see a signal, "
+      + "and every one of them is a correct guess about the cheap remotes this box was "
+      + "built around — and a possible lie about anything else. A session drops the "
+      + "minimum frame length from 32 pulses to whatever you set, makes the frame "
+      + "boundary an adjustable number instead of a fixed 8 ms, lowers (or removes) the "
+      + "signal-strength squelch, and keeps every repeat separately instead of merging "
+      + "them.",
+      "Nothing is admitted or rejected on how it looks. Candidates are RANKED: a "
+      + "waveform heard several times outranks one heard once, and a recognised protocol "
+      + "only breaks ties. A candidate no decoder understands is completely usable — the "
+      + "exact timings are stored and replay works; only the human-readable name is "
+      + "missing.",
+      "Nothing is written to flash and nothing reaches your node graph: while a session "
+      + "runs, the doorbell keeps working exactly as it did, because only signals that "
+      + "would have passed the NORMAL thresholds are still routed. Noise cannot ring "
+      + "anything.",
+      "The frames live in RAM only, and they are handed back when you start another "
+      + "session, when you close this and come back much later, or when the box reboots."
+    ].forEach(function (t) { add(ep.bodyEl, el("p", "small", t)); });
+    add(sh.body, ep);
+
+    /* ---- polling ---- */
+
+    function tick() {
+      return api("/api/raw").then(function (res) {
+        S.raw = res;
+        render(res, null);
+      }).catch(function (e) {
+        render(null, e);
+      });
+    }
+
+    function render(st, err) {
+      if (err) {
+        count.textContent = "—";
+        count.className = "countdown idle";
+        clear(state);
+        add(state, el("span", null, "Listening is not available: " + err.message));
+        startBtn.disabled = true;
+        stopPoll("raw");
+        return;
+      }
+      running = !!st.running;
+      startBtn.classList.toggle("hidden", running);
+      stopBtn.classList.toggle("hidden", !running);
+      setSec.classList.toggle("hidden", running);
+
+      if (running) {
+        var rem = numOr(st.remaining_s, 0);
+        count.textContent = Math.floor(rem / 60) + ":" + ("0" + (rem % 60)).slice(-2);
+        count.className = "countdown";
+        clear(state);
+        add(state, el("span", "pulse"), el("span", null,
+          "Listening — press your button now, several times. " + numOr(st.count, 0)
+          + " of " + numOr(st.capacity, 32) + " slots used."));
+      } else {
+        count.textContent = "—";
+        count.className = "countdown idle";
+        clear(state);
+        add(state, el("span", null, st.held
+          ? ("Stopped (" + (st.stop_reason === "full" ? "all slots used"
+             : st.stop_reason === "time" ? "time up" : "you stopped it")
+             + ") after " + numOr(st.elapsed_s, 0) + " s.")
+          : "Not listening. Nothing is being stored and the box behaves normally."));
+      }
+
+      renderFragmentation(st);
+      renderVerdict(st);
+      renderCandidates(st);
+      renderAll(st);
+    }
+
+    /*
+     * THE THING THE USER ACTUALLY HIT. One press arriving as five rows is not a
+     * mystery to be solved by trying all five: it is a threshold that fired too
+     * early, and the box can both say so and offer the fix. Where the pieces fit
+     * back together the rejoined whole is already in the candidate list above,
+     * marked, so the retry is an improvement rather than the only way forward.
+     */
+    function renderFragmentation(st) {
+      clear(fragWrap);
+      var fr = st && st.fragmentation;
+      if (!fr || !fr.detected || st.running) return;
+
+      var runs = numOr(fr.runs, 0);
+      var frames = numOr(fr.frames, 0);
+      var rejoined = numOr(fr.rejoined, 0);
+      var suggest = numOr(fr.suggest_idle_us, 0);
+      var idle = numOr((st.settings || {}).idle_us, 8000);
+
+      var note = el("div", "note warn");
+      add(note, el("div", null,
+        runs + (runs === 1 ? " transmission was" : " transmissions were") + " cut into "
+        + frames + " pieces: the frame boundary (" + idle + " µs of silence) fired while "
+        + "your remote was still sending. That is why one press turns into several rows."));
+      if (rejoined > 0) {
+        add(note, el("div", "small",
+          rejoined + " of them " + (rejoined === 1 ? "has" : "have") + " been stitched back "
+          + "together from the pieces, using the silence actually measured between them. "
+          + "Those are marked 🧩 in the list and are the ones to try first."));
+      }
+      add(fragWrap, note);
+
+      if (suggest) {
+        var again = el("button", "btn");
+        again.type = "button";
+        again.textContent = "Try again with a " + suggest + " µs gap";
+        again.style.marginTop = ".5rem";
+        again.addEventListener("click", function () {
+          idleIn.value = String(suggest);
+          startBtn.click();
+        });
+        add(fragWrap, again);
+        add(fragWrap, el("div", "hint",
+          "This raises the frame boundary so each press is recorded whole. Nothing you "
+          + "already have is lost until the new session starts."));
+      }
+    }
+
+    function renderVerdict(st) {
+      clear(verdict);
+      var v = rawVerdict(st);
+      if (!v) return;
+      var note = el("div", "note " + v.kind, v.text);
+      add(verdict, note);
+      if (typeof v.suggest === "number" && !st.running) {
+        var again = el("button", "btn", "Try again at " + v.suggest + " dBm");
+        again.type = "button";
+        again.style.marginTop = ".5rem";
+        again.addEventListener("click", function () {
+          floorSel.value = String(v.suggest);
+          if (floorSel.value !== String(v.suggest)) {
+            /* Not one of the offered steps — add it so the select can hold it. */
+            var op = el("option", null, v.suggest + " dBm");
+            op.value = String(v.suggest);
+            add(floorSel, op);
+            floorSel.value = String(v.suggest);
+          }
+          startBtn.click();
+        });
+        add(verdict, again);
+      }
+    }
+
+    /*
+     * The ranked list. Most likely first, and each row says why it is where it
+     * is: an undecoded waveform heard five times legitimately sits above a
+     * pristine decoded one heard twice, and the user has to be able to see that
+     * rather than take it on faith.
+     */
+    function renderCandidates(st) {
+      clear(candWrap);
+      var list = (st && st.candidates) || [];
+      if (!list.length) return;
+
+      add(candWrap, el("div", "lg-label", "Most likely first"));
+      add(candWrap, el("div", "hint",
+        "Ranked by how often each waveform was heard — a real remote repeats itself and "
+        + "noise does not. A recognised protocol only breaks ties: an undecoded candidate "
+        + "is fully usable and can be top of the list. Tap one to see it, trim it, and "
+        + "send it back out."));
+
+      var ul = el("ul", "list");
+      list.forEach(function (c, i) {
+        var li = el("li");
+        var b = el("button", "listitem"); b.type = "button";
+        add(b, el("span", "li-ico", c.merged ? "🧩" : (c.decoded ? "🔎" : "〰️")));
+
+        var main = el("div", "li-main");
+        add(main, el("div", "li-title", (c.decoded && c.decoded.text)
+          ? c.decoded.text
+          : "Unknown protocol — still fully replayable"));
+
+        var why = el("div", "li-sub");
+        if (i === 0) add(why, el("span", "chip ok", "most likely"));
+        add(why, el("span", null, (i === 0 ? " " : "") + (c.why || "")));
+        add(main, why);
+
+        var det = numOr(c.pulse_count, 0) + " pulses · "
+          + (numOr(c.airtime_us, 0) / 1000).toFixed(1) + " ms · base "
+          + numOr(c.base_us, 0) + " µs";
+        if (c.merged && c.frames && c.frames.length) {
+          det += " · rejoined from frames " + c.frames.join(" + ");
+        }
+        if (c.truncated) det += " · TRUNCATED at the 512-pulse limit";
+        add(main, el("div", "li-sub", det));
+        add(b, main);
+
+        var meta = el("div", "li-meta");
+        add(meta, el("div", null, numOr(c.seen, 1) + "×"));
+        add(meta, el("div", "mono", numOr(c.rssi_dbm, 0) + " dBm"));
+        add(b, meta);
+
+        b.addEventListener("click", function () {
+          openWaveform("candidate", c.id, function (sig) {
+            made = sig || made;
+            if (sig) { loadSignals(); if (S.graph) loadGraph(); }
+          });
+        });
+        add(li, b);
+        add(ul, li);
+      });
+      add(candWrap, ul);
+
+      /* GET /api/raw embeds only the top few so a full session's response can
+         still be built on a box that is already holding 43 KB of it. Say so
+         rather than letting a truncated list look like the whole list. */
+      var total = numOr(st.candidates_total, list.length);
+      if (total > list.length) {
+        add(candWrap, el("div", "hint",
+          "Showing the top " + list.length + " of " + total + " candidates. The rest "
+          + "were heard fewer times still — if none of these is yours, the frame list "
+          + "below has everything."));
+      }
+    }
+
+    /* The unranked truth underneath, for when the ranking is not what you want.
+       Grouping is a convenience; it never hides anything. */
+    function renderAll(st) {
+      clear(allWrap);
+      var frames = (st && st.frames) || [];
+      allSec.classList.toggle("hidden", !frames.length);
+      if (!frames.length) return;
+
+      var head = $("summary", allSec);
+      if (head) head.textContent = "Every frame recorded (" + frames.length + ")";
+      add(allWrap, el("div", "hint",
+        "Every frame exactly as it arrived, in order, with nothing grouped or ranked. "
+        + "The list above is built from these — this is here so grouping can never hide "
+        + "something from you."));
+
+      var ul = el("ul", "list");
+      frames.forEach(function (f) {
+        var li = el("li");
+        var b = el("button", "listitem"); b.type = "button";
+        add(b, el("span", "li-ico", f.decoded ? "🔎" : "〰️"));
+        var main = el("div", "li-main");
+        add(main, el("div", "li-title", "Frame " + f.index + " · "
+          + numOr(f.pulse_count, 0) + " pulses"));
+        add(main, el("div", "li-sub", (f.decoded && f.decoded.text)
+          ? f.decoded.text
+          : "No decoder claimed this — still fully replayable"));
+        add(main, el("div", "li-sub",
+          (numOr(f.airtime_us, 0) / 1000).toFixed(1) + " ms · base "
+          + numOr(f.base_us, 0) + " µs · " + numOr(f.confidence, 0) + "% confidence"
+          + (f.truncated ? " · TRUNCATED at the 512-pulse limit" : "")));
+        add(b, main);
+        var meta = el("div", "li-meta");
+        add(meta, el("div", "mono", numOr(f.rssi_dbm, 0) + " dBm"));
+        add(b, meta);
+        b.addEventListener("click", function () {
+          openWaveform("frame", f.index, function (sig) {
+            made = sig || made;
+            if (sig) { loadSignals(); if (S.graph) loadGraph(); }
+          });
+        });
+        add(li, b);
+        add(ul, li);
+      });
+      add(allWrap, ul);
+    }
+
+    startBtn.addEventListener("click", function () {
+      startBtn.disabled = true;
+      setMsg(msg, "Starting…");
+      postJSON("/api/raw/start", {
+        seconds: intOf(secSel, 30),
+        idle_us: intOf(idleIn, 8000),
+        min_pulses: intOf(minIn, 4),
+        rssi_floor_dbm: intOf(floorSel, -80)
+      }).then(function (st) {
+        S.raw = st;
+        setMsg(msg, "Listening. Press your remote button now — several times.", "ok");
+        render(st, null);
+        poll("raw", 1000, tick);
+      }).catch(function (e) {
+        setMsg(msg, e.message, "err");
+      }).then(function () { startBtn.disabled = false; });
+    });
+
+    stopBtn.addEventListener("click", function () {
+      stopBtn.disabled = true;
+      postJSON("/api/raw/stop", {}).then(function (st) {
+        S.raw = st;
+        setMsg(msg, "");
+        render(st, null);
+      }).catch(function (e) { setMsg(msg, e.message, "err"); })
+        .then(function () { stopBtn.disabled = false; });
+    });
+
+    poll("raw", 1000, tick);
+    /* Straight into listening: someone who opened this has already said they
+       want to register a button and should not have to say it twice. */
+    if (opts.autoStart !== false) setTimeout(function () { startBtn.click(); }, 60);
+  });
+}
+
+/*
+ * One waveform, with trim handles. `kind` is "candidate" (a ranked, possibly
+ * rejoined candidate) or "frame" (one recording exactly as it arrived); the two
+ * differ only in which URL the waveform comes from, and deliberately in nothing
+ * else -- what you inspect must be what you transmit and what you save.
+ *
+ * TRIMMING IS THE POINT, NOT A GARNISH. A relaxed frame boundary deliberately
+ * captures more than one transmission at a time, so what comes back is often
+ * "the thing I want, with something either side of it". `from`/`to` are pulse
+ * indices into the same durations_us the plot is drawn from, and they are sent
+ * verbatim to the box — so what you see selected is exactly what is transmitted
+ * and exactly what is saved. There is no second interpretation anywhere.
+ *
+ * Both a pair of sliders (drag) and a pair of number boxes (type) drive the same
+ * two values, because on a phone you want to drag and at a keyboard you want to
+ * nudge by one.
+ */
+function openWaveform(kind, id, onSaved) {
+  var base = (kind === "candidate") ? "/api/raw/candidates/" : "/api/raw/";
+  var sh = openSheet((kind === "candidate") ? "Candidate " + id : "Frame " + id, null);
+  add(sh.body, el("div", "empty", "Loading…"));
+
+  api(base + id).then(function (f) {
+    clear(sh.body);
+    var durs = f.durations_us || [];
+    var n = durs.length;
+    var from = 0, to = n;
+
+    var chips = el("div", "chiprow");
+    if (typeof f.seen === "number") {
+      add(chips, el("span", "chip ok", "seen " + f.seen + "×"));
+    }
+    if (f.merged) add(chips, el("span", "chip accent", "🧩 rejoined from " + (f.frames || []).length + " pieces"));
+    if (f.decoded && f.decoded.text) add(chips, el("span", "chip accent mono", f.decoded.text));
+    else add(chips, el("span", "chip warn", "Unknown protocol — raw pulses only"));
+    add(chips, el("span", "chip mono", numOr(f.rssi_dbm, 0) + " dBm"));
+    add(chips, el("span", "chip mono", numOr(f.confidence, 0) + "%"));
+    if (f.truncated) add(chips, el("span", "chip bad", "truncated at 512 pulses"));
+    add(sh.body, chips);
+
+    if (f.why) add(sh.body, el("div", "hint", "Ranked here because it was " + f.why + "."));
+    if (f.merged) {
+      add(sh.body, el("div", "note",
+        "This is one transmission that the frame boundary cut into "
+        + (f.frames || []).length + " pieces (frames " + (f.frames || []).join(" + ")
+        + "), put back together with the silence actually measured between them — "
+        + (f.gaps_us || []).join(" µs, ") + " µs. It is a reconstruction, so test it "
+        + "before you keep it; the individual pieces are still listed on their own."));
+    }
+
+    var plot = el("div");
+    add(sh.body, plot);
+
+    var fromRange = inputEl("range", 0, { min: "0", max: String(Math.max(0, n - 1)), step: "1" });
+    var toRange = inputEl("range", n, { min: "1", max: String(n), step: "1" });
+    var fromNum = inputEl("number", 0, { min: "0", max: String(Math.max(0, n - 1)), step: "1" });
+    var toNum = inputEl("number", n, { min: "1", max: String(n), step: "1" });
+
+    var trim = el("div", "trim");
+    add(trim, field("Start at pulse", fromRange));
+    add(trim, field("End before pulse", toRange));
+    var nums = el("div", "row");
+    add(nums, field("from", fromNum), field("to", toNum));
+    add(trim, nums);
+    add(sh.body, trim);
+    add(sh.body, el("div", "hint",
+      "Indices count from 0, and `to` is the first pulse NOT included — so 0 to "
+      + n + " is the whole thing. Levels alternate, so a selection starting on an odd "
+      + "index starts on the opposite level; the box accounts for that when it sends "
+      + "or saves, and the caption above says which."));
+
+    function redraw() {
+      clear(plot);
+      var w = waveform(durs, f.first_level, { from: from, to: to });
+      if (w) add(plot, w);
+    }
+    function sync(src) {
+      if (from > n - 1) from = Math.max(0, n - 1);
+      if (from < 0) from = 0;
+      if (to > n) to = n;
+      if (to <= from) to = Math.min(n, from + 1);
+      if (src !== "fromRange") fromRange.value = String(from);
+      if (src !== "toRange") toRange.value = String(to);
+      if (src !== "fromNum") fromNum.value = String(from);
+      if (src !== "toNum") toNum.value = String(to);
+      redraw();
+    }
+    function bind(input, isFrom, name) {
+      input.addEventListener("input", function () {
+        var v = parseInt(input.value, 10);
+        if (!isFinite(v)) return;
+        if (isFrom) from = v; else to = v;
+        sync(name);
+      });
+    }
+    bind(fromRange, true, "fromRange");
+    bind(toRange, false, "toRange");
+    bind(fromNum, true, "fromNum");
+    bind(toNum, false, "toNum");
+    sync(null);
+
+    add(sh.body, el("div", "divider"));
+
+    /* --- transmit the selection, without saving anything --- */
+    var tmsg = el("div", "formmsg");
+    var trow = el("div", "btnrow");
+    var txBtn = el("button", "btn", "\u{1F4E1} Transmit selection");
+    txBtn.type = "button";
+    add(trow, txBtn);
+    add(sh.body, el("div", "lg-label", "Try it"));
+    add(sh.body, el("div", "hint",
+      "Sends the selected pulses straight out, without storing anything. This is the "
+      + "loop: send, listen at the bell, adjust the trim, send again."));
+    add(sh.body, trow, tmsg);
+    var block = txBlockNote();
+    if (block) add(sh.body, block);
+    if (!txAvailable()) txBtn.disabled = true;
+
+    txBtn.addEventListener("click", function () {
+      var old = txBtn.textContent;
+      txBtn.disabled = true;
+      txBtn.textContent = "Sending…";
+      setMsg(tmsg, "");
+      postJSON(base + id + "/transmit", { from: from, to: to })
+        .then(function (res) {
+          txBtn.textContent = "Sent ✓";
+          setTimeout(function () { txBtn.textContent = old; txBtn.disabled = false; }, 1400);
+          setMsg(tmsg, numOr(res.pulse_count, to - from) + " pulses × "
+            + numOr(res.repeats, 0) + ". This only confirms the pulses left the radio — "
+            + "it cannot know whether a receiver reacted.", "ok");
+        }).catch(function (e) {
+          txBtn.textContent = old;
+          txBtn.disabled = false;
+          if (e.status === 503) { S.txBlock = e.message; renderTxNote(); }
+          setMsg(tmsg, e.message, "err");
+        });
+    });
+
+    /* --- promote it to a stored signal --- */
+    add(sh.body, el("div", "divider"));
+    add(sh.body, el("div", "lg-label", "Keep it"));
+    add(sh.body, el("div", "hint",
+      "Saves the SELECTION as an ordinary stored signal: it can then be bound to a node, "
+      + "renamed, transmitted and matched against like any other — decoded or not."));
+    var nameIn = inputEl("text", "", { maxlength: "31", placeholder: "e.g. Front door" });
+    add(sh.body, field("Name", nameIn));
+    var smsg = el("div", "formmsg");
+    var foot = el("div", "formfoot");
+    var saveBtn = el("button", "btn primary", "Save as signal");
+    saveBtn.type = "button";
+    saveBtn.addEventListener("click", function () {
+      var nm = trimOf(nameIn);
+      if (!nm) { setMsg(smsg, "Give it a name first.", "err"); nameIn.focus(); return; }
+      saveBtn.disabled = true;
+      setMsg(smsg, "Saving…");
+      postJSON(base + id + "/save", { name: nm, from: from, to: to })
+        .then(function (sig) {
+          setMsg(smsg, "Saved as “" + sig.name + "”.", "ok");
+          if (onSaved) onSaved(sig);
+          setTimeout(function () { sh.close(); }, 700);
+        }).catch(function (e) {
+          saveBtn.disabled = false;
+          setMsg(smsg, e.message, "err");
+        });
+    });
+    add(foot, saveBtn, smsg);
+    add(sh.body, foot);
+  }).catch(function (e) {
+    clear(sh.body);
+    add(sh.body, el("div", "note bad", "Could not load this waveform: " + e.message));
+  });
+}
+
+/* The one entry-point button, so its wording cannot drift between the places it
+   appears. */
+function listenButton(label, onDone) {
+  var b = el("button", "btn", label || "\u{1F3A7} Listen for a button");
+  b.type = "button";
+  b.addEventListener("click", function () {
+    openListenFlow({}).then(function (sig) { if (onDone) onDone(sig); });
+  });
+  return b;
 }
 
 /* ======================================================================
@@ -2190,7 +2774,9 @@ var EVENT_KINDS = {
   wired_press: { ico: "🔌", label: "Wired button" },
   node_fired: { ico: "↳", label: "Node fired" },
   transmit: { ico: "📡", label: "Transmit" },
-  learn: { ico: "🎓", label: "Learn" },
+  /* The wire name is still "learn"; what it means, and always meant, is that a
+     signal was registered. */
+  learn: { ico: "🎓", label: "Signal registered" },
   system: { ico: "⚙", label: "System" }
 };
 
@@ -2209,7 +2795,7 @@ function buildActivity() {
   add(h, el("h2", null, "Activity"));
   add(h, el("p", null,
     "Everything the receiver hears and everything the nodes do about it, as it happens. " +
-    "The radio listens continuously; learning a button only decides what happens to a " +
+    "The radio listens continuously; a listening session only decides what happens to a " +
     "signal it does not recognise."));
   add(p, h);
 
@@ -2758,14 +3344,16 @@ function createNode(type, sig) {
    node that already works, in one flow and one confirmation. */
 function openSignalNodeFlow(type) {
   var rx = (type !== "signal.tx");
-  function learn() {
-    openLearnFlow({
-      title: "Learn a signal",
+  function listen() {
+    openListenFlow({
+      title: "Listen for a signal",
       sub: rx
-        ? "Arm the receiver, then press the remote button. The code is captured, named and " +
-          "stored — this node then fires whenever it is heard again."
-        : "Arm the receiver, then press the remote button. The code is captured, named and " +
-          "stored — this node then sends that same code whenever it is triggered."
+        ? "Press the remote button a few times. Everything heard is kept and ranked; pick " +
+          "the one that is yours, test it, name it — this node then fires whenever it is " +
+          "heard again."
+        : "Press the remote button a few times. Everything heard is kept and ranked; pick " +
+          "the one that is yours, test it, name it — this node then sends that same code " +
+          "whenever it is triggered."
     }).then(function (sig) { if (sig) createNode(type, sig); });
   }
   function virtual() {
@@ -2776,25 +3364,31 @@ function openSignalNodeFlow(type) {
     openSignalPicker({
       title: "Signal for this node",
       onPick: function (sig) { createNode(type, sig); },
-      onLearn: learn,
+      onListen: S.has.raw ? listen : null,
       onVirtual: virtual
     });
   }
 
-  /* Learn · Select · Configure, in that order: the common case first, the
+  /* Listen · Select · Configure, in that order: the common case first, the
      store second, and hand-entry last for the case where the code is known but
      the remote is not in reach. */
-  var items = [
-    { value: "learn", icon: "🎓", label: "Learn a new button",
-      sub: "Arm the receiver and press your remote. The node picks up exactly that code.",
-      meta: "capture" },
+  /* Listening is the first option whenever the firmware has it. Older firmware
+     is served the other two rather than a button that 404s — the probe at boot
+     is what makes that decision possible here. */
+  var items = [];
+  if (S.has.raw) items.push(
+    { value: "listen", icon: "🎧", label: "Listen for a new button",
+      sub: "Press your remote a few times. Everything heard is ranked, and you pick the one "
+        + "that rings your bell — decoded or not.",
+      meta: "capture" });
+  items = items.concat([
     { value: "existing", icon: "📚", label: "Use a signal you already have",
       sub: "Everything this box has stored, whether a node uses it or not.",
       meta: "stored" },
     { value: "virtual", icon: "✨", label: "Configure by hand",
       sub: "Type an EV1527 code you know, or roll a random one to pair your own chime to.",
       meta: "by hand" }
-  ];
+  ]);
   pickerSheet(rx ? "Which code should this node listen for?"
                  : "Which code should this node send?",
     rx ? "A Signal receiver IS its signal: it fires whenever that code is heard on air, and " +
@@ -2802,7 +3396,7 @@ function openSignalNodeFlow(type) {
        : "A Signal sender IS its signal: it puts that code on air whenever something " +
          "triggers it, and listens for nothing. Pick where the code comes from.",
     items, function (choice) {
-      if (choice === "learn") learn();
+      if (choice === "listen") listen();
       else if (choice === "virtual") virtual();
       else existing();
     });
@@ -3161,8 +3755,8 @@ function renderNodeSignal(wrap, n) {
     add(wrap, el("div", "note warn", (isSignalTx(n)
       ? "This node has no signal yet, so there is nothing for it to send. "
       : "This node has no signal yet, so nothing on air can ever fire it. ") +
-      "Learn the button it should stand for, pick one you already have, or invent a code " +
-      "your own receiver can be paired to."));
+      "Listen for the button it should stand for, pick one you already have, or invent a " +
+      "code your own receiver can be paired to."));
     add(wrap, signalChooser(wrap, n));
     return;
   }
@@ -3207,25 +3801,28 @@ function signalChooser(wrap, n) {
       title: "Signal for this node",
       node: n,
       onPick: bind,
-      onLearn: function () { relearn(); },
+      onListen: S.has.raw ? function () { relisten(); } : null,
       onVirtual: function () { makeVirtual(); }
     });
   });
 
-  function relearn() {
-    openLearnFlow({
-      title: bound ? "Learn a replacement" : "Learn a button",
-      sub: "Press the button this node should stand for from now on.",
-      note: bound
-        ? "The signal this node uses today stays in the store under its name — re-learning " +
-          "only changes what this node points at."
-        : null
+  function relisten() {
+    openListenFlow({
+      title: bound ? "Listen for a replacement" : "Listen for a button",
+      sub: "Press the button this node should stand for from now on, several times."
+        + (bound
+            ? " The signal it uses today stays in the store under its name — this only "
+              + "changes what the node points at."
+            : "")
     }).then(bind);
   }
-  var learn = el("button", "btn", bound ? "🎓 Re-learn" : "🎓 Learn a new button");
-  learn.type = "button";
-  learn.addEventListener("click", relearn);
-  add(row, pick, learn);
+  add(row, pick);
+  if (S.has.raw) {
+    var listen = el("button", "btn", bound ? "🎧 Listen again" : "🎧 Listen for a button");
+    listen.type = "button";
+    listen.addEventListener("click", relisten);
+    add(row, listen);
+  }
 
   /* The third path: a code entered by hand rather than learned or picked.
      openVirtualFlow does the explaining about what a made-up code means. */
@@ -4178,17 +4775,20 @@ function sectionSignals() {
     + "touching this list — removing one here is permanent."));
 
   var mkRow = el("div", "row");
-  var bLearn = el("button", "btn", "\u{1F4E1} Learn a signal");
-  bLearn.type = "button";
-  bLearn.addEventListener("click", function () {
-    openLearnFlow({}).then(function (sig) { if (sig) loadSignals(); });
-  });
+  /* Two ways to make a signal, and only two: hear one, or invent one. There
+     used to be three, because "learn" and "raw capture" were separate screens
+     doing the same job with different thresholds. */
+  if (S.has.raw) {
+    add(mkRow, listenButton("\u{1F3A7} Listen for a signal", function (sig) {
+      if (sig) { loadSignals(); if (S.graph) loadGraph(); }
+    }));
+  }
   var bMake = el("button", "btn", "\u2728 Create custom or random");
   bMake.type = "button";
   bMake.addEventListener("click", function () {
     openVirtualFlow({ mode: "sink" }).then(function (sig) { if (sig) loadSignals(); });
   });
-  add(mkRow, bLearn, bMake);
+  add(mkRow, bMake);
   add(s.bodyEl, mkRow);
   add(s.bodyEl, el("div", "hint",
     "A signal created here belongs to no node yet. Wire it up later from the "
@@ -4208,7 +4808,7 @@ function sectionSignals() {
     var list = S.signals || [];
     if (!list.length) {
       add(listWrap, el("div", "empty",
-        "Nothing stored yet. Signals appear here once you learn a button or create a " +
+        "Nothing stored yet. Signals appear here once you listen for a button or create a " +
         "virtual one while adding a node."));
       return;
     }
@@ -4694,6 +5294,26 @@ function buildDiagnostics() {
   add(p2, diagEls.counters);
   add(root, p2);
 
+  /* LISTENING LIVES HERE TOO. The counters immediately above are the ones that
+     say "energy arrived and none of it survived"; this is the tool that shows
+     you WHAT arrived. Putting the two anywhere but next to each other would
+     make the reader hunt for the follow-up to a number they are already
+     staring at. */
+  var pr = el("div", "panel");
+  add(pr, el("h2", null, "Listen for a button"));
+  add(pr, el("p", "hint",
+    "Those counters can tell you that bursts were rejected, but not what they looked "
+    + "like. A listening session records everything the radio hears for a fixed time, "
+    + "with the minimum frame length, the frame boundary and the signal-strength squelch "
+    + "all turned down — then ranks what it heard, most likely first, and lets you look at "
+    + "any of it, trim it, send it back out and keep it as a signal. Nothing is admitted or "
+    + "rejected on how it looks, nothing is written to flash, and your node graph is "
+    + "untouched."));
+  diagEls.raw = el("div");
+  add(pr, diagEls.raw);
+  add(root, pr);
+  renderRawPanel();
+
   var p3 = el("div", "panel");
   add(p3, el("h2", null, "States"));
   add(p3, el("p", "hint",
@@ -4704,6 +5324,41 @@ function buildDiagnostics() {
   add(root, p3);
 
   renderDiagnostics();
+}
+
+/* Rebuilt whenever the probe lands, so a firmware without /api/raw removes the
+   button instead of offering one that 404s. */
+function renderRawPanel() {
+  if (!diagEls.raw) return;
+  var wrap = clear(diagEls.raw);
+  if (!S.has.raw) {
+    add(wrap, el("div", "note", "This firmware does not have listening sessions. Update "
+      + "it under Settings → Firmware to get the feature."));
+    return;
+  }
+  var st = S.raw;
+  if (st && st.running) {
+    add(wrap, el("div", "note warn", "A session is listening right now — "
+      + numOr(st.count, 0) + " of " + numOr(st.capacity, 32) + " slots used, "
+      + numOr(st.remaining_s, 0) + " s left."));
+  } else if (st && st.held) {
+    var cands = ((st.candidates) || []).length;
+    add(wrap, el("div", "note", "A finished session is still in memory: "
+      + numOr(st.count, 0) + " frame" + (numOr(st.count, 0) === 1 ? "" : "s")
+      + (cands ? ", " + cands + " ranked candidate" + (cands === 1 ? "" : "s") : "")
+      + " you can still open, trim and save."));
+    var fr = st.fragmentation;
+    if (fr && fr.detected) {
+      add(wrap, el("div", "note warn", numOr(fr.runs, 0)
+        + " transmission(s) in that session were cut into pieces by the frame boundary."));
+    }
+  }
+  var row = el("div", "row");
+  add(row, listenButton("\u{1F3A7} Listen for a button", function (sig) {
+    if (sig) { loadSignals(); if (S.graph) loadGraph(); }
+    renderRawPanel();
+  }));
+  add(wrap, row);
 }
 
 function renderDiagnostics(err) {
@@ -5199,34 +5854,62 @@ function buildHandbook() {
   });
   add(root, s3);
 
-  /* ------------------------------- 4. learning and virtual signals */
-  var s4 = hbSection("learn", "Learning and virtual signals",
+  /* ------------------------------- 4. listening and virtual signals */
+  var s4 = hbSection("learn", "Listening and virtual signals",
     "Registering a real remote, and inventing a code of your own.");
   var b4 = s4.bodyEl;
-  add(b4, hbH("What learn mode actually does"));
+  add(b4, hbH("What a listening session actually does"));
   hbPs(b4, [
-    "Learn mode changes exactly one thing: the fate of a signal the box does NOT recognise. " +
-    "Normally such a burst is dropped with one line in Activity. While the box is armed, it is " +
-    "offered to you for registration instead. Signals you already know behave identically either " +
-    "way — they keep ringing whatever the chimes do, armed or not.",
-    "A candidate is only offered once the burst has repeated at least twice and decoded with at " +
-    "least 65 % confidence. Both thresholds come from bench measurement rather than taste: real " +
-    "presses score in the high sixties and up, while ambient noise scores in the twenties and " +
-    "rarely repeats. Without the filters the box would happily register an amplifier's hum as a " +
-    "doorbell.",
-    "Learn mode always expires on its own, so the box is never left armed behind your back."
+    "The receiver is ALWAYS listening — it has to be, or a button you already registered could " +
+    "not ring the instant it is pressed. A listening session changes exactly one thing: the fate " +
+    "of a signal the box does NOT recognise. Normally such a burst is dropped with one line in " +
+    "Activity. During a session it is kept. Signals you already know behave identically either " +
+    "way.",
+    "Nothing is admitted or rejected on the basis of what it looks like. Every frame the radio " +
+    "hands up becomes a candidate, and the box RANKS them instead of filtering them. The ranking " +
+    "runs on evidence that needs no knowledge of any protocol: a real remote repeats itself and " +
+    "band noise does not, so the number of times a waveform was heard dominates the order.",
+    "A recognised protocol and a clean timing estimate push a candidate further up, but only " +
+    "ever as a tie-break. An undecoded candidate is a first-class citizen — it can sit at the " +
+    "top of the list, it saves, it replays, it matches. The exact timings are what get stored; " +
+    "only the human-readable name is missing.",
+    "A session always stops on its own — after its countdown, or as soon as its 32 slots are " +
+    "full — so the box is never left recording behind your back."
   ]);
-  add(b4, hbH("Learning a button"));
+  add(b4, hbNote(
+    "This is the part that changed. There used to be a separate “learn mode” which would only " +
+    "offer a candidate that repeated twice AND decoded at 65 % confidence. Both numbers were " +
+    "measured on 1527-family remotes, which quietly made it a mode for one protocol: anything " +
+    "else produced no candidate at all and no explanation either. Ranking replaced the gate, and " +
+    "the two flows became one."));
+  add(b4, hbH("Registering a button"));
   add(b4, hbList([
-    "Add a Signal receiver node, or open one you already have, and choose to learn a signal.",
-    "The box arms itself and counts down. Press the button on your remote several times, within " +
-    "a few metres.",
-    "The candidate appears with its decode, its repeat count, its signal strength and a " +
-    "confidence bar. Give it a name — that name is what you will see in Activity and on the map.",
-    "Accept it. It is stored immediately and the node is wired to it."
+    "Add a Signal receiver node, or open one you already have, and choose to listen for a signal.",
+    "The box starts listening and counts down. Press the button on your remote several times, " +
+    "within a few metres. Pressing repeatedly is not politeness — repetition is the evidence the " +
+    "ranking runs on.",
+    "Candidates appear, most likely first, each saying why it is where it is: “seen 5 times, " +
+    "decoded ev1527, 92 % confidence”. Tap the top one.",
+    "Transmit it while standing at the bell. That is the only test that means anything — the box " +
+    "can confirm the pulses left the radio, never that a receiver reacted. If it does not ring, " +
+    "close it and try the next candidate.",
+    "Trim it if it carries something either side of the transmission, then give it a name and " +
+    "save. It becomes an ordinary stored signal and the node is wired to it."
   ], true));
-  add(b4, hbP(
-    "Backing out of the sheet cancels learn mode, so closing it never leaves the box armed."));
+  add(b4, hbH("When one press turns into several rows"));
+  hbPs(b4, [
+    "A recording ends after a fixed silence — the frame boundary. If a remote pauses for longer " +
+    "than that in the middle of its own transmission, the boundary fires early and one press " +
+    "arrives as several dissimilar pieces, none of which rings anything on its own.",
+    "The box detects that shape and says so, because otherwise the only way through it is to " +
+    "transmit each scrap in turn and hope. Where the pieces fit back together it also offers the " +
+    "rejoined whole as a candidate of its own, marked 🧩 — stitched using the silence actually " +
+    "measured between the pieces, not a plausible-looking guess, because a wrong gap produces a " +
+    "waveform that looks perfectly reasonable and rings nothing."
+  ]);
+  add(b4, hbNote(
+    "There is also a one-tap “try again with a longer gap”, which raises the frame boundary past " +
+    "the widest cut that was measured. That is the real fix; the rejoin is the shortcut."));
 
   add(b4, hbH("Virtual signals"));
   hbPs(b4, [
@@ -5254,6 +5937,117 @@ function buildHandbook() {
     "If nothing happened, the receiver almost certainly was not in learning mode when the code " +
     "went out. Put it back and tap Pair now again — sending it twice is harmless."));
   add(root, s4);
+
+  /* ------------------------------------ 4b. When the box will not hear it
+     Its own section rather than a footnote inside Listening, because reaching
+     for it is a decision ("the defaults are not going to work for this
+     remote"), and a decision needs a heading you can find from the table of
+     contents. */
+  var s4b = hbSection("raw", "When the box will not hear your remote",
+    "The filters that can hide a transmitter, and how to look behind them.");
+  var b4b = s4b.bodyEl;
+
+  add(b4b, hbH("The problem it solves"));
+  hbPs(b4b, [
+    "The box's founding promise is that a signal NOBODY can decode is still recorded and still " +
+    "replayable. The ordinary receiver does not quite keep that promise on its own, because four " +
+    "filters sit in front of it — and every one of them is a correct guess about the cheap " +
+    "1527-family remotes this box was built around, and a possible lie about anything else.",
+    "A transmitter that breaks one of those guesses is not merely mis-decoded. It is invisible: " +
+    "nothing in Activity, nothing anywhere. A listening session turns three of those filters " +
+    "into numbers you control and reports honestly on the fourth, so you can see what actually " +
+    "arrived."
+  ]);
+  add(b4b, hbKV([
+    ["Signal-strength squelch",
+      "Bursts quieter than −75 dBm are discarded as amplifier noise. A distant or weak " +
+      "transmitter is thrown away with them."],
+    ["Minimum frame length",
+      "Anything shorter than 32 pulses is discarded as noise. A protocol with a short frame never " +
+      "appears at all."],
+    ["Frame boundary",
+      "8 ms of silence is what ends one recording. Too short for a protocol with long gaps and it " +
+      "is chopped into fragments; too long and several repeats are glued into one frame — and " +
+      "anything over 512 pulses is thrown away whole."],
+    ["Repeat merging",
+      "Near-identical frames within 250 ms are folded into a single event. A remote whose repeats " +
+      "differ from each other confuses this."]
+  ]));
+
+  add(b4b, hbH("The worked example: a remote whose protocol we do not decode"));
+  hbPs(b4b, [
+    "The case this was built for, and it is worth stating precisely because the shape of it is " +
+    "the diagnosis. One wireless bell button registered first time. A second button — a " +
+    "different make, on the same chime — would not register at all, even though the chime itself " +
+    "rings for both. So the second button certainly transmits, and certainly works.",
+    "That combination is the signature of a FILTER, not a fault. If the radio were mis-tuned or " +
+    "the antenna were off, the first button would fail too. So something about the second " +
+    "button's waveform is being thrown away before anyone sees it, and the only way to find out " +
+    "which of the four is doing it is to look at what arrives with the filters turned down.",
+    "Nothing here depends on what the protocol is or where the remote was made. The interesting " +
+    "property is simply that no decoder on this box claims it — and that has never been a reason " +
+    "for a signal not to work."
+  ]);
+  add(b4b, hbList([
+    "Open a listening session — from a Signal node, from Settings → Stored signals, or from " +
+    "Diagnostics.",
+    "Leave the settings alone for the first run. The squelch floor is already pre-set a few dB " +
+    "above whatever the band is doing right now, which is the only value that is right in both " +
+    "a quiet room and a busy one.",
+    "Press the button four or five times within a couple of metres of the box.",
+    "Read the top of the list. Repetition is what puts a candidate there, so the thing you just " +
+    "pressed five times should be at or near the top whether or not anything decoded it.",
+    "If the list is empty, read the verdict line. It never says “no results”: it says whether " +
+    "the radio heard nothing at all, or heard something and threw it away, and which threshold " +
+    "did the throwing."
+  ], true));
+  add(b4b, hbNote(
+    "That distinction is the whole point. “Nothing was received” means the radio, the antenna or " +
+    "the frequency — no threshold here can help. “Something was received but did not fit” means " +
+    "a number on this screen, and it is fixable in one attempt.", "warn"));
+
+  add(b4b, hbH("Reading what comes back"));
+  add(b4b, hbKV([
+    ["A candidate seen several times, at the top",
+      "That is your remote. Tap it, transmit it at the bell, trim if needed, save. Whether " +
+      "anything decoded it makes no difference to any of that."],
+    ["Everything seen once, nothing repeated",
+      "Either you pressed once, or each press is arriving slightly differently. Press several " +
+      "more times in one session — repetition is what the ranking runs on."],
+    ["“N transmissions were cut into pieces”",
+      "The frame boundary is too SHORT: one press is being chopped up. Take the offered “try " +
+      "again with a longer gap”, or use the 🧩 rejoined candidate, which is the pieces put back " +
+      "together with the measured silence between them."],
+    ["One enormous frame, or “too long”",
+      "The frame boundary is too LONG: repeats are being glued together, and past 512 pulses the " +
+      "whole thing is discarded. Lower it toward 4000 µs."],
+    ["All 32 slots fill in a couple of seconds, everything quiet",
+      "That is the receiver's own amplifier noise, not your remote. Take the offered “try again " +
+      "at …” button, which raises the squelch floor above the measured band."],
+    ["Nothing at all, and no carrier either",
+      "Check the antenna is fitted, then Settings → Radio: frequency (433.92 MHz for almost " +
+      "everything, but 868 MHz exists) and modulation."]
+  ]));
+
+  add(b4b, hbH("Trimming, and why it matters"));
+  hbPs(b4b, [
+    "Because the frame boundary is relaxed, a recording sometimes contains more than the one " +
+    "transmission you want — a tail of noise, or two presses in a row. Tap a candidate and you " +
+    "get its waveform with a start and an end handle: drag them, or type exact pulse numbers, " +
+    "and the shaded part is exactly what will be sent and exactly what will be saved.",
+    "Transmit the selection first, standing next to the bell. That loop — send, listen, adjust, " +
+    "send — is far faster than saving a signal for every attempt, and nothing is stored until " +
+    "you decide it works.",
+    "Once it rings, Save as signal. It becomes an ordinary stored signal: bind it to a Signal " +
+    "receiver node to make that button ring your chime, or to a Signal sender node to have the " +
+    "box press the button itself. Being undecoded costs it nothing."
+  ]);
+  add(b4b, hbNote(
+    "A session keeps 32 frames in RAM and stops on its own — after its countdown, or as soon as " +
+    "the slots are full. Nothing is written to flash, and your node graph is untouched: while a " +
+    "session runs, only signals that would have passed the NORMAL filters are still routed, so " +
+    "recorded noise can never ring anything."));
+  add(root, s4b);
 
   /* ------------------------------------------ 5. MQTT and Home Assistant */
   var s5 = hbSection("mqtt", "MQTT & Home Assistant",
@@ -5380,6 +6174,11 @@ function buildHandbook() {
     "If the chime rings twice for one press, look for an Any RF signal node and a Signal receiver " +
     "both reaching the same sink. Both are firing, both are correct, and one of them is one too " +
     "many."));
+  add(b7, hbP(
+    "And if ONE remote will not register while others do — nothing in Activity, however often " +
+    "you press it — that is not a fault, it is a filter. Open a listening session and read the " +
+    "verdict line: it says which of the four thresholds threw your remote away. The section " +
+    "above walks through it."));
   add(root, s7);
 }
 
@@ -5617,6 +6416,11 @@ loadSystem().then(function () {
      fatal, it only removes a chip. */
   api("/api/radio").then(function (r) { S.radio = r; renderStatusChips(); })
     .catch(function () { S.has.radioCfg = false; });
+  /* One cheap probe for listening sessions. It has to happen at boot rather
+     than on the Diagnostics tab, because the other entry points (a Signal node
+     and Settings → Stored signals) offer a button and must not offer one that
+     404s on a firmware without the feature. */
+  loadRaw().then(renderRawPanel).catch(renderRawPanel);
   onTabEnter(S.tab, false);
 }).catch(function () {
   /* Even with /api/system down the shell must stay navigable: the user needs

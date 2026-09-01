@@ -73,7 +73,7 @@ every chime in the house every time Home Assistant restarts.
 
 The one exception is `<base>/unknown` (retained) alongside `<base>/unknown/state` (not).
 The unretained topic is the event; the retained one exists so you can *see* the code of the
-remote you are about to learn, even hours later.
+remote you are about to register, even hours later.
 
 ### Slugs, not ids
 
@@ -221,7 +221,7 @@ mosquitto_sub -h 192.168.1.10 -t 'klingelbox/#' -v
 
 The retained `klingelbox/unknown` topic and the "Last unknown code" sensor both hold the
 fingerprint of the most recent unregistered burst — which is exactly what you want to read
-before deciding whether to learn it.
+before deciding whether to register it.
 
 ### Presence of the box itself
 

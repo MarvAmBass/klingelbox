@@ -9,6 +9,7 @@ idf_component_register(
         "db_diag.c"          # shared diagnostic vocabulary
         "db_config.c"        # versioned NVS config
         "rf_service.c"       # sole radio owner: RX/TX handover, burst coalescing
+        "rf_raw.c"           # time-boxed raw capture session, filters relaxed
         "signal_store.c"     # persisted signals, matching, learn mode
         "node_graph.c"       # sources -> logic -> sinks routing engine
         "event_log.c"        # recent-activity ring for the UI

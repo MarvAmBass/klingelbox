@@ -257,25 +257,44 @@ A **signal** is a stored waveform, not a decoded code. Three ways to get one:
 
 | Origin | How |
 |---|---|
-| **Captured** | Learn mode. Press your remote; the box offers the burst for registration. |
+| **Captured** | A listening session. Press your remote a few times; the box ranks what it heard and you keep the one that rings your bell. |
 | **Virtual** | `POST /api/signals/virtual` synthesises an EV1527 frame with a random or chosen address — a code the box invented, that you then teach *your* chime. |
 | **Undecodable** | Also captured. If no decoder recognises it, it is stored as raw timings and works exactly like any other signal. |
 
-### Learn mode
+### Listening sessions
 
-The receiver always listens; learn mode only decides whether an *unrecognised* burst is
-offered to you for registration.
+The receiver always listens; a *session* only decides whether an unrecognised burst is
+kept and offered to you. **There is no `/api/learn` any more** — it required two repeats
+*and* 65 % normalization confidence before it would show you anything, and both numbers
+were measured on EV1527 remotes. That made it a mode for one protocol family: a remote of
+any other shape produced no candidate at all, and no explanation either.
+
+Detection is now permissive and protocol-agnostic — everything the radio hands up is
+kept — and the box **ranks** instead of filtering:
 
 ```sh
-curl -X POST http://klingelbox.local/api/learn/arm -d '{"timeout_s":60}'
-# press the remote, then:
-curl http://klingelbox.local/api/learn
-curl -X POST http://klingelbox.local/api/learn/accept -d '{"name":"Front door"}'
+curl -X POST http://klingelbox.local/api/raw/start -d '{"seconds":30}'
+# press the remote several times, then:
+curl http://klingelbox.local/api/raw/candidates
+# try the top one at the bell, without storing anything:
+curl -X POST http://klingelbox.local/api/raw/candidates/1/transmit -d '{}'
+# keep it:
+curl -X POST http://klingelbox.local/api/raw/candidates/1/save -d '{"name":"Front door"}'
 ```
 
-A candidate only appears when the burst repeated at least twice and scored at least 65 %
-confidence. Those numbers come from bench measurement, not taste: real presses scored
-67–92 %, ambient AGC noise 24–28 %.
+**Repetition dominates the ranking.** A real remote sends the same word several times and
+band noise never does, so "seen 5 times" is the strongest evidence of authenticity
+available — and collecting it needs no knowledge of any protocol. A decoded protocol and a
+high confidence raise a candidate further, but only ever as a tie-break: an undecoded
+candidate can rank first and is fully usable. Each one carries a `why` string
+(`"seen 5 times, decoded ev1527, 92% confidence"`) so the ranking is checkable rather than
+magic.
+
+If one press arrives as several dissimilar pieces, the frame boundary fired mid-
+transmission. The session reports that in `fragmentation`, suggests a longer `idle_us`
+derived from the widest gap it actually measured, and — where the pieces fit back
+together — offers the rejoined whole as a `merged` candidate, stitched with the measured
+silence rather than a guessed one. See [the API reference](API.html#listening--raw-sessions).
 
 ### Virtual signals — pairing your own chimes
 
@@ -363,7 +382,7 @@ go round again.
 source.any_rf ──▶ sink.mqtt (topic: "doorbell")
 ```
 Every burst on the band is published, registered or not. Combine with the retained
-`<base>/unknown` topic to *see* the code of a remote before you learn it.
+`<base>/unknown` topic to *see* the code of a remote before you register it.
 
 ### A wired doorbell button that also rings the wireless chimes
 ```

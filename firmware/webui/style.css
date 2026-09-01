@@ -531,6 +531,21 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 .wave .mid { stroke: var(--line); stroke-width: 1; stroke-dasharray: 3 4; }
 .wave-cap { font-size: .74rem; color: var(--muted); font-family: var(--mono); margin-top: .3rem; }
 
+/* The trim selection on a raw capture. Drawn BEHIND the trace (it is added to
+   the SVG before the path) and kept translucent, because the point of the plot
+   is still the waveform -- the band says which part of it you have picked, it
+   does not replace it. `fill` rather than a stroke so it survives the
+   non-uniform viewBox scaling the plot uses. */
+.wave .wave-sel { fill: var(--accent); opacity: .17; }
+
+/* Two native range inputs are the drag handles. Native on purpose: a phone
+   already knows how to drag one, it is keyboard-operable for free, and the
+   number boxes underneath cover the case where you want to nudge by exactly
+   one pulse. */
+.trim input[type="range"] { width: 100%; height: var(--tap); accent-color: var(--accent); }
+.trim > .row { gap: .6rem; align-items: flex-end; }
+.trim > .row > .field { flex: 1 1 6rem; margin: 0; }
+
 /* ------------------------------------------------------ monitor (💡) node --
    A Monitor node's whole value is what it LOOKS like, so its two pieces are
    styled to be read at a glance rather than studied: a lamp that glows, and a
@@ -594,10 +609,10 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
 .sigblock > .chiprow { margin-bottom: .4rem; }
 .sigblock .note { background: var(--panel); }
 
-/* ------------------------------------------------------------ learn flow --
-   Countdown, listening line and candidate, all inside a bottom sheet: the
-   countdown is a size smaller there than it was on the full screen it
-   replaces, so the candidate still fits above the fold on a 360 px phone. */
+/* --------------------------------------------------------- listening flow --
+   Countdown and listening line inside a bottom sheet: the countdown is a size
+   smaller there than it was on the full screen it replaces, so the ranked
+   candidate list still fits above the fold on a 360 px phone. */
 .candidate {
   border: 1px solid var(--line); border-radius: var(--r-sm);
   background: var(--sunk); padding: .7rem; margin: .6rem 0;

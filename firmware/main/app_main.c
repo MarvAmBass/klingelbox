@@ -35,7 +35,7 @@
  *      arriving and we most want to be listening.
  *
  * So the listener does nothing but copy the event to a queue. All matching,
- * learn-mode handling, graph traversal and sink work happens on this task, which
+ * signal matching, graph traversal and sink work happens on this task, which
  * holds no locks and may block freely.
  * ---------------------------------------------------------------------------
  */
@@ -185,12 +185,12 @@ static void dispatch_task(void *arg)
                            "%s", trig.label);
             db_mqtt_on_signal_press(sid, ev.rssi_dbm, ev.repeats);
         } else {
+            /* An unrecognized burst is reported and then dropped. It is NOT
+             * secretly offered anywhere: registering a button is a deliberate
+             * act that happens in a listening session (rf_raw.h), where every
+             * frame is kept and ranked rather than filtered. */
             db_events_push(DB_EV_RF_UNMATCHED, 0, 0, ev.rssi_dbm, ev.repeats,
                            "%s", trig.label);
-            /* Cheap and safe when learn mode is not armed. */
-            if (db_signals_learn_offer(&ev))
-                db_events_push(DB_EV_LEARN, 0, 0, ev.rssi_dbm, ev.repeats,
-                               "candidate: %s", trig.label);
         }
 
         /* Fires the matching signal node's OUTPUT side AND every source.any_rf

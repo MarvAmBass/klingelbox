@@ -32,6 +32,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "rf_capture.h"
+#include "rf_raw.h"
 #include "rf_transmit.h"
 
 static const char *TAG = "rf_service";
@@ -69,6 +70,17 @@ static const char *TAG = "rf_service";
  * timings would be too mangled to decode anyway.
  */
 #define RSSI_SQUELCH_DBM (-75)
+
+/*
+ * Raw sessions: what the relaxed capture channel looks like.
+ *
+ * A session lowers min_pulses (2-64 instead of a fixed 32) and makes the frame
+ * boundary an argument instead of a constant, which means a lot more frames come
+ * up the queue than the four the default depth expects. Six costs 6 KB while a
+ * session is live and is handed back when it ends; without it a burst of AGC
+ * hash shows up as overruns and hides the thing the user is actually hunting.
+ */
+#define RAW_QUEUE_DEPTH 6
 
 /*
  * TX echo suppression — do not react to our own transmissions.
@@ -111,10 +123,39 @@ static int64_t    s_tx_end_us;
 static bool       s_tx_last_valid;
 static uint32_t   s_echo_suppressed;
 
+/* Relaxed capture parameters while a raw session runs. Read by capture_cfg(),
+ * which is the single place the RMT channel's configuration is decided. */
+static bool     s_relaxed;
+static uint32_t s_relaxed_idle_us;
+static uint16_t s_relaxed_min_pulses;
+
+/* The DEFAULT minimum frame length, remembered at startup. While a session has
+ * lowered the capture layer's threshold, this is what still gates the normal
+ * pipeline — so the graph sees exactly the frames it would have seen with no
+ * session running. */
+static uint16_t s_normal_min_pulses = 32;
+
 /* ------------------------------------------------------------------ helpers */
 
 static void radio_lock(void)   { xSemaphoreTake(s_lock, portMAX_DELAY); }
 static void radio_unlock(void) { xSemaphoreGive(s_lock); }
+
+/*
+ * The capture configuration in force right now. Defaults, unless a raw session
+ * has asked for the frame boundary and the minimum frame length to be something
+ * else. Every path that (re-)creates the RX channel goes through here, including
+ * the one after a transmit — otherwise a replay in the middle of a session would
+ * silently put the strict thresholds back and the session would go quiet.
+ */
+static void capture_cfg(rf_capture_cfg_t *cfg)
+{
+    rf_capture_cfg_default(cfg, DB_PIN_CC1101_GDO0);
+    if (s_relaxed) {
+        cfg->idle_us     = s_relaxed_idle_us;
+        cfg->min_pulses  = s_relaxed_min_pulses;
+        cfg->queue_depth = RAW_QUEUE_DEPTH;
+    }
+}
 
 /* Enter receive: radio in async RX (GDO0 = data out), RMT bound as an input. */
 static esp_err_t enter_rx(void)
@@ -126,8 +167,16 @@ static esp_err_t enter_rx(void)
     if (rf_capture_active())
         return ESP_OK;
     rf_capture_cfg_t cfg;
-    rf_capture_cfg_default(&cfg, DB_PIN_CC1101_GDO0);
+    capture_cfg(&cfg);
     return rf_capture_init(&cfg);
+}
+
+/* Re-create the RX channel so a changed capture_cfg() takes effect. Caller holds
+ * the radio lock. */
+static esp_err_t restart_capture(void)
+{
+    rf_capture_release();
+    return enter_rx();
 }
 
 /* Enter transmit: RMT input released FIRST, then the radio flips GDO0 to an
@@ -174,17 +223,20 @@ static void flush_pending(void)
         s_cb(&s_pending, s_cb_ctx);
 }
 
-/* Fold a freshly captured frame into the pending burst, or start a new one. */
-static void absorb(const rf_frame_t *frame)
+/* Fold a freshly captured frame into the pending burst, or start a new one.
+ * `rssi` was sampled by the caller the moment the frame arrived — see note (3)
+ * in the file header for why it cannot be read later. */
+static void absorb(const rf_frame_t *frame, int rssi)
 {
     int64_t now = esp_timer_get_time();
 
-    /* Squelch first: sample the signal strength before doing any other work, and
-     * drop frames that came out of the noise floor (see RSSI_SQUELCH_DBM). This
-     * is what stops the AGC hash from reaching the decoders — and, later, from
-     * being offered as a learn candidate. */
-    int rssi = 0;
-    if (cc1101_rssi_dbm(s_radio, &rssi) == ESP_OK && rssi < RSSI_SQUELCH_DBM) {
+    /* Squelch first, before any other work: drop frames that came out of the
+     * noise floor (see RSSI_SQUELCH_DBM). This is what stops the AGC hash from
+     * reaching the decoders and from ringing anything. A raw listening session
+     * deliberately bypasses this with its own, much lower floor — that is the
+     * whole point of it. A failed RSSI read arrives here as 0 and passes, which is the
+     * right way round: a broken measurement must not silence the radio. */
+    if (rssi < RSSI_SQUELCH_DBM) {
         s_squelched++;
         return;
     }
@@ -253,9 +305,55 @@ static void check_idle_health(void)
                  (unsigned long)s_squelched, RSSI_SQUELCH_DBM);
         s_squelched = 0;
     }
+
+    /* A finished raw session is kept so it can be inspected, trimmed and saved
+     * — but only for as long as somebody is looking at it. This is where its
+     * ~36 KB goes back to a box nobody came back to. */
+    if (db_raw_stale()) {
+        ESP_LOGI(TAG, "discarding a raw session nobody read for %d s",
+                 DB_RAW_HOLD_SECS);
+        db_raw_discard();
+    }
 }
 
 /* ------------------------------------------------------------- capture task */
+
+/*
+ * Everything a raw session needs, done in the one place that already holds the
+ * radio lock. Caller holds the lock.
+ *
+ * The band observation matters as much as the frames: sampling RSSI and carrier
+ * sense even when NOTHING is arriving is what lets the UI tell "the antenna is
+ * not connected" apart from "your thresholds are wrong". rf_raw rate-limits it
+ * to one sample per 200 ms, so this costs one SPI read a fifth of a second.
+ */
+static void raw_slice(void)
+{
+    if (!db_raw_active())
+        return;
+
+    int rssi = 0;
+    bool cs = false;
+    (void)cc1101_rssi_dbm(s_radio, &rssi);
+    (void)cc1101_carrier_sense(s_radio, &cs);
+    db_raw_note_band(rssi, cs);
+
+    rf_capture_stats_t st;
+    rf_capture_get_stats(&st);
+    db_raw_note_capture_stats(&st);
+
+    /* Auto-stop. Done here rather than on a timer because putting the strict
+     * capture configuration back means re-creating the RMT channel, and this is
+     * the context that owns it. */
+    if (db_raw_expired()) {
+        db_raw_stop(NULL);
+        s_relaxed = false;
+        esp_err_t err = restart_capture();
+        if (err != ESP_OK)
+            ESP_LOGE(TAG, "raw session ended but capture did not restart: %s",
+                     esp_err_to_name(err));
+    }
+}
 
 static void capture_task(void *arg)
 {
@@ -267,12 +365,28 @@ static void capture_task(void *arg)
         esp_err_t err = rf_capture_active()
                             ? rf_capture_receive(&frame, pdMS_TO_TICKS(RX_SLICE_MS))
                             : ESP_ERR_TIMEOUT;
-        if (err == ESP_OK)
-            absorb(&frame);
+        if (err == ESP_OK) {
+            int rssi = 0;
+            (void)cc1101_rssi_dbm(s_radio, &rssi);
+
+            /* The recorder sees the frame FIRST and unfiltered — that is the
+             * whole point of a raw session. The normal pipeline then sees only
+             * what it would have seen anyway: a session relaxes what reaches the
+             * RECORDER, never what reaches the graph, so a doorbell keeps
+             * working during a session and noise can never fire a node. */
+            if (db_raw_active()) {
+                db_raw_offer(&frame, rssi);
+                if (frame.count >= s_normal_min_pulses)
+                    absorb(&frame, rssi);
+            } else {
+                absorb(&frame, rssi);
+            }
+        }
 
         /* Flush a burst that has gone quiet, and keep an eye on the band. */
         if (s_pending_valid && (esp_timer_get_time() - s_pending.ts_us) >= BURST_WINDOW_US)
             flush_pending();
+        raw_slice();
         check_idle_health();
         radio_unlock();
 
@@ -289,6 +403,14 @@ esp_err_t rf_service_start(void)
         s_lock = xSemaphoreCreateMutex();
     if (!s_lock)
         return ESP_ERR_NO_MEM;
+
+    /* Remember the strict minimum before anything can relax it — see
+     * s_normal_min_pulses. */
+    {
+        rf_capture_cfg_t defaults;
+        rf_capture_cfg_default(&defaults, DB_PIN_CC1101_GDO0);
+        s_normal_min_pulses = defaults.min_pulses;
+    }
 
     const cc1101_pins_t pins = {
         .host     = DB_CC1101_SPI_HOST,
@@ -428,4 +550,66 @@ esp_err_t rf_service_rssi(int *dbm_out)
     esp_err_t err = cc1101_rssi_dbm(s_radio, dbm_out);
     radio_unlock();
     return err;
+}
+
+/* ------------------------------------------------------------ raw sessions */
+
+esp_err_t rf_service_raw_start(const db_raw_cfg_t *cfg)
+{
+    db_raw_cfg_t want;
+
+    if (cfg)
+        want = *cfg;
+    else
+        db_raw_cfg_default(&want);
+
+    if (!s_ident.present)
+        return ESP_ERR_INVALID_STATE;
+
+    radio_lock();
+    esp_err_t err = db_raw_start(&want);
+    if (err == ESP_OK) {
+        /* db_raw_start() clamped the request; ask it what it actually took so
+         * the capture channel and the session can never disagree about the
+         * frame boundary. */
+        db_raw_state_t st;
+        db_raw_get_state(&st);
+        s_relaxed            = true;
+        s_relaxed_idle_us    = st.cfg.idle_us;
+        s_relaxed_min_pulses = st.cfg.min_pulses;
+
+        err = restart_capture();
+        if (err != ESP_OK) {
+            /* Leave nothing half-applied: the box must still be listening. */
+            ESP_LOGE(TAG, "could not relax the capture channel: %s",
+                     esp_err_to_name(err));
+            db_raw_stop("radio");
+            db_raw_discard();
+            s_relaxed = false;
+            esp_err_t back = restart_capture();
+            if (back != ESP_OK)
+                ESP_LOGE(TAG, "and the strict channel did not come back: %s",
+                         esp_err_to_name(back));
+        } else {
+            ESP_LOGI(TAG, "raw capture: idle %lu us, min %u pulses, floor %d dBm",
+                     (unsigned long)st.cfg.idle_us, (unsigned)st.cfg.min_pulses,
+                     (int)st.cfg.rssi_floor_dbm);
+        }
+    }
+    radio_unlock();
+    return err;
+}
+
+void rf_service_raw_stop(void)
+{
+    radio_lock();
+    if (db_raw_active()) {
+        db_raw_stop("user");
+        s_relaxed = false;
+        esp_err_t err = restart_capture();
+        if (err != ESP_OK)
+            ESP_LOGE(TAG, "raw session stopped but capture did not restart: %s",
+                     esp_err_to_name(err));
+    }
+    radio_unlock();
 }
