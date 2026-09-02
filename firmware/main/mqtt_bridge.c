@@ -551,6 +551,37 @@ static void announce_virtual_button(const db_node_t *n)
  * back to the node, so an entity is still addressable rather than silently
  * dropped.
  */
+/* True when a node still carries the name it was created with, in either the
+ * UI's form ("Switch") or the wire form ("logic.switch"). Deliberately narrow:
+ * anything the user typed themselves, including "switch upstairs", is a real
+ * name and must be respected. */
+/*
+ * The topic a switch actually answers on.
+ *
+ * An explicit topic always wins and is never rewritten -- so once you have
+ * typed one, renaming the node cannot move your Home Assistant entity out from
+ * under you. Left blank, the node's own NAME is slugified instead, because
+ * "MQTT topic (optional)" made the single thing that connects a switch to Home
+ * Assistant look like a detail you could skip, and skipping it silently meant no
+ * HA switch at all.
+ *
+ * Consequence worth knowing: two switch nodes sharing a NAME now share one
+ * toggle, exactly as two sharing an explicit topic always have. That is the same
+ * rule, reached from the other end.
+ */
+static void switch_suffix(const db_node_t *n, char *out, size_t outsz)
+{
+    if (!n) { if (outsz) out[0] = '\0'; return; }
+    if (n->topic[0]) { strlcpy(out, n->topic, outsz); return; }
+    slugify(n->name, out, outsz);      /* "Outside bell" -> "outside_bell" */
+}
+
+static bool name_is_generic(const char *name)
+{
+    return name && (strcasecmp(name, "Switch") == 0 ||
+                    strcasecmp(name, "logic.switch") == 0);
+}
+
 static void switch_object(char *out, size_t outsz, const db_mqtt_switch_t *sw)
 {
     char slug[DB_MQTT_SLUG_MAX];
@@ -580,7 +611,14 @@ static void announce_switch(const db_mqtt_switch_t *sw)
     /* One node on the topic: the node's own name. Several: still one toggle, and
      * it must say so, or a user wonders which of their three switches it is. */
     char name[DB_NODE_NAME_MAX + 24];
-    const char *base = (n && n->name[0]) ? n->name : sw->suffix;
+    /* A node left at its default name ("Switch") tells Home Assistant nothing:
+     * every switch on every box lands as "Klingelbox Switch", and the topic the
+     * user actually chose -- the one thing that identifies this toggle -- never
+     * appears. So a still-default name is treated as no name at all and the
+     * topic wins. A node the user HAS named keeps that name, because a human
+     * label beats a slug. */
+    const char *base = (n && n->name[0] && !name_is_generic(n->name))
+                           ? n->name : sw->suffix;
     /* The explicit precision is not decoration: `base` may be a topic suffix
      * (48 bytes) rather than a node name (32), and without it gcc cannot prove
      * the " (N paths)" tail fits and -Werror=format-truncation trips — the same
@@ -1093,19 +1131,24 @@ static void sync_switch_subs(bool resub)
 
     for (int j = 0; j < n && nodes; j++) {
         if (nodes[j].type != DB_NODE_LOGIC_SWITCH) continue;
-        if (!nodes[j].topic[0]) continue;   /* UI/REST only, by the user's choice */
+
+        char sfx[DB_NODE_TOPIC_MAX];
+        switch_suffix(&nodes[j], sfx, sizeof(sfx));
+        /* Only when BOTH the topic and the name are empty (or slugify to
+         * nothing) is there no addressable topic at all. */
+        if (!sfx[0]) continue;
 
         int slot = -1;
         for (int i = 0; i < s_sw_count; i++)
-            if (strcmp(s_sw[i].suffix, nodes[j].topic) == 0) { slot = i; break; }
+            if (strcmp(s_sw[i].suffix, sfx) == 0) { slot = i; break; }
 
         if (slot < 0) {
             if (s_sw_count >= DB_NODE_MAX) continue;
             slot = s_sw_count++;
-            strlcpy(s_sw[slot].suffix, nodes[j].topic, DB_NODE_TOPIC_MAX);
+            strlcpy(s_sw[slot].suffix, sfx, DB_NODE_TOPIC_MAX);
             s_sw[slot].node_id = 0;
             s_sw[slot].count   = 0;
-            switch_topic(t, sizeof(t), nodes[j].topic, "set");
+            switch_topic(t, sizeof(t), sfx, "set");
             esp_mqtt_client_subscribe(s_client, t, 0);
             ESP_LOGI(TAG, "subscribed %s -> node %u", t, nodes[j].id);
         }

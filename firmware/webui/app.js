@@ -2311,6 +2311,20 @@ function isSignalNode(n) { return isSignalRx(n) || isSignalTx(n); }
    Everywhere else in the UI `enabled === false` still means "switched off by
    hand and out of service", which reads the same way on the canvas: a node the
    events do not reach, and links that do not carry. */
+/* "Outside bell" -> "outside_bell". Mirrors the firmware's slugify(), so the
+   topic previewed here is the topic the box will actually answer on. */
+function topicSlug(s) {
+  return String(s || "").toLowerCase()
+           .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+/* "outside_bell" -> "Outside bell". Mirrors what the firmware does when a
+   switch node still carries its default name: the topic becomes the label. */
+function prettyTopic(t) {
+  var s = String(t || "").replace(/[_\-/]+/g, " ").trim();
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Switch";
+}
+
 function isSwitch(n) { return !!n && n.type === "logic.switch"; }
 function switchOn(n) { return !!n && n.enabled !== false; }
 
@@ -3660,19 +3674,37 @@ function openNodeEditor(n) {
     ctl.topic = inputEl("text", n.topic || "", { maxlength: "48", placeholder: "outside_bell" });
     var swPreview = el("div", "hint mono");
     function syncSw() {
-      var t = trimOf(ctl.topic);
+      var typed = trimOf(ctl.topic);
+      var auto = topicSlug(trimOf(nameIn));
+      var t = typed || auto;
       clear(swPreview);
+      ctl.topic.placeholder = auto || "outside_bell";
       if (!t) {
         swPreview.textContent =
-          "No topic — this switch can only be moved from this page or the REST API.";
+          "Give this node a name (or a topic) and Home Assistant can switch it.";
         return;
       }
+      if (!typed)
+        add(swPreview, el("div", "muted",
+          "Using the node's name: " + t + "  \u2014 type your own above to pin it, " +
+          "and renaming the node will then leave it alone."));
       add(swPreview, el("div", null, "Home Assistant sets:  " + mqttSwitchTopic(t, "set")));
       add(swPreview, el("div", null, "Box reports (retained):  " + mqttSwitchTopic(t, "state")));
+      /* What HA will actually CALL it. A node still named "Switch" would appear
+         as "Klingelbox Switch" on every box ever built, so the firmware falls
+         back to the topic -- but that is invisible unless it is said here, and
+         a user who wants a nicer label needs to know renaming the node is what
+         changes it. */
+      var nm = trimOf(nameIn);
+      var generic = !nm || /^(switch|logic\.switch)$/i.test(nm);
+      add(swPreview, el("div", null,
+        "Appears in Home Assistant as:  " + (generic ? prettyTopic(t) : nm) +
+        (generic ? "   (from the topic \u2014 rename this node to change it)" : "")));
     }
     ctl.topic.addEventListener("input", syncSw);
+    if (nameIn) nameIn.addEventListener("input", syncSw);
     syncSw();
-    var sf = field("MQTT topic (optional)", ctl.topic, null, "full");
+    var sf = field("MQTT topic \u2014 how Home Assistant reaches it", ctl.topic, null, "full");
     add(sf, swPreview);
     add(grid, sf);
     add(sh.body, el("div", "note",
