@@ -1,7 +1,17 @@
 {
-  "generated": "2026-09-02T04:31:20Z",
+  "generated": "2026-09-02T04:58:59Z",
   "keep": 3,
   "releases": [
+    {
+      "version": "v0.3.0",
+      "date": "2026-09-02T04:58:42Z",
+      "full": {
+        "path": "v0.3.0/klingelbox-esp32s3-full.bin",
+        "size": 5373952,
+        "sha256": "5cc0c6b76260074b4d234ce5d325c5152cf177bcceee386742548abc9ef4c4c4"
+      },
+      "notes_url": "https://github.com/MarvAmBass/klingelbox/releases/tag/v0.3.0"
+    },
     {
       "version": "v0.2.0",
       "date": "2026-09-02T04:31:07Z",
