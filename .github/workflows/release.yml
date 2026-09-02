@@ -263,13 +263,40 @@ jobs:
       - name: List release assets
         run: ls -l release
 
-      # generate_release_notes lets GitHub assemble the changelog from the commits and
-      # PRs since the previous tag; tag_name is passed explicitly so the manual
-      # workflow_dispatch path targets the right tag instead of the launching branch.
+      # The annotated tag's own message is the release notes.
+      #
+      # Without this the body was ONLY GitHub's generated changelog -- a single
+      # "Full Changelog" link -- and every carefully written tag annotation was
+      # invisible on the releases page. The person deciding whether to flash a
+      # new build reads that page, so it should say what changed and why, not
+      # just diff two refs.
+      #
+      # generate_release_notes stays on: softprops appends the generated
+      # changelog beneath the body, so the prose and the commit list both appear.
+      - name: Take the release notes from the tag message
+        id: notes
+        run: |
+          set -euo pipefail
+          TAG='${{ needs.firmware.outputs.tag }}'
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG" --no-tags 2>/dev/null || true
+          # %(contents:body) is the annotation minus its subject line; the subject
+          # is already the release title, so repeating it reads badly.
+          SUBJECT=$(git for-each-ref "refs/tags/$TAG" --format='%(contents:subject)')
+          BODY=$(git for-each-ref "refs/tags/$TAG" --format='%(contents:body)')
+          {
+            echo 'body<<KLINGELBOX_EOF'
+            [ -n "$SUBJECT" ] && echo "$SUBJECT" && echo
+            echo "$BODY"
+            echo 'KLINGELBOX_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # tag_name is passed explicitly so the manual workflow_dispatch path targets
+      # the right tag instead of the launching branch.
       - name: Create Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.firmware.outputs.tag }}
           files: release/*
+          body: ${{ steps.notes.outputs.body }}
           generate_release_notes: true
           fail_on_unmatched_files: true
