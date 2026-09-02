@@ -97,6 +97,8 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "mqtt_topic.h"
+#include "node_migrate.h"
 #include "nvs.h"
 
 static const char *TAG = "db_graph";
@@ -117,12 +119,25 @@ static const char *TAG = "db_graph";
  *        is unchanged AGAIN, so a v2 node is already an rx node; the migration
  *        only has to spot the ones that were being used as senders, and it reads
  *        that off the links. db_node_t / db_link_t are still byte-identical.
+ *   v4 - db_node_t gained `mqtt_enabled` (node_graph.h). THE FIRST VERSION THAT
+ *        CHANGED THE RECORD ITSELF rather than the meaning of a type value, so
+ *        it is also the first that needs a frozen copy of the old layout to read
+ *        the stored bytes through — db_node_v3_t in node_migrate.h.
+ *
+ *        THE TRAP HERE IS THAT sizeof() DID NOT CHANGE. The new bool landed in
+ *        a padding byte v3 was already wasting, so a v3 blob's item_size still
+ *        equals sizeof(db_node_t) and load_blob's size check waves it through.
+ *        The byte it now reads as `mqtt_enabled` is v3 PADDING — indeterminate,
+ *        never written deliberately — so trusting it would silently drop a
+ *        user's nodes off their broker on the first boot after an update. The
+ *        version in the header, not the record size, is therefore what decides
+ *        which layout the bytes are; see load_blob() and db_node_widen_v3().
  *
  * A blob whose version is OLDER than this is migrated on load and written back
  * in the current layout. A blob NEWER than this is refused, because guessing at
  * a layout from the future is how a downgrade eats a user's graph.
  */
-#define DB_GRAPH_VERSION 3u
+#define DB_GRAPH_VERSION 4u
 
 /* At most this many wired inputs. Fixed slots, never compacted: an ISR argument
  * is a slot index, and compacting the table under a live interrupt would point
@@ -216,6 +231,43 @@ typedef struct {
     uint32_t item_size;
     uint32_t count;
 } grf_hdr_t;
+
+/*
+ * How to read records written under an older layout than the current struct.
+ *
+ * A blob at or below `upto_version` holds records of `item_size` bytes, and
+ * `widen` copies `n` of them out of the raw buffer into the current struct,
+ * field by field. NULL means "this blob has only ever had one layout" — which is
+ * still true of the links blob, and was true of the nodes blob until v4.
+ */
+typedef struct {
+    uint32_t upto_version;
+    size_t   item_size;
+    void   (*widen)(void *dst, const void *src, int n);
+} blob_legacy_t;
+
+static void widen_nodes_v3(void *dst, const void *src, int n)
+{
+    db_node_widen_v3((db_node_t *)dst, src, n);
+}
+
+static const blob_legacy_t NODES_LEGACY = {
+    .upto_version = 3u,
+    .item_size    = sizeof(db_node_v3_t),
+    .widen        = widen_nodes_v3,
+};
+
+/*
+ * The two sizes coinciding is exactly why the version, not the size, decides
+ * which layout a blob holds — see the DB_GRAPH_VERSION comment. This assertion
+ * is not a requirement, it is a TRIPWIRE: if a later field makes them differ
+ * this fires, and whoever is reading it needs to know only that the version
+ * check above already handles both cases and this line can be deleted.
+ */
+_Static_assert(sizeof(db_node_v3_t) == sizeof(db_node_t),
+               "v4 added mqtt_enabled into v3's padding; if that is no longer "
+               "true, drop this assert — load_blob() keys off the version, not "
+               "the record size, and is correct either way.");
 
 /* ---- trigger queue ------------------------------------------------------- */
 
@@ -437,9 +489,15 @@ static esp_err_t save_blob(const char *key, const void *items, size_t item_size,
  * *ver_out receives the layout version the blob was written in, or 0 when there
  * was no readable blob at all. The caller needs that to know whether a migration
  * is owed AND whether it may write back: "no blob" and "an old blob" look the
- * same in the item count when the graph is simply empty. */
+ * same in the item count when the graph is simply empty.
+ *
+ * `legacy` (may be NULL) describes the layout older blobs were written in. THE
+ * VERSION IN THE HEADER DECIDES which layout applies, never the record size:
+ * v4 added a bool into a padding byte, so a v3 record is the same NUMBER of
+ * bytes as a v4 one while meaning something different in the byte that matters.
+ * Sizing off item_size would read v3 padding as a live flag. */
 static int load_blob(const char *key, void *items, size_t item_size, int max,
-                     uint32_t *ver_out)
+                     uint32_t *ver_out, const blob_legacy_t *legacy)
 {
     if (ver_out)
         *ver_out = 0;
@@ -456,26 +514,41 @@ static int load_blob(const char *key, void *items, size_t item_size, int max,
 
     grf_hdr_t hdr;
     memcpy(&hdr, s_blob, sizeof(hdr));
-    /* Older layouts are migrated by the caller; a NEWER one is refused. The item
-     * size must match either way — every shipped version of db_node_t and
-     * db_link_t has had the same layout, so a mismatch is corruption or a
-     * struct change that would need its own frozen typedef here. */
-    if (hdr.version == 0 || hdr.version > DB_GRAPH_VERSION ||
-        hdr.item_size != item_size) {
-        ESP_LOGW(TAG, "%s blob is layout v%u/%u, this build reads up to v%u/%u — ignored",
+
+    /* A NEWER layout is refused outright: guessing at a layout from the future
+     * is how a downgrade eats a user's graph. */
+    if (hdr.version == 0 || hdr.version > DB_GRAPH_VERSION) {
+        ESP_LOGW(TAG, "%s blob is layout v%u, this build reads up to v%u — ignored",
+                 key, (unsigned)hdr.version, (unsigned)DB_GRAPH_VERSION);
+        return 0;
+    }
+
+    /* Which layout the records are in, decided by the VERSION. */
+    const blob_legacy_t *lg = NULL;
+    size_t stored_size = item_size;
+    if (legacy && hdr.version <= legacy->upto_version) {
+        lg = legacy;
+        stored_size = legacy->item_size;
+    }
+
+    if (hdr.item_size != stored_size) {
+        ESP_LOGW(TAG, "%s blob is layout v%u with %u-byte records, expected %u — ignored",
                  key, (unsigned)hdr.version, (unsigned)hdr.item_size,
-                 (unsigned)DB_GRAPH_VERSION, (unsigned)item_size);
+                 (unsigned)stored_size);
         return 0;
     }
     if (ver_out)
         *ver_out = hdr.version;
 
     int n = (hdr.count > (uint32_t)max) ? max : (int)hdr.count;
-    if (len < sizeof(hdr) + (size_t)n * item_size) {
+    if (len < sizeof(hdr) + (size_t)n * stored_size) {
         ESP_LOGE(TAG, "%s blob is truncated — ignored", key);
         return 0;
     }
-    memcpy(items, s_blob + sizeof(hdr), (size_t)n * item_size);
+    if (lg)
+        lg->widen(items, s_blob + sizeof(hdr), n);
+    else
+        memcpy(items, s_blob + sizeof(hdr), (size_t)n * item_size);
     return n;
 }
 
@@ -541,9 +614,21 @@ static esp_err_t save_links(void)
  * whoever is watching a console, and as a DB_EV_SYSTEM event naming the node
  * for the user who is not — that it needs a sender adding.
  *
- * ADDING v4: add a `case 3:` below and let `case 2:` fall INTO it, so a v1 blob
+ * v3 -> v4 adds `mqtt_enabled`, and is the first step whose work does NOT
+ * happen here. The two before it only ever changed what a `type` VALUE meant,
+ * which is something you can do to an already-loaded array. This one changed the
+ * RECORD, so it has to happen while the bytes are still being read: load_blob()
+ * routes any blob at v3 or below through db_node_widen_v3(), which copies every
+ * old field across and sets mqtt_enabled = true. By the time this function runs
+ * the array is already in the v4 layout, which is why `case 3:` below has
+ * nothing to do — see the DB_GRAPH_VERSION comment for why trusting the record
+ * size instead would have quietly dropped nodes off the user's broker.
+ *
+ * ADDING v5: add a `case 4:` below and let `case 3:` fall INTO it, so a v1 blob
  * is carried forward through every step in turn rather than needing its own
- * shortcut. (`case 2:` breaks today only because it is the last one.)
+ * shortcut. (`case 3:` breaks today only because it is the last one.) If v5
+ * changes the record rather than the meaning of a value, freeze a db_node_v4_t
+ * in node_migrate.h and extend NODES_LEGACY instead.
  *
  * Caller holds the lock. Returns how many nodes were changed.
  */
@@ -611,6 +696,14 @@ static int migrate_nodes(uint32_t from_version)
                          (unsigned)s_nodes[i].id, s_nodes[i].name);
             }
         }
+        __attribute__((fallthrough));
+    case 3:
+        /* v3 -> v4 is a LAYOUT change, and load_blob() has already applied it
+         * via db_node_widen_v3(): every node in the array arrived here with
+         * mqtt_enabled already set true. Nothing is left to do, and the case is
+         * spelled out rather than omitted so the chain still reads as one step
+         * per version and the next person adding `case 4:` has somewhere
+         * obvious to hang it. */
         break;
     default:
         break;
@@ -969,6 +1062,30 @@ esp_err_t db_graph_switch_set(uint16_t node_id, bool on)
     return ESP_OK;
 }
 
+void db_graph_switch_suffix(const db_node_t *n, char *out, size_t outsz)
+{
+    if (!out || outsz == 0)
+        return;
+    if (!n) { out[0] = '\0'; return; }
+    db_mqtt_switch_suffix(n->topic, n->name, out, outsz);
+}
+
+/*
+ * MATCHED BY RESOLVED SUFFIX, NOT BY THE RAW `topic` FIELD.
+ *
+ * This is the bug that started the whole feature's trouble. The bridge
+ * subscribes on db_graph_switch_suffix() — explicit topic, else a slug of the
+ * name — but this function used to compare `s_nodes[i].topic` directly. A switch
+ * called "All Bells Switch" with no topic typed therefore subscribed on
+ * "all_bells_switch" and got a Home Assistant entity, while every command that
+ * arrived looked for a node whose topic field equalled "all_bells_switch" and
+ * found none. The entity existed, could not be commanded, and its retained state
+ * was never published, because db_graph_switch_topic_state() below had the same
+ * flaw and reported "no such topic".
+ *
+ * Both now ask db_graph_switch_suffix(), which is the same function the bridge
+ * asks. There is one rule and one implementation of it.
+ */
 int db_graph_switch_set_topic(const char *topic, bool on)
 {
     if (!topic || !topic[0])
@@ -979,7 +1096,15 @@ int db_graph_switch_set_topic(const char *topic, bool on)
     for (int i = 0; i < s_node_count; i++) {
         if (s_nodes[i].type != DB_NODE_LOGIC_SWITCH)
             continue;
-        if (strcmp(s_nodes[i].topic, topic) != 0)
+        /* A node the user has taken off MQTT is not commandable FROM MQTT, even
+         * when it shares a topic with one that is still exposed. This is the
+         * only caller's whole purpose, so the check belongs here rather than
+         * being owed by every caller. */
+        if (!s_nodes[i].mqtt_enabled)
+            continue;
+        char sfx[DB_NODE_TOPIC_MAX];
+        db_graph_switch_suffix(&s_nodes[i], sfx, sizeof(sfx));
+        if (strcmp(sfx, topic) != 0)
             continue;
         matched++;
         if (s_nodes[i].enabled == on)
@@ -1009,7 +1134,15 @@ bool db_graph_switch_topic_state(const char *topic, bool *found_out)
     for (int i = 0; i < s_node_count; i++) {
         if (s_nodes[i].type != DB_NODE_LOGIC_SWITCH)
             continue;
-        if (strcmp(s_nodes[i].topic, topic) != 0)
+        /* Same rule as db_graph_switch_set_topic(): the position reported to the
+         * broker is the position of the nodes the broker can actually reach,
+         * matched on the RESOLVED suffix so a name-derived topic reports a state
+         * instead of looking like a topic no node carries. */
+        if (!s_nodes[i].mqtt_enabled)
+            continue;
+        char sfx[DB_NODE_TOPIC_MAX];
+        db_graph_switch_suffix(&s_nodes[i], sfx, sizeof(sfx));
+        if (strcmp(sfx, topic) != 0)
             continue;
         found = true;
         if (s_nodes[i].enabled)
@@ -1775,9 +1908,10 @@ esp_err_t db_graph_init(void)
     lock();
     uint32_t nodes_ver = 0, links_ver = 0;
     s_node_count = load_blob(DB_GRAPH_NODES, s_nodes, sizeof(db_node_t),
-                             DB_NODE_MAX, &nodes_ver);
+                             DB_NODE_MAX, &nodes_ver, &NODES_LEGACY);
+    /* The link record has never changed shape, so it has no legacy layout. */
     s_link_count = load_blob(DB_GRAPH_LINKS, s_links, sizeof(db_link_t),
-                             DB_LINK_MAX, &links_ver);
+                             DB_LINK_MAX, &links_ver, NULL);
 
     /* Bring an older layout forward BEFORE anything else looks at the types —
      * in particular before the unknown-type sanitiser below, which would
@@ -1889,6 +2023,12 @@ void db_graph_node_defaults(db_node_t *node, db_node_type_t type)
     node->gpio_pin = -1;                 /* wired input: opt-in, never assumed */
     node->gpio_active_low  = true;       /* button to GND + internal pull-up */
     node->gpio_debounce_ms = 50;         /* mechanical contacts settle in ~10-30ms */
+
+    /* EVERY type, not only the three the bridge looks at. A user turning this
+     * off on a node it does not apply to should see it stay off rather than
+     * silently reset, and a future type that does reach MQTT must arrive
+     * exposed by default like everything else — the flag is opt-OUT. */
+    node->mqtt_enabled = true;
 
     /* Transmit policy mirrors db_config's defaults: real receivers integrate
      * several copies of a frame before they act, so one replay is routinely

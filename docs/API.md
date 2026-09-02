@@ -447,7 +447,7 @@ signal store is full.
                "gpio_pin":-1, "gpio_active_low":true, "gpio_debounce_ms":50,
                "repeats":6, "gap_us":8000,
                "window_s":10, "window_ms":10000, "group_mode":"any",
-               "topic":"", "ui_x":40, "ui_y":40 } ],
+               "topic":"", "mqtt_enabled":true, "ui_x":40, "ui_y":40 } ],
   "links": [ {"from":1,"to":2} ] }
 ```
 `type` is one of: `signal.rx`, `signal.tx`, `source.gpio`, `source.virtual`,
@@ -607,17 +607,91 @@ a reboot, so Home Assistant never shows a position the box is not in. With
 discovery enabled the topic also becomes a native HA **`switch`** entity on the
 shared Klingelbox device — a real toggle, not a template or a button pair.
 
+**The topic a switch answers on** is its `topic` if it has one, otherwise a slug
+of its `name` (`All Bells Switch` → `all_bells_switch`), otherwise nothing. One
+resolver decides this for the subscription, the Home Assistant entity, the
+routing of an arriving `set` and the reported state alike — they are the same
+question, and when the routing side asked it differently a switch relying on the
+name fallback got an entity that could not be commanded and never published a
+state.
+
 **Several `logic.switch` nodes may share one `topic`**, and that is a feature:
-one Home Assistant toggle then gates several paths at once. A `set` command moves
-every node carrying the suffix; the state reported for the topic is `ON` if
+one Home Assistant toggle then gates several paths at once. Two nodes sharing a
+NAME share a toggle for the same reason, since they resolve to the same suffix. A
+`set` command moves every node that resolves to the suffix; the state reported for the topic is `ON` if
 **any** of them is conducting (an all-of rule would report `OFF` while a path
 still rang). Discovery announces one entity **per distinct topic**, not per node
 — two toggles that always move together and command each other would read as a
 bug — named after the first node on the topic, with `(N paths)` appended when
 several share it.
 
-Empty on a `source.virtual` or a `logic.switch` means UI/REST only: the node
-still works, nothing subscribes to it and no HA entity appears.
+Empty on a `source.virtual` means UI/REST only: the node still works, nothing
+subscribes to it and no HA entity appears. Empty on a `logic.switch` does **not**
+mean that — it falls back to a slug of the node's `name`, so a blank topic still
+produces a topic and an entity. Use `mqtt_enabled` to keep a switch off MQTT.
+
+#### `mqtt_enabled` — is this node visible outside the box?
+
+Boolean, **`true` by default**, on every node type. Absent from a write means
+"leave it as it is"; a node created without it is exposed, like everything that
+existed before the field did.
+
+With it `false` the MQTT bridge behaves as though the node were not in the graph:
+
+| node type | what stops |
+|---|---|
+| `source.virtual` | no `<base>/trigger/<topic>` subscription, no HA button entity |
+| `logic.switch` | no `<base>/switch/<topic>/set` subscription, no HA switch entity, no retained state, and a `set` command no longer moves it even when another node shares the topic |
+| `sink.mqtt` | publishes nothing — not on `<base>/<topic>`, and not into the `<base>/event` stream either |
+
+**Anything already announced is CLEARED, not orphaned.** Turning it off publishes
+an empty retained payload over the node's discovery config — and, for a switch
+topic no exposed node carries any more, over its retained `state` as well — so
+Home Assistant removes the entity instead of showing it permanently unavailable.
+This is the same path a deleted node takes.
+
+**Nothing inside the graph changes.** A switch with `mqtt_enabled: false` still
+gates its wire, a `source.virtual` still fires from
+`POST /api/graph/nodes/{id}/fire`, and a `sink.mqtt` is still reached by a
+traversal. The flag answers one question only: can the outside world see it.
+
+It exists because a blank `topic` stopped being a way to say "no MQTT" once
+`logic.switch` gained the name fallback. A sentinel topic value was considered
+and rejected — `-` is a perfectly legal MQTT topic level, so any magic string
+collides with something a user could legitimately want.
+
+#### Topic validation
+
+Every topic a user can type is checked against **one rule**, and a bad value is
+refused with `400 Bad Request` naming both the field and the offending character
+rather than being stored or silently repaired. It applies to `topic` on
+`POST /api/graph/nodes` and `POST /api/graph/nodes/{id}` (create and update
+alike), and to `mqtt.base_topic` and `mqtt.discovery_prefix` on
+`POST /api/config`.
+
+| refused | why |
+|---|---|
+| `#` or `+` anywhere | MQTT wildcards. Publishing to a topic containing one is illegal: the broker refuses the message or drops the connection. In `base_topic` that takes the entire bridge down, not one entity. |
+| control characters, DEL, any byte >= 0x80 | Not printable, so not debuggable. A newline pasted out of a config file is the usual way one arrives. |
+| a leading or trailing `/` | Legal MQTT, but it means an empty first or last topic level and here it is always a mistake. The box supplies the separators itself. |
+| an empty level (`a//b`) | Same reasoning. Refused rather than silently producing a topic nobody can read. |
+| longer than 47 characters | The field stores 48 bytes including the terminator. Checked before truncation, so an over-long value is refused rather than quietly cut short. |
+
+An **empty** value is always accepted: emptiness is the caller's business, not a
+syntax question. On a node it means "no topic"; on `base_topic` and
+`discovery_prefix` it means "use the default" (`klingelbox` and `homeassistant`),
+which is the behaviour those fields have always had.
+
+Values are trimmed of surrounding whitespace before both validation and storage,
+so the string that is checked is the string that is stored. The web UI applies
+the identical rule as you type, so the same message appears before anything is
+sent.
+
+```
+$ curl -sX POST http://klingelbox.local/api/graph/nodes/3 -d '{"topic":"a/#"}'
+{"error":"\"topic\" contains '#', which is an MQTT wildcard. A message cannot be
+published to a topic containing '#' or '+' — the broker refuses it."}
+```
 
 **`sink.monitor` acts on nothing.** It is a visualizer: reaching it records a
 timestamp and that is all — no transmit, no publish, no GPIO. Drop one anywhere
@@ -723,6 +797,13 @@ succeeded and the key was dropped.) Reads report only `has_pass`.
            "default_url":"https://github.com/MarvAmBass/klingelbox/releases/latest/download/klingelbox.bin",
            "default_webui_url":"https://github.com/MarvAmBass/klingelbox/releases/latest/download/storage.bin" } }
 ```
+
+`mqtt.base_topic` and `mqtt.discovery_prefix` are validated on write by the same
+rule as a node's `topic` — see [Topic validation](#topic-validation). A bad value
+is refused with `400 Bad Request` naming the field, and **nothing else in the
+request body is applied**: this handler is checked before it mutates anything,
+so a rejected topic cannot leave the Wi-Fi half of a POST saved and the MQTT half
+not. Both may be empty, which means "use the default" as it always has.
 
 `ota.url` is the app image URL this box will use for a manual update; it is
 writable and defaults to the stable release asset, so nobody has to type a GitHub

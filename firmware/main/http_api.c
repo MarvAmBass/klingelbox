@@ -100,6 +100,7 @@
 #include "db_diag.h"
 #include "db_mqtt.h"
 #include "event_log.h"
+#include "mqtt_topic.h"
 #include "node_graph.h"
 #include "ota.h"
 #include "rf_capture.h"
@@ -342,6 +343,14 @@ static double clampd(double v, double lo, double hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+
+/*
+ * Room to trim a user-supplied topic into WITHOUT truncating it, so the length
+ * rule in db_mqtt_topic_valid() gets to see the real value. Comfortably past
+ * both DB_NODE_TOPIC_MAX and DB_STR_TOPIC: the point is only that a value which
+ * is too long still looks too long by the time it is checked.
+ */
+#define DB_TOPIC_SCRATCH 128
 
 static void trim_copy(const char *in, char *out, size_t outsz)
 {
@@ -1713,18 +1722,30 @@ static cJSON *node_json(const db_node_t *n)
     cJSON_AddNumberToObject(o, "window_ms", (double)n->window_ms);
     cJSON_AddStringToObject(o, "group_mode", n->group_mode == DB_GROUP_ALL ? "all" : "any");
     cJSON_AddStringToObject(o, "topic", n->topic);
+    cJSON_AddBoolToObject(o, "mqtt_enabled", n->mqtt_enabled);
     cJSON_AddNumberToObject(o, "ui_x", n->ui_x);
     cJSON_AddNumberToObject(o, "ui_y", n->ui_y);
     return o;
 }
 
-/* Apply every field present in `j` onto *n. Absent fields are left alone, which
- * is what makes POST /api/graph/nodes/<id> a partial update for free. */
-static void node_apply_json(db_node_t *n, const cJSON *j)
+/*
+ * Apply every field present in `j` onto *n. Absent fields are left alone, which
+ * is what makes POST /api/graph/nodes/<id> a partial update for free.
+ *
+ * Returns false when a value is REFUSED rather than clamped, writing the reason
+ * into `err`. Almost everything here clamps — a window of 9999 s becomes 6000 s
+ * and nobody is hurt — but a topic cannot be clamped into validity: silently
+ * stripping a '#' would hand the user back a topic they did not ask for and did
+ * not notice. *n may be partially updated on failure; every caller applies onto
+ * a stack copy that it drops.
+ */
+static bool node_apply_json(db_node_t *n, const cJSON *j, char *err, size_t errsz)
 {
     const char *s;
     double d;
     bool b;
+
+    if (errsz) err[0] = '\0';
 
     if (json_str(j, "name", &s))   trim_copy(s, n->name, sizeof(n->name));
     if (json_bool(j, "enabled", &b)) n->enabled = b;
@@ -1760,9 +1781,30 @@ static void node_apply_json(db_node_t *n, const cJSON *j)
                                         (long)DB_MONITOR_HOLD_MAX_S) * 1000u;
     if (json_str(j, "group_mode", &s))
         n->group_mode = (uint8_t)(strcmp(s, "all") == 0 ? DB_GROUP_ALL : DB_GROUP_ANY);
-    if (json_str(j, "topic", &s)) trim_copy(s, n->topic, sizeof(n->topic));
+    /* The one field that is validated rather than clamped. `#` and `+` are MQTT
+     * wildcards and a PUBLISH carrying one is illegal, so a single typo here
+     * would have the broker refuse the message or drop the connection — which
+     * is how one bad node topic used to take the whole bridge down. Checked
+     * against the TRIMMED value, because that is what gets stored. */
+    if (json_str(j, "topic", &s)) {
+        /* Trimmed into a buffer BIGGER than the field, deliberately. Trimming
+         * straight into a DB_NODE_TOPIC_MAX buffer would truncate an over-long
+         * value to exactly the limit and then happily validate the result — the
+         * length rule would never fire, and the user would be handed back a
+         * silently shortened topic they did not type. Validation guarantees the
+         * value fits before it is copied into the node. */
+        char topic[DB_TOPIC_SCRATCH];
+        trim_copy(s, topic, sizeof(topic));
+        if (!db_mqtt_topic_valid(topic, "topic", DB_NODE_TOPIC_MAX - 1, err, errsz))
+            return false;
+        strlcpy(n->topic, topic, sizeof(n->topic));
+    }
+    /* Opt-OUT: absent means "leave it as it was", and a node created without it
+     * keeps the true that db_graph_node_defaults() set. */
+    if (json_bool(j, "mqtt_enabled", &b)) n->mqtt_enabled = b;
     if (json_num(j, "ui_x", &d))  n->ui_x = (int16_t)clampl(d, -32768, 32767);
     if (json_num(j, "ui_y", &d))  n->ui_y = (int16_t)clampl(d, -32768, 32767);
+    return true;
 }
 
 static esp_err_t api_graph_get(httpd_req_t *req)
@@ -1857,7 +1899,11 @@ static esp_err_t api_node_create(httpd_req_t *req)
      * so a caller only has to send what it actually wants to differ. */
     db_node_t n;
     db_graph_node_defaults(&n, type);
-    node_apply_json(&n, j);
+    char verr[224];
+    if (!node_apply_json(&n, j, verr, sizeof(verr))) {
+        cJSON_Delete(j);
+        return send_error(req, "400 Bad Request", verr);
+    }
     cJSON_Delete(j);
     n.id = 0;                 /* the graph assigns it */
     n.type = (uint8_t)type;
@@ -1893,7 +1939,11 @@ static esp_err_t api_node_update(httpd_req_t *req, uint16_t id)
         }
         n.type = (uint8_t)type;
     }
-    node_apply_json(&n, j);
+    char verr[224];
+    if (!node_apply_json(&n, j, verr, sizeof(verr))) {
+        cJSON_Delete(j);
+        return send_error(req, "400 Bad Request", verr);
+    }
     cJSON_Delete(j);
     n.id = id;
 
@@ -2228,6 +2278,42 @@ static esp_err_t api_config_post(httpd_req_t *req)
     bool b;
     bool sta_changed = false;
 
+    /*
+     * VALIDATE BEFORE MUTATING ANYTHING — the same rule POST /api/ap follows,
+     * and for a sharper reason here. This handler applies fields onto the live
+     * config as it walks the body, so a topic rejected halfway through would
+     * leave the Wi-Fi half of the request applied and the MQTT half not. Worse,
+     * the base topic is the prefix of EVERY topic the box publishes: a '#' in
+     * it does not break one node, it takes the whole bridge down on a box that
+     * is very likely connected right now.
+     *
+     * An EMPTY value stays legal and is left alone: both fields already mean
+     * "use the default" when blank (mqtt_bridge.c resolves it), and turning
+     * that into an error would reject a body that has always been accepted.
+     */
+    cJSON *mqtt_pre = cJSON_GetObjectItem(j, "mqtt");
+    if (cJSON_IsObject(mqtt_pre)) {
+        static const struct { const char *key; const char *field; } TOPIC_FIELDS[] = {
+            { "base_topic",       "mqtt.base_topic" },
+            { "discovery_prefix", "mqtt.discovery_prefix" },
+        };
+        for (size_t i = 0; i < sizeof(TOPIC_FIELDS) / sizeof(TOPIC_FIELDS[0]); i++) {
+            const char *raw;
+            if (!json_str(mqtt_pre, TOPIC_FIELDS[i].key, &raw)) continue;
+            /* Same reason as the node topic above: trim into something larger
+             * than the field so an over-long value is REFUSED rather than
+             * quietly cut down to the limit and then found to be valid. */
+            char clean[DB_TOPIC_SCRATCH];
+            trim_copy(raw, clean, sizeof(clean));
+            char verr[224];
+            if (!db_mqtt_topic_valid(clean, TOPIC_FIELDS[i].field,
+                                     DB_STR_TOPIC - 1, verr, sizeof(verr))) {
+                cJSON_Delete(j);
+                return send_error(req, "400 Bad Request", verr);
+            }
+        }
+    }
+
     if (json_str(j, "hostname", &s) && s[0])
         strlcpy(s_cfg->hostname, s, sizeof(s_cfg->hostname));
 
@@ -2270,11 +2356,14 @@ static esp_err_t api_config_post(httpd_req_t *req)
         if (json_str(mqtt, "user", &s))     strlcpy(s_cfg->mqtt_user, s, sizeof(s_cfg->mqtt_user));
         if ((json_str(mqtt, "password", &s) || json_str(mqtt, "pass", &s)) && s[0])
             strlcpy(s_cfg->mqtt_pass, s, sizeof(s_cfg->mqtt_pass));
+        /* Trimmed, because the trimmed value is the one that was validated
+         * above — storing the raw one would put back a space the check never
+         * saw. */
         if (json_str(mqtt, "base_topic", &s))
-            strlcpy(s_cfg->mqtt_base_topic, s, sizeof(s_cfg->mqtt_base_topic));
+            trim_copy(s, s_cfg->mqtt_base_topic, sizeof(s_cfg->mqtt_base_topic));
         if (json_bool(mqtt, "homeassistant", &b)) s_cfg->mqtt_homeassistant = b;
         if (json_str(mqtt, "discovery_prefix", &s))
-            strlcpy(s_cfg->mqtt_discovery_prefix, s, sizeof(s_cfg->mqtt_discovery_prefix));
+            trim_copy(s, s_cfg->mqtt_discovery_prefix, sizeof(s_cfg->mqtt_discovery_prefix));
     }
 
     cJSON *ota = cJSON_GetObjectItem(j, "ota");

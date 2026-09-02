@@ -2318,6 +2318,130 @@ function topicSlug(s) {
            .replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
 }
 
+/* MQTT TOPIC LIMIT. The field holds 48 bytes including the terminator, so 47
+   characters is what actually fits. The inputs used to advertise 48 and let the
+   user type one character the box would then refuse. */
+var TOPIC_MAX = 47;
+
+/*
+ * A DELIBERATE MIRROR of db_mqtt_topic_valid() in main/mqtt_topic.c — same rule,
+ * same order, same words. Returns "" when the topic is fine, or the complete
+ * sentence to show when it is not.
+ *
+ * WHY IT IS DUPLICATED AT ALL. The firmware is the authority and validates every
+ * write regardless; this copy exists so the rule reads as you type instead of
+ * arriving as a server error after you have pressed Save. Keeping the wording
+ * identical is what stops the two from being experienced as two different rules.
+ * If you change one, change the other — and host-test/test_node_graph.c pins the
+ * C side down.
+ *
+ * The one place they can differ is the length of a non-ASCII string: C counts
+ * bytes, JavaScript counts UTF-16 units. Both still REFUSE it — non-ASCII is
+ * rejected outright — so only the sentence can differ, never the verdict.
+ *
+ * '#' and '+' are MQTT wildcards: a broker refuses a PUBLISH to a topic
+ * containing one, so a single typo here can take the whole bridge down. The
+ * slash rules are not MQTT requirements — a leading, trailing or doubled '/' is
+ * legal and produces an empty topic level — but here they are always a mistake,
+ * so they are refused rather than silently made into a topic nobody can read.
+ */
+function topicError(value, fieldName, maxLen) {
+  var t = String(value === null || value === undefined ? "" : value);
+  var f = fieldName || "topic";
+  var max = maxLen || TOPIC_MAX;
+
+  /* Empty is the caller's business, not a syntax error: on a node it means "no
+     MQTT", in Settings it means "use the default". */
+  if (t.length === 0) return "";
+
+  if (t.length > max)
+    return '"' + f + '" is too long: ' + t.length +
+           " characters, the limit is " + max + ".";
+
+  if (t.charAt(0) === "/")
+    return '"' + f + "\" must not start with '/' \u2014 a leading slash makes an " +
+           "empty first topic level. The box adds the separators itself.";
+
+  for (var i = 0; i < t.length; i++) {
+    var ch = t.charAt(i);
+    var c = t.charCodeAt(i);
+
+    if (ch === "#" || ch === "+")
+      return '"' + f + "\" contains '" + ch + "', which is an MQTT wildcard. A " +
+             "message cannot be published to a topic containing '#' or '+' \u2014 " +
+             "the broker refuses it.";
+
+    if (c < 0x20 || c >= 0x7F) {
+      var hex = c.toString(16).toUpperCase();
+      if (hex.length < 2) hex = "0" + hex;
+      return '"' + f + '" contains a non-printable character (byte 0x' + hex +
+             ") at position " + (i + 1) + ". Only plain printable ASCII is allowed.";
+    }
+
+    if (ch === "/" && t.charAt(i + 1) === "/")
+      return '"' + f + "\" contains an empty level ('//') at position " + (i + 1) +
+             ". That is legal MQTT but almost always a typo, so it is refused " +
+             "rather than producing a topic nobody can read.";
+  }
+
+  if (t.charAt(t.length - 1) === "/")
+    return '"' + f + "\" must not end with '/' \u2014 a trailing slash makes an " +
+           "empty last topic level.";
+
+  return "";
+}
+
+/*
+ * The "Expose to Home Assistant / MQTT" checkbox, shared by the three node types
+ * the bridge actually looks at (Virtual trigger, Switch, MQTT publish).
+ *
+ * CHECKED BY DEFAULT, and `mqtt_enabled !== false` rather than a truthy test on
+ * purpose: a node saved by an older firmware has no such field at all, and the
+ * honest reading of "absent" is the default, which is on.
+ *
+ * It exists because a blank topic stopped meaning "no MQTT" — a Switch with no
+ * topic now falls back to a slug of its NAME, so there was no longer any way to
+ * keep one off Home Assistant. A magic topic value was considered and rejected:
+ * '-' is a perfectly legal MQTT topic level, so any sentinel collides with
+ * something somebody could legitimately want to publish to.
+ */
+function exposeField(n, onChange) {
+  var f = checkField("Expose to Home Assistant / MQTT", n.mqtt_enabled !== false,
+    "On by default. Uncheck it and this node disappears from MQTT completely \u2014 nothing " +
+    "subscribed, nothing published, and its Home Assistant entity removed rather than left " +
+    "behind permanently unavailable. Inside the graph nothing changes: it still fires, still " +
+    "gates, still works from this page and the REST API.");
+  f.classList.add("full");
+  f.input.addEventListener("change", onChange);
+  return f;
+}
+
+/*
+ * Wire live validation onto one topic input.
+ *
+ * `errEl` carries the message, `field` is the name the message uses (so a user
+ * looking at three topic fields is told WHICH one is wrong, exactly as the
+ * firmware's error would). Returns a function that re-runs the check and returns
+ * true when the value is usable — call it before POSTing, so a Save can be
+ * refused for a value the user pasted rather than typed.
+ */
+function bindTopicCheck(input, errEl, field, after) {
+  function run() {
+    var e = topicError(trimOf(input), field, TOPIC_MAX);
+    if (errEl) {
+      errEl.textContent = e;
+      errEl.className = e ? "hint bad" : "hint";
+    }
+    if (e) input.classList.add("badinput");
+    else   input.classList.remove("badinput");
+    if (after) after(e);
+    return !e;
+  }
+  input.addEventListener("input", run);
+  run();
+  return run;
+}
+
 /* "outside_bell" -> "Outside bell". Mirrors what the firmware does when a
    switch node still carries its default name: the topic becomes the label. */
 function prettyTopic(t) {
@@ -3081,6 +3205,9 @@ function nodeSummary(n) {
         " · " + (n.gpio_active_low === false ? "active high" : "active low") +
         " · " + numOr(n.gpio_debounce_ms, 50) + " ms debounce";
     case "source.virtual":
+      /* No new badge and no extra line: the subtitle already had a slot for the
+         topic, and naming a topic nothing is listening on would be a lie. */
+      if (n.mqtt_enabled === false) return "Not on MQTT · fired from this page or the REST API";
       return n.topic
         ? ("MQTT trigger: " + mqttTriggerTopic(n.topic))
         : "Fired from this page or the REST API only";
@@ -3105,8 +3232,10 @@ function nodeSummary(n) {
     }
     case "logic.switch":
       return (switchOn(n) ? "ON — events pass through" : "OFF — everything past it is blocked") +
-             (n.topic ? (" · " + mqttSwitchTopic(n.topic, "set")) : " · no MQTT topic");
+             (n.mqtt_enabled === false ? " · not on MQTT"
+               : (n.topic ? (" · " + mqttSwitchTopic(n.topic, "set")) : " · no MQTT topic"));
     case "sink.mqtt":
+      if (n.mqtt_enabled === false) return "Not on MQTT — publishes nothing";
       return n.topic ? ("Publishes to " + mqttPublishTopic(n.topic)) : "No topic set";
     case "sink.monitor":
       return "Watches only — nothing is sent or published. Lamp stays lit " +
@@ -3378,7 +3507,7 @@ function createNode(type, sig) {
     type: type, name: sig ? signalLabel(sig) : ty.label, enabled: true,
     signal_id: sig ? sig.id : 0, gpio_pin: -1, gpio_active_low: true, gpio_debounce_ms: 50,
     repeats: rep ? 3 : 6, gap_us: 8000, window_s: win, group_mode: "any",
-    topic: "", ui_x: pos.x, ui_y: pos.y
+    topic: "", mqtt_enabled: true, ui_x: pos.x, ui_y: pos.y
   };
   return postJSON("/api/graph/nodes", body).then(function (created) {
     return loadGraph().then(function () {
@@ -3547,19 +3676,40 @@ function openNodeEditor(n) {
     sh.body.insertBefore(fireBtn, grid);
     sh.body.insertBefore(fireMsg, grid);
 
-    ctl.topic = inputEl("text", n.topic || "", { maxlength: "48", placeholder: "front_gate" });
+    ctl.topic = inputEl("text", n.topic || "",
+      { maxlength: String(TOPIC_MAX), placeholder: "front_gate" });
     var topicPreview = el("div", "hint mono");
+    var topicErr = el("div", "hint");
+    var tf = field("MQTT trigger topic (optional)", ctl.topic, null, "full");
+
     function syncTopic() {
+      if (!ctl.mqttOn.input.checked) {
+        topicPreview.textContent =
+          "Not exposed \u2014 nothing subscribes to this node and Home Assistant has no button " +
+          "for it. The topic is kept for when you switch it back on.";
+        return;
+      }
       var t = trimOf(ctl.topic);
       topicPreview.textContent = t
         ? ("Full topic:  " + mqttTriggerTopic(t))
         : "No topic — this node can only be fired from this page or the REST API.";
     }
-    ctl.topic.addEventListener("input", syncTopic);
-    syncTopic();
-    var tf = field("MQTT trigger topic (optional)", ctl.topic, null, "full");
-    add(tf, topicPreview);
+    /* The topic and the checkbox must never look as though they disagree: with
+       the node not exposed the field is disabled and dimmed, so it plainly does
+       not apply rather than sitting there implying it does. */
+    function syncExposed() {
+      var on = ctl.mqttOn.input.checked;
+      ctl.topic.disabled = !on;
+      if (on) tf.classList.remove("dim");
+      else    tf.classList.add("dim");
+      syncTopic();
+    }
+    ctl.mqttOn = exposeField(n, syncExposed);
+    add(grid, ctl.mqttOn);
+    ctl.topicCheck = bindTopicCheck(ctl.topic, topicErr, "topic", syncTopic);
+    add(tf, topicErr, topicPreview);
     add(grid, tf);
+    syncExposed();
     add(sh.body, el("div", "note",
       "Publishing ANY message to that topic fires this node — that is how a virtual input " +
       "becomes reachable from Home Assistant, Node-RED or a shell one-liner, with no RF involved. " +
@@ -3671,14 +3821,26 @@ function openNodeEditor(n) {
     sh.body.insertBefore(swBtn, grid);
     sh.body.insertBefore(swMsg, grid);
 
-    ctl.topic = inputEl("text", n.topic || "", { maxlength: "48", placeholder: "outside_bell" });
+    ctl.topic = inputEl("text", n.topic || "",
+      { maxlength: String(TOPIC_MAX), placeholder: "outside_bell" });
     var swPreview = el("div", "hint mono");
+    var swErr = el("div", "hint");
+    var sf = field("MQTT topic", ctl.topic, null, "full");
+
     function syncSw() {
       var typed = trimOf(ctl.topic);
       var auto = topicSlug(trimOf(nameIn));
       var t = typed || auto;
       clear(swPreview);
       ctl.topic.placeholder = auto || "outside_bell";
+      /* Said first and on its own, because with the node not exposed every other
+         line below would be describing a topic that is not live. */
+      if (!ctl.mqttOn.input.checked) {
+        add(swPreview, el("div", null,
+          "Not exposed \u2014 no subscription, no Home Assistant entity, and the retained " +
+          "state cleared. The switch still works from this page and the REST API."));
+        return;
+      }
       if (!t) {
         swPreview.textContent =
           "Give this node a name (or a topic) and Home Assistant can switch it.";
@@ -3700,12 +3862,20 @@ function openNodeEditor(n) {
         "Appears in Home Assistant as:  " + (generic ? prettyTopic(t) : nm) +
         (generic ? "   (from the topic \u2014 rename this node to change it)" : "")));
     }
-    ctl.topic.addEventListener("input", syncSw);
+    function syncSwExposed() {
+      var on = ctl.mqttOn.input.checked;
+      ctl.topic.disabled = !on;
+      if (on) sf.classList.remove("dim");
+      else    sf.classList.add("dim");
+      syncSw();
+    }
+    ctl.mqttOn = exposeField(n, syncSwExposed);
+    add(grid, ctl.mqttOn);
+    ctl.topicCheck = bindTopicCheck(ctl.topic, swErr, "topic", syncSw);
     if (nameIn) nameIn.addEventListener("input", syncSw);
-    syncSw();
-    var sf = field("MQTT topic", ctl.topic, null, "full");
-    add(sf, swPreview);
+    add(sf, swErr, swPreview);
     add(grid, sf);
+    syncSwExposed();
     add(sh.body, el("div", "note",
       "With a topic set, Home Assistant discovers this as a real switch entity on the " +
       "Klingelbox device — a toggle, not a workaround. ON, OFF, 1, 0, true and false are all " +
@@ -3724,17 +3894,35 @@ function openNodeEditor(n) {
   }
 
   if (n.type === "sink.mqtt") {
-    ctl.topic = inputEl("text", n.topic || "", { maxlength: "48", placeholder: "front" });
+    ctl.topic = inputEl("text", n.topic || "",
+      { maxlength: String(TOPIC_MAX), placeholder: "front" });
     var pubPreview = el("div", "hint mono");
+    var pubErr = el("div", "hint");
+    var pf = field("Topic", ctl.topic, null, "full");
+
     function syncPub() {
+      if (!ctl.mqttOn.input.checked) {
+        pubPreview.textContent =
+          "Not exposed \u2014 this node publishes nothing at all, not even to the " +
+          mqttBase() + "/event stream. The chain still reaches it.";
+        return;
+      }
       var t = trimOf(ctl.topic);
       pubPreview.textContent = t ? ("Publishes to:  " + mqttPublishTopic(t)) : "No topic set — nothing is published.";
     }
-    ctl.topic.addEventListener("input", syncPub);
-    syncPub();
-    var pf = field("Topic", ctl.topic, null, "full");
-    add(pf, pubPreview);
+    function syncPubExposed() {
+      var on = ctl.mqttOn.input.checked;
+      ctl.topic.disabled = !on;
+      if (on) pf.classList.remove("dim");
+      else    pf.classList.add("dim");
+      syncPub();
+    }
+    ctl.mqttOn = exposeField(n, syncPubExposed);
+    add(grid, ctl.mqttOn);
+    ctl.topicCheck = bindTopicCheck(ctl.topic, pubErr, "topic", syncPub);
+    add(pf, pubErr, pubPreview);
     add(grid, pf);
+    syncPubExposed();
     if (S.has.config && !mqttEnabled()) {
       add(sh.body, el("div", "note warn",
         "MQTT is disabled under Settings, so this node stores its topic but publishes nothing yet."));
@@ -3797,6 +3985,16 @@ function openNodeEditor(n) {
     if (ctl.windowS) patch.window_s = intOf(ctl.windowS, numOr(ctl.windowDflt, 10));
     if (ctl.mode) patch.group_mode = ctl.mode.value;
     if (ctl.topic) patch.topic = trimOf(ctl.topic);
+    if (ctl.mqttOn) patch.mqtt_enabled = ctl.mqttOn.input.checked;
+    /* Re-checked here as well as on every keystroke: a value can arrive by paste
+       or autofill without an input event, and the firmware would refuse it
+       anyway — better to say so in the same words, without a round trip. The
+       topic is validated even when the node is not exposed, because it is still
+       stored and would still be refused on the next save. */
+    if (ctl.topicCheck && !ctl.topicCheck()) {
+      setMsg(msg, topicError(patch.topic, "topic", TOPIC_MAX), "err");
+      return;
+    }
     save.disabled = true;
     setMsg(msg, "Saving…");
     postJSON("/api/graph/nodes/" + n.id, patch).then(function () {
@@ -4740,16 +4938,29 @@ function sectionMqtt() {
     var user = inputEl("text", m.user || "", { maxlength: "63" });
     var pass = inputEl("password", "", { maxlength: "63", placeholder: "leave empty to keep" });
     pass.autocomplete = "new-password";
-    var base = inputEl("text", m.base_topic || "klingelbox", { maxlength: "48" });
-    var disc = inputEl("text", m.discovery_prefix || "homeassistant", { maxlength: "48" });
+    var base = inputEl("text", m.base_topic || "klingelbox", { maxlength: String(TOPIC_MAX) });
+    var disc = inputEl("text", m.discovery_prefix || "homeassistant", { maxlength: String(TOPIC_MAX) });
+    var baseErr = el("div", "hint");
+    var discErr = el("div", "hint");
     var ha = checkField("Home Assistant discovery", m.homeassistant !== false);
     add(grid, field("Broker host", host, null, "full"));
     add(grid, field("Port", port));
     add(grid, field("Username", user));
     add(grid, field("Password", pass, "Never sent back to this page.", "full"));
-    add(grid, field("Base topic", base,
-      "Everything is published under this prefix, and virtual triggers listen on <base>/trigger/<topic>."));
-    add(grid, field("Discovery prefix", disc));
+    /* These two matter more than any single node's topic: the base topic is the
+       prefix of EVERY topic the box publishes, and the discovery prefix is the
+       root of everything Home Assistant reads. A '#' in either does not break
+       one entity, it takes the whole bridge down. Same rule, same words, same
+       moment — as you type. */
+    var baseField = field("Base topic", base,
+      "Everything is published under this prefix, and virtual triggers listen on <base>/trigger/<topic>.");
+    add(baseField, baseErr);
+    add(grid, baseField);
+    var discField = field("Discovery prefix", disc);
+    add(discField, discErr);
+    add(grid, discField);
+    var baseCheck = bindTopicCheck(base, baseErr, "mqtt.base_topic");
+    var discCheck = bindTopicCheck(disc, discErr, "mqtt.discovery_prefix");
     add(body, grid, ha);
 
     var msg = el("div", "formmsg");
@@ -4757,11 +4968,24 @@ function sectionMqtt() {
     var save = el("button", "btn primary", "Save MQTT");
     save.type = "button";
     save.addEventListener("click", function () {
+      /* Refused here rather than as a server error, and refused BEFORE the rest
+         of the form is sent: this handler posts host, port and credentials in
+         the same body, and a rejected topic would otherwise mean a round trip
+         that saved nothing. */
+      var baseOk = baseCheck(), discOk = discCheck();
+      if (!baseOk || !discOk) {
+        setMsg(msg, !baseOk
+          ? topicError(trimOf(base), "mqtt.base_topic", TOPIC_MAX)
+          : topicError(trimOf(disc), "mqtt.discovery_prefix", TOPIC_MAX), "err");
+        return;
+      }
       var mm = {
         enabled: enabled.input.checked,
         host: trimOf(host),
         port: intOf(port, 1883),
         user: trimOf(user),
+        /* Empty still means "use the default" — that has always been true and
+           the firmware resolves it, so it is not a validation failure. */
         base_topic: trimOf(base) || "klingelbox",
         homeassistant: ha.input.checked,
         discovery_prefix: trimOf(disc) || "homeassistant"
@@ -6404,7 +6628,8 @@ var NODE_DOC = {
     settings: [
       ["Topic", "A suffix. The box subscribes to <base>/trigger/<suffix>; any message on it fires " +
                 "the node, whatever the payload says. Leave it empty and the node still works from " +
-                "the ▶ button and the API — it simply gets no topic and no Home Assistant entity."]
+                "the ▶ button and the API — it simply gets no topic and no Home Assistant entity."],
+      ["Expose to MQTT", "On by default. Clear it and this node disappears from MQTT entirely \u2014 nothing subscribed, nothing published, and its Home Assistant entity removed rather than left behind unavailable. It keeps working inside the graph."]
     ],
     notes: ["A virtual node with a topic appears in Home Assistant as a button entity."]
   },
@@ -6455,10 +6680,19 @@ var NODE_DOC = {
     settings: [
       ["Position", "ON or OFF. This IS the node's enabled flag — there is no second field, which " +
                    "is why a switched-off Switch draws its wire broken on the map."],
-      ["Topic", "A suffix. With one set, Home Assistant gets a real switch entity for it. Leave it " +
-                "empty and the node still works from this page and the API."]
+      ["Topic", "A suffix. With one set, Home Assistant gets a real switch entity for it. Left " +
+                "empty it does NOT mean “no MQTT” — it follows a slug of the node's name instead, " +
+                "so a switch called “Outside bell” answers on outside_bell either way."],
+      ["Expose to MQTT", "On by default. Clear it and this node disappears from MQTT entirely \u2014 nothing subscribed, nothing published, and its Home Assistant entity removed rather than left behind unavailable. It keeps working inside the graph."]
     ],
     notes: ["Three ways to move it: the ON/OFF button here, the REST API, or MQTT.",
+            "The topic it answers on is the one you typed, or a slug of its name if you did not " +
+            "— “All Bells Switch” answers on all_bells_switch. The same answer decides the " +
+            "subscription, the Home Assistant entity, the routing of a command and the reported " +
+            "state, so a switch that appears in Home Assistant is a switch that can be commanded.",
+            "Clearing “Expose to MQTT” is how you keep a switch off Home Assistant, because a " +
+            "blank topic no longer does it. The retained entity and its retained position are " +
+            "both cleared when you do, so nothing is left haunting the dashboard.",
             "Several Switch nodes may share one topic. A command then moves all of them, and Home " +
             "Assistant shows one entity per topic rather than one per node — one wall switch " +
             "feeding several lamps."]
@@ -6466,8 +6700,12 @@ var NODE_DOC = {
   "sink.mqtt": {
     what: "Publishes to your broker when the chain reaches it, so Home Assistant or anything else " +
           "on the LAN learns that something happened.",
-    settings: [["Topic", "A suffix. Published to <base>/<suffix>."]],
-    notes: ["The message carries the signal id, the label, the fingerprint, the RSSI, the repeat " +
+    settings: [["Topic", "A suffix. Published to <base>/<suffix>."],
+      ["Expose to MQTT", "On by default. Clear it and this node disappears from MQTT entirely \u2014 nothing subscribed, nothing published, and its Home Assistant entity removed rather than left behind unavailable. It keeps working inside the graph."]
+    ],
+    notes: ["With “Expose to MQTT” cleared this node publishes nothing at all — not on its own " +
+            "topic and not into the <base>/event stream either. The chain still reaches it.",
+            "The message carries the signal id, the label, the fingerprint, the RSSI, the repeat " +
             "count and the decode when there is one. For an unregistered burst arriving through " +
             "Any RF signal the signal id is 0 and the decode may be absent."]
   },
@@ -6517,7 +6755,7 @@ function hbNodeReference(body) {
 
   add(body, hbNote(
     "Limits, so a graph does not fail in a way you have to guess at: 24 nodes, a chain at most 8 " +
-    "nodes deep, node names up to 32 characters, MQTT topic suffixes up to 48, and any time " +
+    "nodes deep, node names up to 32 characters, MQTT topic suffixes up to 47, and any time " +
     "window between 1 and 6000 seconds."));
 }
 
@@ -6959,6 +7197,57 @@ function buildHandbook() {
   add(b5, hbP(
     "Deleting a signal tells Home Assistant to forget its entities. Renaming one changes its " +
     "topic but not its entity, because entities are keyed on the signal's number."));
+
+  add(b5, hbH("Keeping one node off MQTT"));
+  add(b5, hbP(
+    "Every Virtual trigger, Switch and MQTT publish node has an “Expose to Home Assistant / " +
+    "MQTT” checkbox in its editor, ticked by default. Clear it and that one node becomes " +
+    "invisible to the broker: nothing is subscribed for it, nothing is published for it, and " +
+    "it gets no Home Assistant entity."));
+  add(b5, hbKV([
+    ["Virtual trigger", "Loses its " + base + "/trigger/<topic> subscription and its HA button."],
+    ["Switch", "Loses its " + base + "/switch/<topic>/set subscription, its HA toggle and its " +
+     "retained position. An MQTT command no longer moves it."],
+    ["MQTT publish", "Publishes nothing at all — not on its own topic, and not into " +
+     base + "/event either."]
+  ]));
+  add(b5, hbP(
+    "What it had already announced is CLEARED rather than abandoned: the box publishes an empty " +
+    "retained payload over the entity's config, and over a switch topic's retained state when no " +
+    "exposed node carries that topic any more. Home Assistant removes the entity instead of " +
+    "showing it unavailable for ever — exactly what deleting the node would have done."));
+  add(b5, hbP(
+    "Nothing inside the graph changes. A Switch still gates its wire, a Virtual trigger still " +
+    "fires from its ▶ button and from the API, and an MQTT publish node is still reached by the " +
+    "chain. The checkbox answers one question only: can anything outside the box see it."));
+  add(b5, hbNote(
+    "It exists because a blank topic on a Switch stopped meaning “no MQTT” — it follows the " +
+    "node's name instead, so a Switch called “Outside bell” answers on outside_bell whether you " +
+    "asked for a topic or not. A magic topic value was considered and rejected: “-” is a " +
+    "perfectly legal MQTT topic level, so any sentinel would collide with a topic somebody could " +
+    "legitimately want."));
+
+  add(b5, hbH("What makes a topic valid"));
+  add(b5, hbP(
+    "Every topic you can type — a node's, the base topic and the discovery prefix under Settings " +
+    "— is checked by the same rule, as you type and again on the box. A rejected topic is never " +
+    "stored and never quietly repaired; the message names the field and the character."));
+  add(b5, hbKV([
+    ["# and +", "MQTT wildcards. Publishing to a topic containing one is illegal — the broker " +
+     "refuses the message or drops the connection. In the base topic that takes the whole bridge " +
+     "down rather than one entity."],
+    ["Control characters", "Anything unprintable, which is usually a newline pasted out of a " +
+     "config file. A topic you cannot see is a topic you cannot debug."],
+    ["A leading or trailing /", "Legal MQTT, but it means an empty first or last level and here " +
+     "it is always a mistake. The box puts the separators in itself."],
+    ["An empty level (a//b)", "Same reasoning — refused rather than silently making a topic " +
+     "nobody can read."],
+    ["Over 47 characters", "The field holds 47. Checked before the value is cut short, so you " +
+     "are told rather than quietly given a different topic."]
+  ]));
+  add(b5, hbP(
+    "Leaving a topic EMPTY is always fine. On a node it means “no topic”; under Settings it " +
+    "means “use the default”."));
   add(root, s5);
 
   /* -------------------------------------------------------- 6. wired button */

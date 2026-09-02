@@ -8,4 +8,5 @@
 
 # Host-side logic tests, built by firmware/host-test/Makefile
 /firmware/host-test/test_rf_decode
+/firmware/host-test/test_node_graph
 /firmware/host-test/*.dSYM/

@@ -402,6 +402,15 @@ main {
 .field input:disabled, .field select:disabled { opacity: .55; }
 .field .hint, .hint { font-size: .76rem; font-weight: 400; color: var(--muted);
   text-transform: none; letter-spacing: 0; }
+/* A rejected topic. Empty until there is something to say, so it takes no room
+   in the layout while the field is fine. */
+.field .hint.bad, .hint.bad { color: var(--bad); font-weight: 500; }
+.hint.bad:empty { display: none; }
+input.badinput { border-color: var(--bad); }
+/* A field a checkbox has just switched off. Dimmed AND disabled, so the topic
+   and the "expose to MQTT" checkbox beside it cannot appear to contradict each
+   other -- the field plainly does not apply rather than looking like it does. */
+.field.dim { opacity: .5; }
 .field.check { flex-direction: row; align-items: center; gap: .6rem; min-height: var(--tap); }
 .field.check input[type="checkbox"] { width: 1.4rem; height: 1.4rem; flex: none; accent-color: var(--accent); }
 .field.check > span { font-size: .9rem; font-weight: 500; color: var(--text);

@@ -46,6 +46,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <stddef.h>
+
 #include "driver/gpio.h"
 #include "esp_err.h"
 
@@ -286,8 +288,38 @@ typedef struct {
      *                   position published retained on <base>/switch/<topic>/state.
      *                   Deliberately NOT unique: several switch nodes may carry
      *                   the same topic so that one HA toggle gates all of them.
-     * Empty on a SOURCE_VIRTUAL or a LOGIC_SWITCH means "no MQTT" (UI/REST only). */
+     * Empty on a SOURCE_VIRTUAL means "no MQTT" (UI/REST only). Empty on a
+     * LOGIC_SWITCH does NOT — it falls back to a slug of the node's NAME, which
+     * is why mqtt_enabled below had to exist. */
     char     topic[DB_NODE_TOPIC_MAX];
+
+    /*
+     * DOES THE OUTSIDE WORLD SEE THIS NODE? Default TRUE on every node type.
+     *
+     * While it is false the MQTT bridge behaves as though the node were not
+     * there: it does not subscribe for it, does not publish for it, and
+     * announces no Home Assistant entity for it — and anything it had already
+     * announced is CLEARED (retained discovery config, and the retained state
+     * with it) rather than left behind as a permanently-unavailable ghost
+     * entity in somebody's dashboard.
+     *
+     * IT CHANGES NOTHING INSIDE THE GRAPH. A switch with the flag off still
+     * gates its wire, a virtual trigger still fires from the ▶ button and from
+     * POST /api/graph/nodes/<id>/fire, an mqtt sink is still reached by a
+     * traversal. This is purely about who can see it from outside the box.
+     *
+     * WHY A FLAG AND NOT A SENTINEL TOPIC. Leaving a switch's topic empty used
+     * to mean "no MQTT"; it now falls back to a slug of the node's name, so
+     * blank stopped meaning anything. A magic topic value was considered and
+     * rejected — '-' is a perfectly legal MQTT topic level, and so is every
+     * other string a sentinel could use, so any sentinel collides with
+     * something a user could legitimately want.
+     *
+     * ON FLASH THIS IS WHAT v4 ADDED. Everything stored under v3 is widened
+     * with this set true, so an existing graph behaves exactly as it did. See
+     * node_migrate.h.
+     */
+    bool     mqtt_enabled;
 
     /* UI canvas position. Stored so a layout survives a reboot; ignored by the
      * engine, and irrelevant to the mobile list view. */
@@ -376,12 +408,33 @@ uint16_t db_graph_monitor_hold_s(const db_node_t *n);
  * switch the box is not actually in.
  */
 
+/*
+ * THE topic suffix a switch node answers on — the ONE resolver.
+ *
+ * Explicit `topic` if it has one, otherwise a slug of its `name`, otherwise ""
+ * (no addressable topic). See db_mqtt_switch_suffix() in mqtt_topic.h for the
+ * rule itself and for the bug that made sharing it necessary: the bridge
+ * resolved the suffix one way when subscribing while the two functions below
+ * matched on the raw `topic` field, so a switch relying on the name fallback got
+ * a Home Assistant entity it was impossible to command.
+ *
+ * EVERY comparison of "does this node answer on that topic?" goes through here,
+ * on both sides of the bridge. A caller that reads n->topic to answer that
+ * question is reintroducing the bug.
+ */
+void db_graph_switch_suffix(const db_node_t *n, char *out, size_t outsz);
+
 /* Set one switch node by id. ESP_ERR_NOT_FOUND if there is no such node,
  * ESP_ERR_INVALID_ARG if it is not a DB_NODE_LOGIC_SWITCH. */
 esp_err_t db_graph_switch_set(uint16_t node_id, bool on);
 
-/* Set EVERY switch node carrying `topic` — the "one HA toggle, N switches" case.
- * Returns how many nodes it moved (0 = no switch node has that topic). */
+/* Set EVERY switch node whose RESOLVED suffix (db_graph_switch_suffix, above) is
+ * `topic` — the "one HA toggle, N switches" case. Returns how many nodes it
+ * MATCHED, which is 0 when no switch node answers on that topic.
+ *
+ * Nodes with mqtt_enabled false are skipped: a node the user has taken off MQTT
+ * must not be movable from MQTT, even when it shares a topic with one that is
+ * still exposed. */
 int db_graph_switch_set_topic(const char *topic, bool on);
 
 /*

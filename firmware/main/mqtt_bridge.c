@@ -18,6 +18,15 @@
  *   <base>/<suffix>                    a SINK_MQTT node's own topic, when set
  *   <base>/radio                       radio telemetry, JSON, RETAINED
  *
+ * EVERY NODE TOPIC ABOVE IS OPT-OUT. A node carries `mqtt_enabled` (node_graph.h),
+ * true by default; with it false the bridge behaves as though the node were not
+ * in the graph at all — nothing subscribed, nothing published, nothing announced
+ * — and whatever it had already announced is CLEARED, retained state included,
+ * so Home Assistant drops the entity instead of showing it unavailable for ever.
+ * That clearing is not special-cased: the node simply stops appearing in the
+ * tables announce() reconciles against, and the existing "it went away" path
+ * does the rest. See node_mqtt_exposed().
+ *
  * WHY PRESSES ARE NOT RETAINED AND TELEMETRY IS. Retention answers "what should a
  * subscriber that just connected be told?". For radio telemetry the honest answer
  * is the last reading; for a doorbell press it is *nothing*, because a press is a
@@ -102,6 +111,7 @@
 
 #include "db_diag.h"
 #include "event_log.h"
+#include "mqtt_topic.h"
 #include "node_graph.h"
 #include "rf_service.h"
 #include "signal_store.h"
@@ -287,23 +297,6 @@ static void pub_json(const char *topic, cJSON *doc, int qos, int retain)
     cJSON_free(s);
 }
 
-/* Lowercase alphanumerics survive; every other byte becomes '_', runs collapse,
- * and leading/trailing separators are trimmed. Multi-byte UTF-8 (an umlaut in a
- * signal name) degrades to a single '_' rather than mangling the topic. */
-static void slugify(const char *name, char *out, size_t outsz)
-{
-    size_t o = 0;
-    for (const unsigned char *p = (const unsigned char *)name; *p && o + 1 < outsz; p++) {
-        if (isalnum(*p)) {
-            out[o++] = (char)tolower(*p);
-        } else if (o && out[o - 1] != '_') {
-            out[o++] = '_';
-        }
-    }
-    while (o && out[o - 1] == '_') o--;
-    out[o] = '\0';
-}
-
 static void topic_of(char *out, size_t outsz, const char *suffix)
 {
     snprintf(out, outsz, "%s/%s", s_base, suffix);
@@ -363,7 +356,7 @@ static void slug_table_build(void)
 
     for (int i = 0; i < n; i++) {
         char *dst = s_slug[s_slug_count];
-        slugify(list[i].name, dst, DB_MQTT_SLUG_MAX);
+        db_mqtt_slugify(list[i].name, dst, DB_MQTT_SLUG_MAX);
         if (!dst[0] || slug_taken(dst, s_slug_count)) {
             if (dst[0]) {
                 char base[DB_MQTT_SLUG_MAX];
@@ -523,7 +516,7 @@ static void announce_virtual_button(const db_node_t *n)
     snprintf(buf, sizeof(buf), "%s_node%u", s_dev_uid, n->id);
     cJSON_AddStringToObject(d, "unique_id", buf);
     char nslug[DB_MQTT_SLUG_MAX];
-    slugify(n->name[0] ? n->name : n->topic, nslug, sizeof(nslug));
+    db_mqtt_slugify(n->name[0] ? n->name : n->topic, nslug, sizeof(nslug));
     if (!nslug[0]) snprintf(nslug, sizeof(nslug), "node_%u", n->id);
     snprintf(buf, sizeof(buf), "%s_%s", s_dev_slug, nslug);
     cJSON_AddStringToObject(d, "object_id", buf);
@@ -543,6 +536,32 @@ static void announce_virtual_button(const db_node_t *n)
     pub_json(dt, d, 1, 1);
 }
 
+/* True when a node still carries the name it was created with, in either the
+ * UI's form ("Switch") or the wire form ("logic.switch"). Deliberately narrow:
+ * anything the user typed themselves, including "switch upstairs", is a real
+ * name and must be respected. */
+/*
+ * The topic a switch answers on is resolved by db_graph_switch_suffix()
+ * (node_graph.h), NOT by a copy of the rule kept here.
+ *
+ * There used to be a copy here, and node_graph.c matched arriving commands
+ * against the raw `topic` field instead. The two disagreed for exactly the
+ * switches that relied on the name fallback: they were subscribed and announced
+ * to Home Assistant, and then no command ever reached them and no retained state
+ * was ever published. The rule now has one home, on the other side of the
+ * boundary from this file, so the side that ROUTES a command and the side that
+ * SUBSCRIBES for it cannot drift apart again.
+ *
+ * Consequence worth knowing, unchanged: two switch nodes sharing a NAME share
+ * one toggle, exactly as two sharing an explicit topic always have.
+ */
+
+static bool name_is_generic(const char *name)
+{
+    return name && (strcasecmp(name, "Switch") == 0 ||
+                    strcasecmp(name, "logic.switch") == 0);
+}
+
 /*
  * The object_id / unique_id fragment for a switch topic. Derived from the topic
  * SUFFIX and not from a node id, because the topic is what the entity is: rename
@@ -551,41 +570,10 @@ static void announce_virtual_button(const db_node_t *n)
  * back to the node, so an entity is still addressable rather than silently
  * dropped.
  */
-/* True when a node still carries the name it was created with, in either the
- * UI's form ("Switch") or the wire form ("logic.switch"). Deliberately narrow:
- * anything the user typed themselves, including "switch upstairs", is a real
- * name and must be respected. */
-/*
- * The topic a switch actually answers on.
- *
- * An explicit topic always wins and is never rewritten -- so once you have
- * typed one, renaming the node cannot move your Home Assistant entity out from
- * under you. Left blank, the node's own NAME is slugified instead, because
- * "MQTT topic (optional)" made the single thing that connects a switch to Home
- * Assistant look like a detail you could skip, and skipping it silently meant no
- * HA switch at all.
- *
- * Consequence worth knowing: two switch nodes sharing a NAME now share one
- * toggle, exactly as two sharing an explicit topic always have. That is the same
- * rule, reached from the other end.
- */
-static void switch_suffix(const db_node_t *n, char *out, size_t outsz)
-{
-    if (!n) { if (outsz) out[0] = '\0'; return; }
-    if (n->topic[0]) { strlcpy(out, n->topic, outsz); return; }
-    slugify(n->name, out, outsz);      /* "Outside bell" -> "outside_bell" */
-}
-
-static bool name_is_generic(const char *name)
-{
-    return name && (strcasecmp(name, "Switch") == 0 ||
-                    strcasecmp(name, "logic.switch") == 0);
-}
-
 static void switch_object(char *out, size_t outsz, const db_mqtt_switch_t *sw)
 {
     char slug[DB_MQTT_SLUG_MAX];
-    slugify(sw->suffix, slug, sizeof(slug));
+    db_mqtt_slugify(sw->suffix, slug, sizeof(slug));
     if (slug[0]) snprintf(out, outsz, "sw_%s", slug);
     else         snprintf(out, outsz, "sw_node%u", (unsigned)sw->node_id);
 }
@@ -1041,6 +1029,25 @@ static void publish_event(uint8_t ev_kind, const db_trigger_t *t, uint16_t node_
 
 /* ---- announce: discovery + subscriptions ---------------------------------- */
 
+/*
+ * Is this node exposed to the outside world at all?
+ *
+ * ONE PREDICATE, EVERY PATH. `mqtt_enabled` (node_graph.h) has to mean the same
+ * thing to the subscriber, the publisher and the discovery announcer, or a node
+ * ends up half-visible — unsubscribed but still announced, which is the ghost
+ * entity the flag exists to prevent. Everything in this file that asks "should
+ * the broker know about this node?" asks here.
+ *
+ * A node that drops out of these tables is not merely skipped: announce() sees
+ * it leave and clears its retained discovery config (and, for a switch topic,
+ * its retained state) exactly as if it had been deleted. That is the whole
+ * point — turning the flag off has to REMOVE the entity, not orphan it.
+ */
+static bool node_mqtt_exposed(const db_node_t *n)
+{
+    return n && n->mqtt_enabled;
+}
+
 /* Reconcile the <base>/trigger/<suffix> subscriptions against the graph. The
  * broker forgets subscriptions across a disconnect, so `resub` makes the pass
  * treat the table as empty and re-subscribe everything. */
@@ -1058,6 +1065,7 @@ static void sync_trigger_subs(bool resub)
         uint16_t owner = 0;
         for (int j = 0; j < n && nodes; j++) {
             if (nodes[j].type != DB_NODE_SOURCE_VIRTUAL || !nodes[j].enabled) continue;
+            if (!node_mqtt_exposed(&nodes[j])) continue;
             if (!nodes[j].topic[0]) continue;
             if (strcmp(nodes[j].topic, s_subs[i].suffix) == 0) { owner = nodes[j].id; break; }
         }
@@ -1075,6 +1083,10 @@ static void sync_trigger_subs(bool resub)
     /* Subscribe to anything new. */
     for (int j = 0; j < n && nodes && s_sub_count < DB_NODE_MAX; j++) {
         if (nodes[j].type != DB_NODE_SOURCE_VIRTUAL || !nodes[j].enabled) continue;
+        /* Not exposed: no subscription, and announce() clears whatever button
+         * entity this node had already been given. It still fires from the UI
+         * and from POST /api/graph/nodes/<id>/fire. */
+        if (!node_mqtt_exposed(&nodes[j])) continue;
         if (!nodes[j].topic[0]) continue;   /* UI/REST only, by the user's choice */
         bool have = false;
         for (int i = 0; i < s_sub_count; i++)
@@ -1099,6 +1111,20 @@ static void sync_trigger_subs(bool resub)
  * IT IGNORES `enabled`. On a switch node that flag is the POSITION, so dropping
  * the subscription when it is false would strand every switch in the off
  * position with no way back — the one bug this whole feature must not have.
+ *
+ * IT DOES NOT IGNORE `mqtt_enabled`, which is the opposite kind of flag: not a
+ * position but a decision that the broker should not see this node at all. A
+ * switch with it off still gates its wire and is still movable from this box's
+ * own UI and REST API; it simply stops being a Home Assistant entity, and the
+ * one it used to be is cleared rather than left dangling.
+ *
+ * BOTH PASSES BELOW RESOLVE THE SUFFIX THE SAME WAY, through switch_suffix().
+ * They used to disagree — the drop pass compared against the raw `topic` field
+ * while the add pass fell back to the node's name — so every switch relying on
+ * that fallback was unsubscribed and immediately re-subscribed on each announce.
+ * Harmless but pointless, and with an exposure flag in the mix the two passes
+ * disagreeing about which nodes count is exactly how a subscription gets
+ * stranded.
  */
 static void sync_switch_subs(bool resub)
 {
@@ -1109,12 +1135,19 @@ static void sync_switch_subs(bool resub)
     if (resub)
         s_sw_count = 0;
 
-    /* Drop subscriptions whose topic no longer belongs to any switch node. */
+    /* Drop subscriptions whose topic no longer belongs to any exposed switch
+     * node — including one whose owner is still there but has just been taken
+     * off MQTT. announce() turns that into a retire_switch(..., true), which
+     * clears the retained discovery config AND the retained state. */
     for (int i = 0; i < s_sw_count;) {
         bool still = false;
         for (int j = 0; j < n && nodes && !still; j++) {
-            if (nodes[j].type != DB_NODE_LOGIC_SWITCH || !nodes[j].topic[0]) continue;
-            still = (strcmp(nodes[j].topic, s_sw[i].suffix) == 0);
+            if (nodes[j].type != DB_NODE_LOGIC_SWITCH) continue;
+            if (!node_mqtt_exposed(&nodes[j])) continue;
+            char sfx[DB_NODE_TOPIC_MAX];
+            db_graph_switch_suffix(&nodes[j], sfx, sizeof(sfx));
+            if (!sfx[0]) continue;
+            still = (strcmp(sfx, s_sw[i].suffix) == 0);
         }
         if (still) {
             i++;
@@ -1131,9 +1164,10 @@ static void sync_switch_subs(bool resub)
 
     for (int j = 0; j < n && nodes; j++) {
         if (nodes[j].type != DB_NODE_LOGIC_SWITCH) continue;
+        if (!node_mqtt_exposed(&nodes[j])) continue;
 
         char sfx[DB_NODE_TOPIC_MAX];
-        switch_suffix(&nodes[j], sfx, sizeof(sfx));
+        db_graph_switch_suffix(&nodes[j], sfx, sizeof(sfx));
         /* Only when BOTH the topic and the name are empty (or slugify to
          * nothing) is there no addressable topic at all. */
         if (!sfx[0]) continue;
@@ -1621,7 +1655,7 @@ void db_mqtt_start(db_config_t *cfg)
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     snprintf(s_dev_mac, sizeof(s_dev_mac), "%02x:%02x:%02x:%02x:%02x:%02x",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    slugify(cfg->hostname[0] ? cfg->hostname : "klingelbox", s_dev_slug, sizeof(s_dev_slug));
+    db_mqtt_slugify(cfg->hostname[0] ? cfg->hostname : "klingelbox", s_dev_slug, sizeof(s_dev_slug));
     if (!s_dev_slug[0]) strlcpy(s_dev_slug, "klingelbox", sizeof(s_dev_slug));
     const esp_app_desc_t *app = esp_app_get_description();
     strlcpy(s_sw_version, app ? app->version : "unknown", sizeof(s_sw_version));
@@ -1756,6 +1790,15 @@ void db_mqtt_sink(const db_node_t *node, const db_trigger_t *trig, void *ctx)
 {
     (void)ctx;
     if (!node) return;
+    /*
+     * Taken off MQTT: this node publishes NOTHING — not on its own topic, and
+     * not into the <base>/event stream either. Half of it would be the worse
+     * answer: a user who has said "the broker must not see this node" and then
+     * finds every one of its firings in the box-wide event feed has not got what
+     * the checkbox promised. The traversal still reached it, and everything else
+     * on the chain still publishes normally.
+     */
+    if (!node_mqtt_exposed(node)) return;
     db_mqtt_msg_t m = {
         .kind    = MSG_EVENT,
         .ev_kind = DB_EV_NODE_FIRED,

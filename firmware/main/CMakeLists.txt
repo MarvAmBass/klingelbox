@@ -12,6 +12,8 @@ idf_component_register(
         "rf_raw.c"           # time-boxed raw capture session, filters relaxed
         "signal_store.c"     # persisted signals, matching, learn mode
         "node_graph.c"       # sources -> logic -> sinks routing engine
+        "node_migrate.c"     # frozen on-flash node layouts + widening
+        "mqtt_topic.c"       # one validity rule for every user-typed topic
         "event_log.c"        # recent-activity ring for the UI
         "wifi_mgr.c"         # APSTA + Tasmota-style recovery portal
         "dns_server.c"       # captive DNS for the portal

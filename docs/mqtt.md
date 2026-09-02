@@ -42,6 +42,18 @@ An empty string in a `POST` means "leave unchanged", so you can update the host 
 re-sending the password.
 
 {: .note }
+> **`base_topic` and `discovery_prefix` are validated on write.** They are the prefixes of
+> every topic the box publishes and every topic Home Assistant reads, so a `#` or a `+` in
+> either does not break one entity — it takes the whole bridge down, because publishing to
+> a topic containing an MQTT wildcard is illegal and the broker refuses the message. The
+> same rule rejects control characters, a leading or trailing `/`, an empty level (`a//b`)
+> and anything over 47 characters, and the error names both the field and the offending
+> character. Node topics are checked by the identical rule — see
+> [API.md](API.md#topic-validation). Leaving either empty is still fine and still means
+> "use the default"; the whole request is refused before anything is applied, so a bad
+> topic never leaves half a form saved.
+
+{: .note }
 > Write the broker password under the key **`password`**. `pass` is accepted as an alias,
 > because the two config endpoints once disagreed and the mismatch failed *silently* — the
 > request succeeded and the key was quietly dropped.
@@ -61,7 +73,18 @@ re-sending the password.
 | `<base>/unknown` | publish | **yes** | The last unregistered burst, so you can look it up later. |
 | `<base>/event` | publish | no | Every node firing, plus system events. |
 | `<base>/<suffix>` | publish | no | A `sink.mqtt` node's own topic, when it has one set. |
+| `<base>/switch/<suffix>/set` | **subscribe** | — | Moves every `logic.switch` node answering on that suffix. `ON` `OFF` `1` `0` `true` `false` `open` `close`, any case, or a JSON object. |
+| `<base>/switch/<suffix>/state` | publish | **yes** | `ON` or `OFF` — the position of that suffix. |
 | `<base>/radio` | publish | **yes** | [Radio telemetry](#radio-telemetry). |
+
+{: .note }
+> **Which suffix does a Switch answer on?** Its **Topic** if you typed one, otherwise a slug
+> of its **name** — a switch called "All Bells Switch" with an empty topic answers on
+> `all_bells_switch`. The same rule decides the subscription, the Home Assistant entity, the
+> routing of an arriving `set` and the retained state, because they are all the same
+> question. They have not always agreed: a switch relying on the name fallback used to get
+> an entity that no command could reach and that never published a state. If you have one
+> that looked broken in Home Assistant, this is why, and it is fixed.
 
 ### Why presses are not retained and telemetry is
 
@@ -170,6 +193,37 @@ trigger for *receiving*, and a `button` entity for *transmitting*.
 Deleting a signal publishes an empty retained discovery payload, which is how MQTT
 discovery says "forget this entity". Without that, a deleted signal would leave a
 permanently unavailable entity behind that only a manual purge removes.
+
+### Keeping one node off MQTT
+
+Every node has an **Expose to Home Assistant / MQTT** checkbox in its editor, on by
+default. It is on the three node types the bridge actually looks at — **Virtual trigger**,
+**Switch** and **MQTT publish** — and unchecking it makes that one node invisible to the
+broker while leaving it completely unchanged inside the graph.
+
+| | with the box ticked | with it cleared |
+|---|---|---|
+| Virtual trigger | subscribed on `<base>/trigger/<topic>`, HA button entity | neither |
+| Switch | subscribed on `<base>/switch/<topic>/set`, HA switch entity, retained state | none of them, and a `set` command no longer moves it |
+| MQTT publish | publishes on `<base>/<topic>` and into `<base>/event` | publishes nothing at all |
+
+Whatever the node had already announced is **cleared**, not abandoned: an empty retained
+payload goes out over its discovery config, and over a switch topic's retained `state`
+when no exposed node carries that topic any more. Home Assistant therefore removes the
+entity rather than showing it unavailable for ever — the same thing that happens when you
+delete the node.
+
+Inside the graph nothing changes. A Switch still gates its wire, a Virtual trigger still
+fires from its ▶ button and from the REST API, and an MQTT publish node is still reached
+by the chain. The checkbox answers one question only: can anything outside the box see it.
+
+{: .note }
+> This exists because a **blank topic on a Switch no longer means "no MQTT"** — it falls
+> back to a slug of the node's name, so a Switch called "Outside bell" gets the topic
+> `outside_bell` whether you asked for one or not. A magic topic value such as `-` was
+> considered and rejected: `-` is a perfectly legal MQTT topic level, and so is every other
+> string a sentinel could use, so any of them would collide with a topic somebody could
+> legitimately want.
 
 ## Recipes
 
