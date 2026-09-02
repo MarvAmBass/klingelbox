@@ -33,6 +33,16 @@ on:
 
 # deploy-pages authenticates via OIDC, hence id-token: write. contents stays
 # read-only — this workflow never writes to the repository.
+  # The SAME GITHUB_TOKEN recursion guard that stopped flasher-sync firing on a
+  # release also stops flasher-sync's own commit from firing this workflow: it
+  # pushes with GITHUB_TOKEN, so `push: main` never sees it. The mirrored
+  # firmware landed in the repo and was never published, which is exactly as
+  # useless as not mirroring it -- and, once again, every run was green.
+  #
+  # So Pages also redeploys when flasher-sync completes.
+  workflow_run:
+    workflows: [flasher-sync]
+    types: [completed]
 permissions:
   contents: read
   pages: write
