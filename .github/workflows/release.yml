@@ -254,6 +254,17 @@ jobs:
     runs-on: ubuntu-latest
     needs: firmware
     steps:
+      # Checked out purely for the tag object: the notes step below reads the
+      # annotation with git, and without a working tree that step died with
+      # "fatal: not a git repository". It runs BEFORE the artifact download
+      # because actions/checkout cleans the workspace, which would otherwise
+      # delete the very files being uploaded.
+      - name: Check out the tag, for its annotation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.firmware.outputs.tag }}
+          fetch-depth: 0
+
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -285,7 +296,12 @@ jobs:
           BODY=$(git for-each-ref "refs/tags/$TAG" --format='%(contents:body)')
           {
             echo 'body<<KLINGELBOX_EOF'
-            [ -n "$SUBJECT" ] && echo "$SUBJECT" && echo
+            # An `&&` chain here would return non-zero on an empty subject and,
+            # under `bash -e`, take the whole step down with it.
+            if [ -n "$SUBJECT" ]; then
+              echo "$SUBJECT"
+              echo
+            fi
             echo "$BODY"
             echo 'KLINGELBOX_EOF'
           } >> "$GITHUB_OUTPUT"
