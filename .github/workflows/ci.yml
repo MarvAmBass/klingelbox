@@ -289,8 +289,16 @@ jobs:
               print(f"::error::{storage} was not produced by the build")
               failed = True
 
-          # Same source-directory choice as main/CMakeLists.txt.
-          webui = "webui" if os.path.isfile("webui/index.html") else "main/www"
+          # Measure what is actually IMAGED, which since the gzip step is the
+          # compressed staging directory -- not webui/. Sizing the raw sources
+          # failed this job at 127% while the real image sat at 43%, because the
+          # check predates compression and nobody told it.
+          gz = os.path.join(os.environ.get("BUILD_DIR", "build"), "webui-gz")
+          if os.path.isdir(gz) and os.listdir(gz):
+              webui = gz
+          else:
+              # Same source-directory choice as main/CMakeLists.txt.
+              webui = "webui" if os.path.isfile("webui/index.html") else "main/www"
           content = 0
           for root, _dirs, files in os.walk(webui):
               for name in files:
