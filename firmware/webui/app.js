@@ -3686,8 +3686,7 @@ function openNodeEditor(n) {
       }
       if (!typed)
         add(swPreview, el("div", "muted",
-          "Using the node's name: " + t + "  \u2014 type your own above to pin it, " +
-          "and renaming the node will then leave it alone."));
+          "Following the node name. Type your own to pin it; clear it to follow again."));
       add(swPreview, el("div", null, "Home Assistant sets:  " + mqttSwitchTopic(t, "set")));
       add(swPreview, el("div", null, "Box reports (retained):  " + mqttSwitchTopic(t, "state")));
       /* What HA will actually CALL it. A node still named "Switch" would appear
@@ -3704,7 +3703,7 @@ function openNodeEditor(n) {
     ctl.topic.addEventListener("input", syncSw);
     if (nameIn) nameIn.addEventListener("input", syncSw);
     syncSw();
-    var sf = field("MQTT topic \u2014 how Home Assistant reaches it", ctl.topic, null, "full");
+    var sf = field("MQTT topic", ctl.topic, null, "full");
     add(sf, swPreview);
     add(grid, sf);
     add(sh.body, el("div", "note",
