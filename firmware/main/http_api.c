@@ -2994,18 +2994,36 @@ static bool client_accepts_gzip(httpd_req_t *req)
 }
 
 /* Open `base`, preferring a pre-compressed "<base>.gz" when the client can take
- * it. Shipping the UI gzipped roughly triples what fits in the 1 MB `storage`
- * partition and cuts transfer time over the softAP. */
+ * it. Shipping the UI gzipped roughly triples what fits in the `storage`
+ * partition and cuts transfer time over the softAP.
+ *
+ * SINCE THE IMAGE NOW CONTAINS ONLY .gz FILES, the last branch matters: if no
+ * plain file exists we serve the ".gz" anyway, labelled honestly with
+ * Content-Encoding: gzip, even to a client that never sent "Accept-Encoding:
+ * gzip". Shipping both copies would undo the whole reason the UI is compressed
+ * (tools/gzip_webui.py explains the budget), and the alternative — 404 — would
+ * mean a blank page. Every browser has understood gzip for two decades and this
+ * is a LAN appliance on someone's home network, so a client that genuinely
+ * cannot decompress is not a client this box has. A bare `curl` still gets a
+ * correct, correctly-labelled response rather than a 404; `curl --compressed`
+ * (or piping through gunzip) reads it as text. */
 static FILE *open_asset(const char *base, bool gz_ok, bool *is_gz)
 {
     char p[320];
+    FILE *f;
     *is_gz = false;
     if (gz_ok) {
         snprintf(p, sizeof(p), "%s.gz", base);
-        FILE *f = fopen(p, "r");
+        f = fopen(p, "r");
         if (f) { *is_gz = true; return f; }
     }
-    return fopen(base, "r");
+    f = fopen(base, "r");
+    if (f) return f;
+    /* No uncompressed twin exists. Serve the compressed one regardless. */
+    snprintf(p, sizeof(p), "%s.gz", base);
+    f = fopen(p, "r");
+    if (f) { *is_gz = true; return f; }
+    return NULL;
 }
 
 /*

@@ -11,7 +11,9 @@
 </head>
 <!--
   Klingelbox web UI — mobile-first shell.
-  The product name is German; the interface is English on purpose.
+  The product name is German, and so is one of the two interface languages:
+  English and German, toggled from the header. English strings are the
+  translation keys — see the i18n block in app.js and README.md.
 
   FIVE destinations, and the first one is the product: the node graph. The
   Dashboard IS the map and nothing else — the live feed has its own tab
@@ -41,12 +43,12 @@
   </div>
 
   <!-- Wide-screen tab strip. Hidden below 720 px, where .bottomnav takes over. -->
-  <nav class="tabs" role="tablist" aria-label="Sections">
-    <button class="tab active" type="button" data-tab="dashboard" role="tab" aria-selected="true">Dashboard</button>
-    <button class="tab" type="button" data-tab="activity" role="tab" aria-selected="false">Activity</button>
-    <button class="tab" type="button" data-tab="settings" role="tab" aria-selected="false">Settings</button>
-    <button class="tab" type="button" data-tab="diagnostics" role="tab" aria-selected="false">Diagnostics</button>
-    <button class="tab" type="button" data-tab="handbook" role="tab" aria-selected="false">Handbook</button>
+  <nav class="tabs" role="tablist" aria-label="Sections" data-i18n-aria>
+    <button class="tab active" type="button" data-tab="dashboard" role="tab" aria-selected="true" data-i18n>Dashboard</button>
+    <button class="tab" type="button" data-tab="activity" role="tab" aria-selected="false" data-i18n>Activity</button>
+    <button class="tab" type="button" data-tab="settings" role="tab" aria-selected="false" data-i18n>Settings</button>
+    <button class="tab" type="button" data-tab="diagnostics" role="tab" aria-selected="false" data-i18n>Diagnostics</button>
+    <button class="tab" type="button" data-tab="handbook" role="tab" aria-selected="false" data-i18n>Handbook</button>
   </nav>
 
 
@@ -57,11 +59,17 @@
        app.js builds these chips ONCE and thereafter only assigns nodeValue: the
        uptime ticks at 1 Hz, and a rebuilt row would repaint the header every
        second. -->
-  <div id="status-chips" class="statuschips" aria-label="Box status"></div>
+  <div id="status-chips" class="statuschips" aria-label="Box status" data-i18n-aria></div>
 
+  <!-- Two toggles, same class, same 44 px square: theme and language are the
+       same kind of control — one tap, one stored preference, nothing to undo.
+       The language button shows the language you would GET (DE while you are
+       reading English), because showing the current one makes the tap a
+       guess. -->
   <div class="topbar-right">
-    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Theme">&#128421;</button>
-    <div id="status-badge" class="status-badge" title="Box status">&hellip;</div>
+    <button id="lang-toggle" class="theme-toggle lang-toggle" type="button" aria-label="Language">DE</button>
+    <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Theme" data-i18n-aria>&#128421;</button>
+    <div id="status-badge" class="status-badge" title="Box status" data-i18n-title>&hellip;</div>
   </div>
 
 </header>
@@ -69,20 +77,20 @@
 <main>
   <!-- Recovery first-run wizard. app.js fills and reveals this, and adds
        .recovery to <body>, when /api/system reports wifi_mode == "recovery". -->
-  <section id="tab-recovery" class="tabpane" role="tabpanel" aria-label="Wi-Fi setup"></section>
+  <section id="tab-recovery" class="tabpane" role="tabpanel" aria-label="Wi-Fi setup" data-i18n-aria></section>
 
   <!-- The Dashboard IS the node graph and only the node graph: the two
        blocking warnings, the status chips, the view switch + ➕ Add node, then
        the map itself. -->
-  <section id="tab-dashboard"   class="tabpane active" role="tabpanel" aria-label="Dashboard"></section>
+  <section id="tab-dashboard"   class="tabpane active" role="tabpanel" aria-label="Dashboard" data-i18n-aria></section>
   <!-- The live event feed, a whole page of it, with search and a kind filter
        above the list. Polls /api/events only while it is the visible tab. -->
-  <section id="tab-activity"    class="tabpane" role="tabpanel" aria-label="Activity"></section>
-  <section id="tab-settings"    class="tabpane" role="tabpanel" aria-label="Settings"></section>
-  <section id="tab-diagnostics" class="tabpane" role="tabpanel" aria-label="Diagnostics"></section>
+  <section id="tab-activity"    class="tabpane" role="tabpanel" aria-label="Activity" data-i18n-aria></section>
+  <section id="tab-settings"    class="tabpane" role="tabpanel" aria-label="Settings" data-i18n-aria></section>
+  <section id="tab-diagnostics" class="tabpane" role="tabpanel" aria-label="Diagnostics" data-i18n-aria></section>
   <!-- The offline manual. This box can be reached over its own captive portal
        with no internet at all, so the documentation has to ship inside it. -->
-  <section id="tab-handbook"    class="tabpane" role="tabpanel" aria-label="Handbook"></section>
+  <section id="tab-handbook"    class="tabpane" role="tabpanel" aria-label="Handbook" data-i18n-aria></section>
 
   <footer class="foot">Klingelbox &mdash; <i>Die Klingel, lokal und ohne Cloud.</i><span id="foot-ver"></span></footer>
 </main>
@@ -97,19 +105,24 @@
      lines costs more legibility than the two syllables it saves. "Map" is what
      the Dashboard actually is now. Still an overflow-x scroller as a safety net
      for 280 px devices and very large system text. -->
-<nav class="bottomnav" role="tablist" aria-label="Sections">
+<nav class="bottomnav" role="tablist" aria-label="Sections" data-i18n-aria>
   <button class="navbtn active" type="button" data-tab="dashboard" role="tab" aria-selected="true">
-    <span class="ico" aria-hidden="true">&#128256;</span><span class="lbl">Map</span></button>
+    <span class="ico" aria-hidden="true">&#128256;</span><span class="lbl" data-i18n>Map</span></button>
   <button class="navbtn" type="button" data-tab="activity" role="tab" aria-selected="false">
-    <span class="ico" aria-hidden="true">&#128276;</span><span class="lbl">Activity</span></button>
+    <span class="ico" aria-hidden="true">&#128276;</span><span class="lbl" data-i18n>Activity</span></button>
   <button class="navbtn" type="button" data-tab="settings" role="tab" aria-selected="false">
-    <span class="ico" aria-hidden="true">&#9881;</span><span class="lbl">Settings</span></button>
+    <span class="ico" aria-hidden="true">&#9881;</span><span class="lbl" data-i18n>Setup</span></button>
   <button class="navbtn" type="button" data-tab="diagnostics" role="tab" aria-selected="false">
-    <span class="ico" aria-hidden="true">&#129514;</span><span class="lbl">Health</span></button>
+    <span class="ico" aria-hidden="true">&#129514;</span><span class="lbl" data-i18n>Health</span></button>
   <button class="navbtn" type="button" data-tab="handbook" role="tab" aria-selected="false">
-    <span class="ico" aria-hidden="true">&#128214;</span><span class="lbl">Handbook</span></button>
+    <span class="ico" aria-hidden="true">&#128214;</span><span class="lbl" data-i18n>Handbook</span></button>
 </nav>
 
+<!-- The German dictionary is its own file: a translation fix is then a readable
+     diff in one place, with no JavaScript around it, and adding a language
+     means adding a file rather than editing app.js. English needs no
+     dictionary — the English strings ARE the lookup keys (see app.js). -->
+<script src="/lang-de.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

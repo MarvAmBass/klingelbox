@@ -1,6 +1,8 @@
 /* Klingelbox web UI -- "Die Klingel, lokal und ohne Cloud."
  *
- * The product name is German; the interface is English on purpose.
+ * The product name is German, and so is one of the two interface languages:
+ * English and German, toggled from the header. The ENGLISH STRING IS THE KEY —
+ * see the i18n block below, and README.md for how to add a third.
  *
  * Vanilla ES5-ish JavaScript, no framework, no build step, no external assets:
  * this file is flashed into a SPIFFS image on a microcontroller, so every byte
@@ -84,7 +86,7 @@ function api(path, opts) {
       return body || {};
     });
   }, function () {
-    var err = new Error("No answer from the box (connection lost).");
+    var err = new Error(t("No answer from the box (connection lost)."));
     err.status = 0;
     throw err;
   });
@@ -140,6 +142,70 @@ function fmtEpoch(s) {
 }
 
 /* ======================================================================
+   i18n — THE ENGLISH STRING IS THE KEY
+
+   t("Add node") returns the German sentence, or "Add node" itself when the
+   dictionary has no entry for it. There is deliberately no `nav.add_node`
+   style identifier anywhere, and PLEASE DO NOT "IMPROVE" IT INTO ONE.
+
+   The reasoning, so it does not have to be rediscovered:
+
+   * This is a retrofit onto ~350 KB of finished UI code. Opaque ids would mean
+     authoring a second dictionary (id -> English) and keeping it in sync with
+     this file forever; English-as-key means there is exactly one dictionary,
+     lang-de.js, and it is the only thing a translator ever opens.
+   * A missing or misspelt key degrades to correct English. With opaque ids it
+     degrades to `nav.add_node` leaking into the interface, which is the worse
+     failure by a wide margin on a device whose UI ships in flash and cannot be
+     hot-fixed from a server.
+   * The source stays readable: el("button", null, t("Add node")) says what
+     appears on screen, so a reviewer can see the copy without a lookup.
+
+   The cost is real and accepted: changing an English string orphans its German
+   entry (it falls back to the new English, visibly), and two English strings
+   that happen to be identical cannot take different German translations. Both
+   have been fine in practice; the second has not come up at all.
+
+   INTERPOLATION. Never concatenate a translated fragment with a value —
+   German word order differs, so t("Signal ") + id cannot be translated
+   properly. Use one key with a {placeholder}:
+
+       t("Signal {id} is still in use", { id: sig.id })
+
+   WHAT IS NOT TRANSLATED, and must never be: node type wire names
+   ("logic.switch"), MQTT topics, API field names, GPIO numbers, anything the
+   firmware sends back in an {"error": "..."} body (it is authored in C, in
+   English, and is closer to log output than to interface copy), and the
+   product tagline.
+
+   NEW LANGUAGE: see firmware/webui/README.md — it is one more file and one
+   more entry in LANG_DICTS.
+   ====================================================================== */
+
+/* Dictionaries are plain objects hung off `window` by their own file, so
+   lang-<code>.js stays separately editable and a translation fix is a diff a
+   non-programmer can read. English needs no dictionary: it is the keys. */
+var LANG_DICTS = { en: null, de: "KLINGELBOX_DE" };
+var LANG_NAMES = { en: "English", de: "Deutsch" };
+var langCur = "en";
+
+function langDict() {
+  var g = LANG_DICTS[langCur];
+  return (g && window[g]) || null;
+}
+
+function t(s, vars) {
+  var d = langDict();
+  var out = (d && Object.prototype.hasOwnProperty.call(d, s) && d[s]) || s;
+  if (vars) {
+    out = out.replace(/\{(\w+)\}/g, function (m, k) {
+      return Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m;
+    });
+  }
+  return out;
+}
+
+/* ======================================================================
    Where updates come from
 
    THE ONE PLACE A FORK CHANGES ON THIS SIDE. The firmware has its own single
@@ -188,7 +254,14 @@ var S = {
   /* feature availability, driven purely by response codes */
   has: { gpio: true, diagnostics: true, radioCfg: true, ap: true, config: true,
          monitor: true, raw: true },
-  txBlock: null,          /* reason string when transmit is unavailable */
+  /* Why transmitting is unavailable. `txBlock` holds the reason as its ENGLISH
+     text and is translated on the way out by txBlockText(); a reason authored by
+     the firmware is not a dictionary key and so passes through untouched, which
+     is exactly what we want for server prose. `txBlockKind` is what the code
+     tests against — sniffing the prose ("does it start with 'No CC1101'?")
+     silently stopped working the moment that sentence could be German. */
+  txBlock: null,
+  txBlockKind: null,      /* "radio" = no CC1101, "api" = the box said 409/503 */
 
   upBase: null,           /* uptime_s at the last /api/system */
   upAt: 0                 /* Date.now() at the last /api/system */
@@ -207,7 +280,7 @@ function agoText(ts) {
   if (abs) return abs;
   var up = uptimeNow();
   if (up === null) return "+" + Math.round(ts) + "s";
-  return shortDur(up - ts) + " ago";
+  return t("{d} ago", { d: shortDur(up - ts) });
 }
 
 /* ======================================================================
@@ -216,6 +289,7 @@ function agoText(ts) {
    media query decides. The click cycle starts with the OPPOSITE of what the
    system currently shows, so the very first tap always visibly does something.
    ====================================================================== */
+var themeRelabel = null;   /* set below; re-titles the button after a language change */
 (function themeToggle() {
   var KEY = "doorbell433-theme";
   var root = document.documentElement;
@@ -231,10 +305,13 @@ function agoText(ts) {
     if (mode === "light" || mode === "dark") root.setAttribute("data-theme", mode);
     else root.removeAttribute("data-theme");
     if (!btn) return;
-    if (mode === "light") { btn.textContent = "☀️"; btn.title = "Theme: Light (tap for Dark)"; }
-    else if (mode === "dark") { btn.textContent = "🌙"; btn.title = "Theme: Dark (tap for Auto)"; }
-    else { btn.textContent = "🖥"; btn.title = "Theme: Auto (tap for Light/Dark)"; }
+    if (mode === "light") { btn.textContent = "☀️"; btn.title = t("Theme: Light (tap for Dark)"); }
+    else if (mode === "dark") { btn.textContent = "🌙"; btn.title = t("Theme: Dark (tap for Auto)"); }
+    else { btn.textContent = "🖥"; btn.title = t("Theme: Auto (tap for Light/Dark)"); }
   }
+  /* The language toggle initialises after this block and calls this to re-title
+     the button, both at boot and on every later switch. */
+  themeRelabel = function () { apply(stored()); };
   apply(stored());
   if (btn) btn.addEventListener("click", function () {
     var cur = stored();
@@ -245,6 +322,107 @@ function agoText(ts) {
       if (next) localStorage.setItem(KEY, next); else localStorage.removeItem(KEY);
     } catch (e) { /* ignore */ }
     apply(next);
+  });
+})();
+
+/* ======================================================================
+   Language toggle: English / German
+
+   Two languages is a TOGGLE, not a dropdown, and it sits next to the theme
+   toggle wearing the same size and shape because it is the same class of
+   control: one tap, one tiny persistent preference, no consequences.
+
+   THE BUTTON SHOWS THE LANGUAGE YOU WOULD GET, not the one you have. Reading
+   "DE" while looking at an English page is unambiguous; reading "EN" while
+   looking at an English page could mean either, and every user would have to
+   tap it once to find out.
+
+   First visit with nothing stored follows navigator.language, so a browser set
+   to German opens in German — this box is called a Klingelbox.
+   ====================================================================== */
+
+/* Static chrome (the tab strips, the footer, aria-labels) lives in index.html
+   rather than being built by JS. Marked-up elements carry data-i18n; the
+   English original is stashed on first pass so re-translating is not a
+   translate-the-translation. */
+function translateStatic() {
+  $$("[data-i18n]").forEach(function (n) {
+    if (n.dataset.i18nEn === undefined) n.dataset.i18nEn = n.textContent;
+    n.textContent = t(n.dataset.i18nEn);
+  });
+  $$("[data-i18n-aria]").forEach(function (n) {
+    if (n.dataset.i18nAriaEn === undefined) n.dataset.i18nAriaEn = n.getAttribute("aria-label") || "";
+    n.setAttribute("aria-label", t(n.dataset.i18nAriaEn));
+  });
+  $$("[data-i18n-title]").forEach(function (n) {
+    if (n.dataset.i18nTitleEn === undefined) n.dataset.i18nTitleEn = n.getAttribute("title") || "";
+    n.setAttribute("title", t(n.dataset.i18nTitleEn));
+  });
+}
+
+/* Re-render everything the language actually reaches, WITHOUT a page reload.
+   What must survive, and how:
+     * open sheets — untouched. A sheet is a live flow (a listening session has
+       the radio armed); tearing it down mid-flow to relabel it would be a far
+       worse bug than a dialog finishing in the language it started in.
+     * polling timers — stopTabPolls() then onTabEnter() is the same teardown
+       and restart a tab switch performs, so no timer is duplicated or orphaned.
+     * the node graph — S.graph, S.signals and the rest of the cache are NOT
+       cleared, so the map redraws from the data already in hand: no refetch,
+       no flash of an empty screen, and the scroll position is all that moves.
+   Only S.built is dropped, which is precisely "the DOM for this tab must be
+   built again". */
+function rerenderForLang() {
+  translateStatic();
+  if (themeRelabel) themeRelabel();
+  S.built = {};
+  $$(".tabpane").forEach(function (p) { if (p.id !== "tab-recovery") clear(p); });
+  renderHeader();
+  if (S.recovery) { if (S.sys) buildRecovery(S.sys); return; }
+  stopTabPolls();
+  onTabEnter(S.tab, true);
+}
+
+(function langToggle() {
+  var KEY = "klingelbox-lang";
+  var btn = $("#lang-toggle");
+
+  function stored() {
+    var v = null;
+    try { v = localStorage.getItem(KEY); } catch (e) { /* private mode */ }
+    return Object.prototype.hasOwnProperty.call(LANG_DICTS, v) ? v : null;
+  }
+  /* navigator.language is "de", "de-DE", "de-AT", "de-CH"… — the primary
+     subtag is the only part that decides, and anything that is not German
+     lands on English rather than on a language we do not have. */
+  function fromBrowser() {
+    var l = (navigator.language || (navigator.languages || [])[0] || "en").toLowerCase();
+    var primary = l.split("-")[0];
+    return Object.prototype.hasOwnProperty.call(LANG_DICTS, primary) ? primary : "en";
+  }
+  function apply(code, rerender) {
+    langCur = code;
+    /* <html lang> is not decoration: it is what a screen reader switches voice
+       on and what the browser hyphenates by. */
+    document.documentElement.setAttribute("lang", code);
+    var other = (code === "en") ? "de" : "en";
+    if (btn) {
+      btn.textContent = other.toUpperCase();
+      btn.title = t("Language: {current} (tap for {other})",
+                    { current: LANG_NAMES[code], other: LANG_NAMES[other] });
+      btn.setAttribute("aria-label", btn.title);
+    }
+    if (rerender) rerenderForLang();
+  }
+
+  apply(stored() || fromBrowser(), false);
+  translateStatic();
+  if (themeRelabel) themeRelabel();
+
+  if (btn) btn.addEventListener("click", function () {
+    var next = (langCur === "en") ? "de" : "en";
+    try { localStorage.setItem(KEY, next); } catch (e) { /* ignore */ }
+    apply(next, true);
   });
 })();
 
@@ -286,7 +464,7 @@ function openSheet(title, sub, onClose) {
   var head = el("div", "sheet-head");
   add(head, el("h3", null, title));
   var x = el("button", "sheet-close", "✕");
-  x.type = "button"; x.setAttribute("aria-label", "Close");
+  x.type = "button"; x.setAttribute("aria-label", t("Close"));
   add(head, x);
   add(sheet, head);
   if (sub) add(sheet, el("p", "sheet-sub", sub));
@@ -313,11 +491,11 @@ function openSheet(title, sub, onClose) {
 function confirmSheet(title, lines, confirmLabel, danger) {
   return new Promise(function (resolve) {
     var sh = openSheet(title);
-    (lines || []).forEach(function (t) { add(sh.body, el("p", "small muted", t)); });
+    (lines || []).forEach(function (line) { add(sh.body, el("p", "small muted", line)); });
     var foot = el("div", "formfoot");
-    var yes = el("button", "btn " + (danger ? "danger" : "primary"), confirmLabel || "Confirm");
+    var yes = el("button", "btn " + (danger ? "danger" : "primary"), confirmLabel || t("Confirm"));
     yes.type = "button";
-    var no = el("button", "btn", "Cancel"); no.type = "button";
+    var no = el("button", "btn", t("Cancel")); no.type = "button";
     add(foot, yes, no);
     add(sh.body, foot);
     var done = false;
@@ -334,7 +512,7 @@ function confirmSheet(title, lines, confirmLabel, danger) {
 function pickerSheet(title, sub, items, onPick) {
   var sh = openSheet(title, sub);
   if (!items.length) {
-    add(sh.body, el("div", "empty", "Nothing to choose from."));
+    add(sh.body, el("div", "empty", t("Nothing to choose from.")));
     return sh;
   }
   var ul = el("ul", "list");
@@ -501,8 +679,10 @@ function loadSystem() {
     renderHeader();
     if (sys.radio && sys.radio.present === false) {
       S.txBlock = "No CC1101 radio detected. Transmitting is impossible until the module answers on SPI -- see Diagnostics.";
-    } else if (S.txBlock && S.txBlock.indexOf("No CC1101") === 0) {
+      S.txBlockKind = "radio";
+    } else if (S.txBlockKind === "radio") {
       S.txBlock = null;
+      S.txBlockKind = null;
     }
     return sys;
   }).catch(function (e) {
@@ -653,14 +833,14 @@ function renderHeader(err) {
   if (!badge) return;
 
   if (S.recovery) {
-    badge.textContent = "setup mode";
+    badge.textContent = t("setup mode");
     badge.className = "status-badge warn";
     dot.className = "brand-dot";
     renderStatusChips(err);
     return;
   }
   if (err || !S.sys) {
-    badge.textContent = "offline";
+    badge.textContent = t("offline");
     badge.className = "status-badge bad";
     dot.className = "brand-dot bad";
     renderStatusChips(err);
@@ -672,24 +852,25 @@ function renderHeader(err) {
 
   var radioOk = !(sys.radio && sys.radio.present === false);
   if (!radioOk) {
-    badge.textContent = "no radio";
+    badge.textContent = t("no radio");
     badge.className = "status-badge bad";
     dot.className = "brand-dot bad";
   } else if (!sys.sta_connected) {
-    badge.textContent = sys.ap_ssid ? "AP only" : "no Wi-Fi";
+    badge.textContent = sys.ap_ssid ? t("AP only") : t("no Wi-Fi");
     badge.className = "status-badge warn";
     dot.className = "brand-dot";
   } else {
-    badge.textContent = "ready";
+    badge.textContent = t("ready");
     badge.className = "status-badge ok";
     dot.className = "brand-dot ok";
   }
-  badge.title = (sys.sta_connected ? ("Wi-Fi: " + (sys.sta_ssid || "?") + " @ " + (sys.sta_ip || "?"))
-                                   : "Not on a home network")
-    + (radioOk ? "" : " -- CC1101 not detected");
+  badge.title = (sys.sta_connected ? t("Wi-Fi: {ssid} @ {ip}",
+                                       { ssid: (sys.sta_ssid || "?"), ip: (sys.sta_ip || "?") })
+                                   : t("Not on a home network"))
+    + (radioOk ? "" : t(" -- CC1101 not detected"));
   /* Below 600 px the badge is hidden and this dot IS the badge — same three
      states, same class names — so it carries the same explanation. */
-  if (dot) dot.title = badge.textContent + " — " + badge.title;
+  if (dot) dot.title = t("{state} — {detail}", { state: badge.textContent, detail: badge.title });
 
   /* Both live off the same /api/system reading, so both are refreshed by the
      one call that produced it — the header chips everywhere, and the two
@@ -704,6 +885,13 @@ function renderHeader(err) {
 
 function txAvailable() { return !S.txBlock; }
 
+/* The stored reason, in the current language. Our own reasons are English
+   dictionary keys and come back translated; a firmware-authored reason is not a
+   key, so t() returns it verbatim. Reading it here rather than translating at
+   assignment is what makes the note change language on the toggle instead of at
+   the next /api/system, ten seconds later. */
+function txBlockText() { return S.txBlock ? t(S.txBlock) : ""; }
+
 /* `opts` is optional and exists so the pairing burst (a longer repeat train
    with its own wording) still goes through THIS function rather than growing a
    second transmit path that would have to re-learn what a 409/503 means:
@@ -711,17 +899,18 @@ function txAvailable() { return !S.txBlock; }
      .sending / .sent / .ok   wording for a non-default use */
 function transmit(signalId, btn, msgNode, opts) {
   opts = opts || {};
-  if (!txAvailable()) { if (msgNode) setMsg(msgNode, S.txBlock, "err"); return Promise.resolve(); }
+  if (!txAvailable()) { if (msgNode) setMsg(msgNode, txBlockText(), "err"); return Promise.resolve(); }
   var old = btn ? btn.textContent : null;
-  if (btn) { btn.disabled = true; btn.textContent = opts.sending || "Sending…"; }
+  if (btn) { btn.disabled = true; btn.textContent = opts.sending || t("Sending…"); }
   if (msgNode) setMsg(msgNode, "");
   return postJSON("/api/signals/" + signalId + "/transmit", opts.body || {}).then(function () {
-    if (btn) { btn.textContent = opts.sent || "Sent ✓"; setTimeout(function () { btn.textContent = old; btn.disabled = false; }, 1400); }
-    if (msgNode) setMsg(msgNode, opts.ok || "Transmitted. This only confirms the pulses left the radio -- it cannot know a receiver reacted.", "ok");
+    if (btn) { btn.textContent = opts.sent || t("Sent ✓"); setTimeout(function () { btn.textContent = old; btn.disabled = false; }, 1400); }
+    if (msgNode) setMsg(msgNode, opts.ok || t("Transmitted. This only confirms the pulses left the radio -- it cannot know a receiver reacted."), "ok");
   }).catch(function (e) {
     if (btn) { btn.textContent = old; btn.disabled = false; }
     if (e.status === 503 || e.status === 409) {
       S.txBlock = e.message || "The radio is unavailable, so nothing can be transmitted.";
+      S.txBlockKind = "api";
       renderTxNote();
     }
     if (msgNode) setMsg(msgNode, e.message, "err");
@@ -730,7 +919,7 @@ function transmit(signalId, btn, msgNode, opts) {
 
 function txBlockNote() {
   if (txAvailable()) return null;
-  return el("div", "note bad", S.txBlock);
+  return el("div", "note bad", txBlockText());
 }
 
 /* ======================================================================
@@ -768,7 +957,8 @@ function waveform(durations, firstLevel, sel) {
   svg.setAttribute("viewBox", "0 0 " + W + " " + H);
   svg.setAttribute("preserveAspectRatio", "none");
   svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", n + " pulses over " + Math.round(total / 1000) + " milliseconds");
+  svg.setAttribute("aria-label", t("{n} pulses over {ms} milliseconds",
+                                   { n: n, ms: Math.round(total / 1000) }));
   var mid = svgEl("path", "mid");
   mid.setAttribute("d", "M0,20 H" + W);
   add(svg, mid);
@@ -797,10 +987,12 @@ function waveform(durations, firstLevel, sel) {
   var box = el("div");
   add(box, wrap);
   add(box, el("div", "wave-cap", sel
-    ? ((to - from) + " of " + n + " pulses selected · " + (selUs / 1000).toFixed(1) +
-       " ms · starts " + ((firstLevel ^ (from & 1)) ? "HIGH" : "LOW"))
-    : (n + (durations.length > n ? " of " + durations.length : "") + " pulses · " +
-       (total / 1000).toFixed(1) + " ms · starts " + (firstLevel ? "HIGH" : "LOW"))));
+    ? t("{sel} of {n} pulses selected · {ms} ms · starts {lvl}",
+        { sel: (to - from), n: n, ms: (selUs / 1000).toFixed(1),
+          lvl: ((firstLevel ^ (from & 1)) ? "HIGH" : "LOW") })
+    : t("{n} pulses · {ms} ms · starts {lvl}",
+        { n: (durations.length > n ? t("{n} of {total}", { n: n, total: durations.length }) : n),
+          ms: (total / 1000).toFixed(1), lvl: (firstLevel ? "HIGH" : "LOW") })));
   box.svg = svg;
   return box;
 }
@@ -834,14 +1026,14 @@ function signalById(id) {
   return null;
 }
 function signalLabel(sig) {
-  if (!sig) return "signal";
-  return sig.name || ("Signal " + sig.id);
+  if (!sig) return t("signal");
+  return sig.name || t("Signal {id}", { id: sig.id });
 }
 /* One line of identity: the decoder's sentence when there is one, otherwise the
    honest "raw pulses" wording -- an undecoded signal is a supported state. */
 function signalIdent(sig) {
   if (sig && sig.decoded && sig.decoded.text) return sig.decoded.text;
-  return "raw waveform, " + numOr(sig && sig.pulse_count, 0) + " pulses";
+  return t("raw waveform, {count} pulses", { count: numOr(sig && sig.pulse_count, 0) });
 }
 /* Which nodes point at a signal. Drives both the "used by" marks in the picker
    and the delete guard: a signal another node still needs is not deletable. */
@@ -854,8 +1046,8 @@ function nodesUsingSignal(id, exceptNodeId) {
   return out;
 }
 function usedByText(users) {
-  if (!users.length) return "Not used by any node";
-  return "Used by " + users.map(function (n) { return nodeName(n.id); }).join(", ");
+  if (!users.length) return t("Not used by any node");
+  return t("Used by {nodes}", { nodes: users.map(function (n) { return nodeName(n.id); }).join(", ") });
 }
 
 /* Anything that re-reads /api/signals lands here: node summaries carry signal
@@ -889,40 +1081,40 @@ var PAIR_GAP_US = 8000;
 
 function pairPanel(sig) {
   var box = el("div", "note");
-  add(box, el("b", null, "Pair with a receiver"));
+  add(box, el("b", null, t("Pair with a receiver")));
 
   var steps = el("ol");
   steps.style.margin = ".45rem 0 .55rem";
   steps.style.paddingLeft = "1.25rem";
 
   var s1 = el("li");
-  add(s1, el("span", null, "Put your receiver into "), el("b", null, "learning mode"),
-      el("span", null, " — usually hold its button until it beeps or its LED blinks."));
+  add(s1, el("span", null, t("Put your receiver into ")), el("b", null, t("learning mode")),
+      el("span", null, t(" — usually hold its button until it beeps or its LED blinks.")));
   var s2 = el("li");
-  add(s2, el("span", null, "Tap "), el("b", null, "Pair now"),
-      el("span", null, " below within a few seconds."));
-  var s3 = el("li", null, "The receiver stores this code and rings for it from then on.");
+  add(s2, el("span", null, t("Tap ")), el("b", null, t("Pair now")),
+      el("span", null, t(" below within a few seconds.")));
+  var s3 = el("li", null, t("The receiver stores this code and rings for it from then on."));
   add(steps, s1, s2, s3);
   add(box, steps);
 
   add(box, el("div", "small muted",
-    "This code is new — nothing responds to it until a receiver has learned it. " +
-    "That is expected."));
+    t("This code is new — nothing responds to it until a receiver has learned it. " +
+      "That is expected.")));
 
   var msg = el("div", "formmsg");
   var row = el("div", "formfoot");
-  var b = el("button", "btn primary", "🔗 Pair now");
+  var b = el("button", "btn primary", t("🔗 Pair now"));
   b.type = "button";
   b.disabled = !txAvailable();
-  if (!txAvailable()) b.title = S.txBlock;
+  if (!txAvailable()) b.title = txBlockText();
   b.addEventListener("click", function () {
     transmit(sig.id, b, msg, {
       body: { repeats: PAIR_REPEATS, gap_us: PAIR_GAP_US },
-      sending: "Pairing…",
-      sent: "Sent ✓",
-      ok: "Code sent " + PAIR_REPEATS + " times. If the receiver was in learning mode it " +
-          "has stored it — test it with Transmit below. If not, put it back into learning " +
-          "mode and tap Pair now again."
+      sending: t("Pairing…"),
+      sent: t("Sent ✓"),
+      ok: t("Code sent {count} times. If the receiver was in learning mode it " +
+            "has stored it — test it with Transmit below. If not, put it back into learning " +
+            "mode and tap Pair now again.", { count: PAIR_REPEATS })
     });
   });
   add(row, b, msg);
@@ -949,15 +1141,15 @@ function signalBlock(sig, opts) {
   /* identity */
   var chips = el("div", "chiprow");
   if (sig.decoded && sig.decoded.text) add(chips, el("span", "chip accent mono", sig.decoded.text));
-  else add(chips, el("span", "chip warn", "Unknown protocol — stored as raw pulses"));
+  else add(chips, el("span", "chip warn", t("Unknown protocol — stored as raw pulses")));
   if (sig.origin) add(chips, el("span", "chip", sig.origin));
-  if (typeof sig.seen_count === "number") add(chips, el("span", "chip", "seen " + sig.seen_count + "x"));
+  if (typeof sig.seen_count === "number") add(chips, el("span", "chip", t("seen {count}x", { count: sig.seen_count })));
   add(box, chips);
 
   if (!sig.decoded) {
     add(box, el("div", "note",
-      "No decoder claimed this waveform. That is a fully supported state: the exact pulse " +
-      "timings are stored and replay works normally. Only the human-readable identity is missing."));
+      t("No decoder claimed this waveform. That is a fully supported state: the exact pulse " +
+        "timings are stored and replay works normally. Only the human-readable identity is missing.")));
   }
 
   /* Above every other control, because it is the answer to the question a
@@ -978,7 +1170,7 @@ function signalBlock(sig, opts) {
     cwrap.style.margin = ".7rem 0";
     var crow = el("div", "row");
     crow.style.justifyContent = "space-between";
-    add(crow, el("span", "small muted", "Decode confidence"));
+    add(crow, el("span", "small muted", t("Decode confidence")));
     add(crow, el("span", "small mono", sig.confidence + "%"));
     add(cwrap, crow);
     var m = el("div", "meter " + (sig.confidence >= 65 ? "ok" : sig.confidence >= 45 ? "warn" : "bad"));
@@ -987,26 +1179,26 @@ function signalBlock(sig, opts) {
     add(m, fill);
     add(cwrap, m);
     add(cwrap, el("div", "hint",
-      "Measured on this bench: real presses score 67-92%, band noise 24-48%."));
+      t("Measured on this bench: real presses score 67-92%, band noise 24-48%.")));
     add(box, cwrap);
   }
 
   /* facts */
   var kv = el("dl", "kv");
   function kvAdd(k, v) { if (v === null || v === undefined || v === "") return; add(kv, el("dt", null, k)); add(kv, el("dd", "mono", String(v))); }
-  kvAdd("Id", sig.id);
-  kvAdd("Fingerprint", sig.fingerprint);
-  kvAdd("Base pulse", typeof sig.base_us === "number" ? sig.base_us + " us" : null);
-  kvAdd("Pulses", sig.pulse_count);
+  kvAdd(t("Id"), sig.id);
+  kvAdd(t("Fingerprint"), sig.fingerprint);
+  kvAdd(t("Base pulse"), typeof sig.base_us === "number" ? sig.base_us + " us" : null);
+  kvAdd(t("Pulses"), sig.pulse_count);
   kvAdd("RSSI", typeof sig.rssi_dbm === "number" ? sig.rssi_dbm + " dBm" : null);
-  kvAdd("Seen", typeof sig.seen_count === "number" ? sig.seen_count + " times" : null);
-  kvAdd("Last seen", typeof sig.last_seen_s === "number" ? agoText(sig.last_seen_s) : null);
-  kvAdd("Created", fmtEpoch(sig.created_at) || null);
+  kvAdd(t("Seen"), typeof sig.seen_count === "number" ? t("{count} times", { count: sig.seen_count }) : null);
+  kvAdd(t("Last seen"), typeof sig.last_seen_s === "number" ? agoText(sig.last_seen_s) : null);
+  kvAdd(t("Created"), fmtEpoch(sig.created_at) || null);
   if (sig.decoded) {
-    kvAdd("Protocol", sig.decoded.protocol);
-    kvAdd("Address", typeof sig.decoded.id === "number"
+    kvAdd(t("Protocol"), sig.decoded.protocol);
+    kvAdd(t("Address"), typeof sig.decoded.id === "number"
       ? sig.decoded.id + " (0x" + sig.decoded.id.toString(16).toUpperCase() + ")" : null);
-    kvAdd("Button", sig.decoded.button);
+    kvAdd(t("Button"), sig.decoded.button);
   }
   add(box, kv);
 
@@ -1014,34 +1206,34 @@ function signalBlock(sig, opts) {
   var wf = waveform(sig.durations_us, sig.first_level);
   if (wf) {
     var wh = el("div", "field");
-    add(wh, el("span", null, "Pulse train"));
+    add(wh, el("span", null, t("Pulse train")));
     add(wh, wf);
     add(wh, el("span", "hint",
-      "High = carrier on, low = carrier off. This is what gets replayed, verbatim, on transmit."));
+      t("High = carrier on, low = carrier off. This is what gets replayed, verbatim, on transmit.")));
     /* Why a virtual signal does not look like a captured one. Read as a bug
        otherwise -- and it has been. */
     if (sig.origin === "synthesized") {
       add(wh, el("span", "hint",
-        "A synthesized frame ends with the ~9 ms sync gap the protocol puts between words, " +
-        "so it has one pulse more than the same code captured off the air (50 vs 49). A " +
-        "capture can never contain that gap: it is longer than the 8 ms idle threshold, so it " +
-        "is exactly what ENDS the recording. Repeated on air the two are the same waveform."));
+        t("A synthesized frame ends with the ~9 ms sync gap the protocol puts between words, " +
+          "so it has one pulse more than the same code captured off the air (50 vs 49). A " +
+          "capture can never contain that gap: it is longer than the 8 ms idle threshold, so it " +
+          "is exactly what ENDS the recording. Repeated on air the two are the same waveform.")));
     }
     add(box, wh);
   }
 
   /* rename */
   var nameIn = inputEl("text", sig.name || "", { maxlength: "40" });
-  add(box, field("Signal name", nameIn,
-    "Shown in the activity feed, on the node card and in the picker."));
+  add(box, field(t("Signal name"), nameIn,
+    t("Shown in the activity feed, on the node card and in the picker.")));
 
   var msg = el("div", "formmsg");
   var foot = el("div", "formfoot");
 
-  var txb = el("button", "btn primary", "📡 Transmit");
+  var txb = el("button", "btn primary", t("📡 Transmit"));
   txb.type = "button";
   txb.disabled = !txAvailable();
-  if (!txAvailable()) txb.title = S.txBlock;
+  if (!txAvailable()) txb.title = txBlockText();
   txb.addEventListener("click", function () { transmit(sig.id, txb, msg); });
 
   /* Export just this one signal.
@@ -1049,12 +1241,12 @@ function signalBlock(sig, opts) {
      empty graph -- so it imports through the identical path with no special
      case. A one-signal file is simply a small backup, which is also why it can
      be merged into a box that already has automations without touching them. */
-  var exp = el("button", "btn", "\u2b07 Export");
+  var exp = el("button", "btn", t("\u2b07 Export"));
   exp.type = "button";
-  exp.title = "Download this one signal as a .json you can import on another Klingelbox";
+  exp.title = t("Download this one signal as a .json you can import on another Klingelbox");
   exp.addEventListener("click", function () {
     exp.disabled = true;
-    setMsg(msg, "Reading the waveform\u2026");
+    setMsg(msg, t("Reading the waveform\u2026"));
     Promise.all([api("/api/system"), api("/api/signals/" + sig.id)])
       .then(function (r) {
         var sysm = r[0], full = r[1];
@@ -1073,23 +1265,24 @@ function signalBlock(sig, opts) {
                      .toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, "");
         var bytes = downloadBundle(bundle, "klingelbox-signal-" + (slug || full.id) + ".json");
         exp.disabled = false;
-        setMsg(msg, "Exported " + (full.durations_us || []).length + " pulses (" +
-                    Math.round(bytes / 1024) + " KB). Import it on another box from Settings \u2192 Backup.", "ok");
+        setMsg(msg, t("Exported {count} pulses ({kb} KB). Import it on another box from " +
+                      "Settings \u2192 Backup.",
+                    { count: (full.durations_us || []).length, kb: Math.round(bytes / 1024) }), "ok");
       })
       .catch(function (e) { exp.disabled = false; setMsg(msg, e.message, "err"); });
   });
 
-  var save = el("button", "btn", "Save name");
+  var save = el("button", "btn", t("Save name"));
   save.type = "button";
   save.addEventListener("click", function () {
     var n = trimOf(nameIn);
-    if (!n) { setMsg(msg, "A name cannot be empty.", "err"); return; }
+    if (!n) { setMsg(msg, t("A name cannot be empty."), "err"); return; }
     save.disabled = true;
-    setMsg(msg, "Saving…");
+    setMsg(msg, t("Saving…"));
     postJSON("/api/signals/" + sig.id, { name: n }).then(function () {
       save.disabled = false;
       sig.name = n;
-      setMsg(msg, "Renamed.", "ok");
+      setMsg(msg, t("Renamed."), "ok");
       loadSignals();
       if (S.graph) loadGraph();
       if (opts.onChanged) opts.onChanged("renamed", n);
@@ -1104,11 +1297,11 @@ function signalBlock(sig, opts) {
   if (opts.storeNote !== false) {
     var others = nodesUsingSignal(sig.id, opts.node ? opts.node.id : 0);
     add(box, el("div", "note",
-      "This recording belongs to the box, not to this node. Deleting the node, unlinking it or " +
-      "pointing it at a different signal leaves it in the store under its name — you never have " +
-      "to walk to the door and register a button twice." +
-      (others.length ? " " + usedByText(others) + " as well." : "") +
-      " To remove it for good: Settings → Stored signals."));
+      t("This recording belongs to the box, not to this node. Deleting the node, unlinking it or " +
+        "pointing it at a different signal leaves it in the store under its name — you never have " +
+        "to walk to the door and register a button twice.") +
+      (others.length ? " " + t("{used} as well.", { used: usedByText(others) }) : "") +
+      " " + t("To remove it for good: Settings → Stored signals.")));
   }
   return box;
 }
@@ -1132,9 +1325,9 @@ var pickerRefresh = null;   /* set while a picker sheet is open */
 
 function openSignalPicker(opts) {
   opts = opts || {};
-  var sh = openSheet(opts.title || "Choose a signal",
-    "Everything this box has stored. Signals already used by a node are marked — you can " +
-    "still pick one, two nodes may share a signal.",
+  var sh = openSheet(opts.title || t("Choose a signal"),
+    t("Everything this box has stored. Signals already used by a node are marked — you can " +
+      "still pick one, two nodes may share a signal."),
     function () { pickerRefresh = null; });
 
   var listWrap = el("div");
@@ -1145,13 +1338,13 @@ function openSignalPicker(opts) {
     var row = el("div", "btnrow");
     row.style.marginTop = ".7rem";
     if (opts.onListen) {
-      var lb = el("button", "btn", "🎧 Listen for a new button");
+      var lb = el("button", "btn", t("🎧 Listen for a new button"));
       lb.type = "button";
       lb.addEventListener("click", function () { sh.close(); opts.onListen(); });
       add(row, lb);
     }
     if (opts.onVirtual) {
-      var vb = el("button", "btn", "✨ Configure by hand");
+      var vb = el("button", "btn", t("✨ Configure by hand"));
       vb.type = "button";
       vb.addEventListener("click", function () { sh.close(); opts.onVirtual(); });
       add(row, vb);
@@ -1163,12 +1356,12 @@ function openSignalPicker(opts) {
     clear(listWrap);
     if (S.signalsErr) {
       add(listWrap, el("div", "note bad",
-        "Could not read the signal store: " + S.signalsErr.message));
+        t("Could not read the signal store: {error}", { error: S.signalsErr.message })));
     }
 
     var list = S.signals || [];
     if (!list.length) {
-      add(listWrap, el("div", "empty", "No signals stored yet."));
+      add(listWrap, el("div", "empty", t("No signals stored yet.")));
       alts(listWrap);
       return;
     }
@@ -1182,9 +1375,9 @@ function openSignalPicker(opts) {
       var main = el("div", "li-main");
       add(main, el("div", "li-title", signalLabel(sig)));
       var subParts = [signalIdent(sig)];
-      if (typeof sig.base_us === "number") subParts.push(sig.base_us + " us base");
+      if (typeof sig.base_us === "number") subParts.push(t("{base} us base", { base: sig.base_us }));
       add(main, el("div", "li-sub", subParts.join("  ·  ")));
-      add(main, el("div", "li-sub", users.length ? usedByText(users) : "Not used by any node"));
+      add(main, el("div", "li-sub", users.length ? usedByText(users) : t("Not used by any node")));
       add(b, main);
       var meta = el("div", "li-meta");
       if (typeof sig.seen_count === "number") add(meta, el("div", null, sig.seen_count + "x"));
@@ -1220,17 +1413,17 @@ function openSignalPicker(opts) {
 var ID20_MAX = 0xFFFFF;
 
 function parseId20(raw) {
-  var t = (raw || "").trim().replace(/\s+/g, "");
-  if (!t) return { ok: true, blank: true, value: 0 };
+  var txt = (raw || "").trim().replace(/\s+/g, "");
+  if (!txt) return { ok: true, blank: true, value: 0 };
   var v = NaN;
-  if (/^0x[0-9a-f]+$/i.test(t)) v = parseInt(t.slice(2), 16);
-  else if (/^[0-9]+$/.test(t)) v = parseInt(t, 10);
-  else if (/^[0-9a-f]+$/i.test(t)) v = parseInt(t, 16);
-  else return { ok: false, msg: "Use hex (0xA685A or A685A) or plain digits — nothing else." };
-  if (!isFinite(v) || v < 0) return { ok: false, msg: "That is not a number." };
+  if (/^0x[0-9a-f]+$/i.test(txt)) v = parseInt(txt.slice(2), 16);
+  else if (/^[0-9]+$/.test(txt)) v = parseInt(txt, 10);
+  else if (/^[0-9a-f]+$/i.test(txt)) v = parseInt(txt, 16);
+  else return { ok: false, msg: t("Use hex (0xA685A or A685A) or plain digits — nothing else.") };
+  if (!isFinite(v) || v < 0) return { ok: false, msg: t("That is not a number.") };
   if (v > ID20_MAX) {
-    return { ok: false, msg: "An EV1527 address is 20 bits: 0 to 0xFFFFF (1048575). " +
-      "0x" + v.toString(16).toUpperCase() + " is too large." };
+    return { ok: false, msg: t("An EV1527 address is 20 bits: 0 to 0xFFFFF (1048575). " +
+      "0x{hex} is too large.", { hex: v.toString(16).toUpperCase() }) };
   }
   /* 0 is the API's "pick one for me" sentinel, so it can never be a real
      address -- say so instead of creating something that decodes as random. */
@@ -1261,50 +1454,50 @@ function openVirtualFlow(opts) {
   var isNode = opts.mode === "signal";
   return new Promise(function (resolve) {
     var done = false;
-    var sh = openSheet("Enter a code",
+    var sh = openSheet(t("Enter a code"),
       isNode
-        ? "A code for this node to use."
-        : "A brand-new code, so you can pair your own receivers to this box.",
+        ? t("A code for this node to use.")
+        : t("A brand-new code, so you can pair your own receivers to this box."),
       function () { if (!done) { done = true; resolve(null); } });
 
     if (isNode) {
       add(sh.body, el("p", "small",
-        "Use this when you already KNOW the code — from another Klingelbox, from a remote you " +
-        "decoded elsewhere — or when you are inventing a fresh one for a receiver of your own. " +
-        "If the remote is in your hand, Learn is easier and cannot get a digit wrong."));
+        t("Use this when you already KNOW the code — from another Klingelbox, from a remote you " +
+          "decoded elsewhere — or when you are inventing a fresh one for a receiver of your own. " +
+          "If the remote is in your hand, Learn is easier and cannot get a digit wrong.")));
       add(sh.body, el("div", "note warn",
-        "A code on its own does nothing. A Signal sender puts it on air when something " +
-        "triggers it — which is also how you pair a chime, relay or socket to it. A Signal " +
-        "receiver stays quiet until that code is actually heard on air."));
+        t("A code on its own does nothing. A Signal sender puts it on air when something " +
+          "triggers it — which is also how you pair a chime, relay or socket to it. A Signal " +
+          "receiver stays quiet until that code is actually heard on air.")));
     } else {
       add(sh.body, el("p", "small",
-        "A virtual signal is a brand-new EV1527 code that no remote in the world is using yet. " +
-        "It exists so you can pair YOUR OWN receivers to this box: put a plug-in chime, a relay " +
-        "or a socket into its learning mode, then transmit this signal. From then on the receiver " +
-        "obeys this box, and any node can ring it."));
+        t("A virtual signal is a brand-new EV1527 code that no remote in the world is using yet. " +
+          "It exists so you can pair YOUR OWN receivers to this box: put a plug-in chime, a relay " +
+          "or a socket into its learning mode, then transmit this signal. From then on the receiver " +
+          "obeys this box, and any node can ring it.")));
     }
 
     var grid = el("div", "formgrid");
-    var vName = inputEl("text", isNode ? "Hand-entered code" : "Virtual chime 1",
-      { maxlength: "40", placeholder: isNode ? "Hand-entered code" : "Virtual chime 1" });
-    var vBtn = selectEl([1, 2, 4, 8].map(function (b) { return { value: b, label: "Button " + b }; }), 8);
+    var vName = inputEl("text", isNode ? t("Hand-entered code") : t("Virtual chime 1"),
+      { maxlength: "40", placeholder: isNode ? t("Hand-entered code") : t("Virtual chime 1") });
+    var vBtn = selectEl([1, 2, 4, 8].map(function (b) { return { value: b, label: t("Button {n}", { n: b }) }; }), 8);
     var vBase = inputEl("number", "350", { min: "100", max: "1500", step: "10", inputmode: "numeric" });
     /* text, not number: "0xA685A" is the form this UI displays everywhere. */
-    var vId = inputEl("text", "", { maxlength: "12", placeholder: "0xA685A or blank",
+    var vId = inputEl("text", "", { maxlength: "12", placeholder: t("0xA685A or blank"),
       autocapitalize: "off", autocorrect: "off" });
 
     var idRow = el("div", "row");
     idRow.style.gap = ".4rem";
     vId.style.flex = "1 1 8rem";
-    var rnd = el("button", "btn small", "🎲 Randomize");
+    var rnd = el("button", "btn small", t("🎲 Randomize"));
     rnd.type = "button";
     rnd.style.minHeight = "2.75rem";
     rnd.style.flex = "0 0 auto";
     add(idRow, vId, rnd);
 
-    var idField = field("20-bit address", idRow,
-      "Hex (0xA685A or A685A) or plain digits. Leave it blank — or tap Randomize — and the box " +
-      "picks a free address itself.", "full");
+    var idField = field(t("20-bit address"), idRow,
+      t("Hex (0xA685A or A685A) or plain digits. Leave it blank — or tap Randomize — and the box " +
+        "picks a free address itself."), "full");
 
     /* The preview is what makes hand-entry checkable: it is formatted exactly
        like the decoded identity shown on every signal elsewhere in the UI. */
@@ -1312,9 +1505,9 @@ function openVirtualFlow(opts) {
     add(idField, preview);
 
     add(grid,
-      field("Name", vName, null, "full"),
-      field("Button code", vBtn, "The 4-bit button nibble sent with the address."),
-      field("Base pulse (us)", vBase, "350 us suits most EV1527 receivers."),
+      field(t("Name"), vName, null, "full"),
+      field(t("Button code"), vBtn, t("The 4-bit button nibble sent with the address.")),
+      field(t("Base pulse (us)"), vBase, t("350 us suits most EV1527 receivers.")),
       idField);
     add(sh.body, grid);
 
@@ -1330,7 +1523,7 @@ function openVirtualFlow(opts) {
       }
       preview.className = "hint mono";
       preview.textContent = r.blank
-        ? ("EV1527 id=0x????? btn=" + hex20(btn) + "   — a random address, chosen by the box")
+        ? t("EV1527 id=0x????? btn={btn}   — a random address, chosen by the box", { btn: hex20(btn) })
         : ev1527Text(r.value, btn);
       return r;
     }
@@ -1345,7 +1538,7 @@ function openVirtualFlow(opts) {
     syncPreview();
 
     var foot = el("div", "formfoot");
-    var save = el("button", "btn primary", isNode ? "Use this code" : "Create virtual signal");
+    var save = el("button", "btn primary", isNode ? t("Use this code") : t("Create virtual signal"));
     save.type = "button";
     /* The duplicate-address override.
        The API refuses a code another signal already carries, because the two
@@ -1356,28 +1549,28 @@ function openVirtualFlow(opts) {
        than a dead end, and the button stays hidden until there has actually
        been a refusal: nobody should be offered "create a duplicate" before
        there is one to duplicate. */
-    var anyway = el("button", "btn", "Create it anyway");
+    var anyway = el("button", "btn", t("Create it anyway"));
     anyway.type = "button";
     anyway.style.display = "none";
-    var cancel = el("button", "btn", "Cancel");
+    var cancel = el("button", "btn", t("Cancel"));
     cancel.type = "button";
     cancel.addEventListener("click", sh.close);
     add(foot, save, anyway, cancel, msg);
     add(sh.body, foot);
 
     add(sh.body, el("div", "note", isNode
-      ? "The node is created carrying exactly this code. It gets a “Pair with a receiver” " +
-        "panel for teaching your chime the code, and anything sending that code over the air " +
-        "shows up on the Activity tab."
-      : "Next: the signal you are creating gets a “Pair with a receiver” panel. Put your receiver " +
-        "into pairing mode and tap Pair now there — the receiver stores this code and answers to " +
-        "it from then on."));
+      ? t("The node is created carrying exactly this code. It gets a “Pair with a receiver” " +
+          "panel for teaching your chime the code, and anything sending that code over the air " +
+          "shows up on the Activity tab.")
+      : t("Next: the signal you are creating gets a “Pair with a receiver” panel. Put your receiver " +
+          "into pairing mode and tap Pair now there — the receiver stores this code and answers to " +
+          "it from then on.")));
 
     function submit(allowDuplicate) {
       var r = syncPreview();
       if (!r.ok) { setMsg(msg, r.msg, "err"); vId.focus(); return; }
       var body = {
-        name: trimOf(vName) || (isNode ? "Hand-entered code" : "Virtual signal"),
+        name: trimOf(vName) || (isNode ? t("Hand-entered code") : t("Virtual signal")),
         button: intOf(vBtn, 8),
         base_us: intOf(vBase, 350),
         id20: r.blank ? 0 : r.value
@@ -1385,7 +1578,7 @@ function openVirtualFlow(opts) {
       if (allowDuplicate) body.allow_duplicate = true;
       save.disabled = true;
       anyway.disabled = true;
-      setMsg(msg, "Creating…");
+      setMsg(msg, t("Creating…"));
       postJSON("/api/signals/virtual", body).then(function (created) {
         return loadSignals().then(function (list) {
           var made = (created && created.id) ? (signalById(created.id) || created)
@@ -1480,12 +1673,13 @@ function rawSuggestedFloor() {
 }
 
 function rawFloorOptions(sel, offValue) {
-  var out = [{ value: offValue, label: "Off — record every burst" }];
+  var out = [{ value: offValue, label: t("Off — record every burst") }];
   [-100, -95, -90, -85, -80, -75].forEach(function (v) {
     out.push({
       value: v,
-      label: v + " dBm" + (v === -75 ? " (the normal receiver's squelch)"
-                                     : (v === sel ? " (suggested here)" : ""))
+      label: v === -75 ? t("{v} dBm (the normal receiver's squelch)", { v: v })
+           : v === sel ? t("{v} dBm (suggested here)", { v: v })
+           : v + " dBm"
     });
   });
   return out;
@@ -1506,7 +1700,7 @@ function rawVerdict(st) {
   var cands = (st && st.candidates) || [];
 
   if (r.present === false) {
-    return { kind: "bad", text: "No CC1101 detected, so nothing can be recorded. See the states below." };
+    return { kind: "bad", text: t("No CC1101 detected, so nothing can be recorded. See the states below.") };
   }
   if (count > 0) {
     /* Filled to the brim almost immediately, with nothing strong in it: that is
@@ -1521,29 +1715,37 @@ function rawVerdict(st) {
       return {
         kind: "warn",
         suggest: Math.min(-75, Math.round((strongest + 5) / 5) * 5),
-        text: "All " + count + " slots filled in " + numOr(st.elapsed_s, 0) + " s and the "
-          + "loudest thing in them was " + strongest + " dBm. That is the receiver's own "
-          + "amplifier noise, not a transmitter. Raise the squelch floor and run it again."
+        text: t("All {count} slots filled in {secs} s and the loudest thing in them was "
+          + "{dbm} dBm. That is the receiver's own amplifier noise, not a transmitter. "
+          + "Raise the squelch floor and run it again.",
+          { count: count, secs: numOr(st.elapsed_s, 0), dbm: strongest })
       };
     }
     /* Something repeated: say so, because that is the evidence the ranking runs
        on and it is what tells the user the top row is worth trying first. */
+    var frameTxt = count === 1 ? t("{n} frame", { n: count })
+                               : t("{n} frames", { n: count });
     var best = cands.length ? numOr(cands[0].seen, 1) : 1;
     if (best > 1) {
       return {
         kind: "ok",
-        text: cands.length + " candidate" + (cands.length === 1 ? "" : "s") + " from "
-          + count + " frame" + (count === 1 ? "" : "s") + ". The top one was heard "
-          + best + " times, which is what a real remote does and noise does not — "
-          + "try that one first."
+        text: t("{cands} from {frames}. The top one was heard {best} times, which is "
+          + "what a real remote does and noise does not — try that one first.",
+          { cands: cands.length === 1 ? t("{n} candidate", { n: cands.length })
+                                      : t("{n} candidates", { n: cands.length }),
+            frames: frameTxt, best: best })
       };
     }
     return {
       kind: "ok",
-      text: count + " frame" + (count === 1 ? "" : "s") + " recorded"
-        + (strongest !== null ? ", loudest " + strongest + " dBm" : "")
-        + ", but nothing repeated. Press the button several times in one session so the "
-        + "box can tell your remote apart from the band — or just try the candidates below."
+      text: t(strongest !== null
+        ? "{frames} recorded, loudest {dbm} dBm, but nothing repeated. Press the button "
+          + "several times in one session so the box can tell your remote apart from the "
+          + "band — or just try the candidates below."
+        : "{frames} recorded, but nothing repeated. Press the button several times in one "
+          + "session so the box can tell your remote apart from the band — or just try "
+          + "the candidates below.",
+        { frames: frameTxt, dbm: strongest })
     };
   }
   if (st && st.running) return null;   /* still listening; not a verdict yet */
@@ -1552,52 +1754,64 @@ function rawVerdict(st) {
   if (!heard && !floor && !r.carrier_seen) {
     return {
       kind: "bad",
-      text: "The radio heard NOTHING — not one burst, not even noise, and carrier sense "
+      text: t("The radio heard NOTHING — not one burst, not even noise, and carrier sense "
         + "never asserted. That is a radio problem, not a threshold problem: these "
         + "settings cannot help. Check the antenna is fitted, and that the frequency and "
-        + "modulation under Settings → Radio match what your remote actually sends."
+        + "modulation under Settings → Radio match what your remote actually sends.")
     };
   }
   if (floor > 0) {
     return {
       kind: "warn",
       suggest: numOr(set.rssi_floor_dbm, -80) - 10,
-      text: floor + " burst" + (floor === 1 ? " was" : "s were") + " received and thrown "
-        + "away for being quieter than " + numOr(set.rssi_floor_dbm, -80) + " dBm"
-        + (typeof r.peak_rssi_dbm === "number" ? " (the band peaked at " + r.peak_rssi_dbm + " dBm)" : "")
-        + ". Lower the floor, or press the button closer to the box."
+      text: t(floor === 1
+        ? "{n} burst was received and thrown away for being quieter than {floor} dBm"
+          + "{peak}. Lower the floor, or press the button closer to the box."
+        : "{n} bursts were received and thrown away for being quieter than {floor} dBm"
+          + "{peak}. Lower the floor, or press the button closer to the box.",
+        { n: floor, floor: numOr(set.rssi_floor_dbm, -80),
+          peak: typeof r.peak_rssi_dbm === "number"
+            ? t(" (the band peaked at {dbm} dBm)", { dbm: r.peak_rssi_dbm }) : "" })
     };
   }
   if (tooLong > 0) {
     return {
       kind: "warn",
-      text: tooLong + " frame" + (tooLong === 1 ? " was" : "s were") + " longer than the "
-        + "512-pulse limit and were discarded before they reached us — a truncated "
-        + "recording would replay as a different waveform. Lower the frame boundary so "
-        + "each transmission ends sooner instead of running into the next one."
+      text: t(tooLong === 1
+        ? "{n} frame was longer than the 512-pulse limit and were discarded before they "
+          + "reached us — a truncated recording would replay as a different waveform. "
+          + "Lower the frame boundary so each transmission ends sooner instead of "
+          + "running into the next one."
+        : "{n} frames were longer than the 512-pulse limit and were discarded before they "
+          + "reached us — a truncated recording would replay as a different waveform. "
+          + "Lower the frame boundary so each transmission ends sooner instead of "
+          + "running into the next one.", { n: tooLong })
     };
   }
   if (tooShort > 0) {
     return {
       kind: "warn",
-      text: tooShort + " burst" + (tooShort === 1 ? " was" : "s were") + " shorter than "
-        + numOr(set.min_pulses, 4) + " pulses. Lower the minimum — but this is usually "
-        + "the AGC hash rather than a remote."
+      text: t(tooShort === 1
+        ? "{n} burst was shorter than {min} pulses. Lower the minimum — but this is "
+          + "usually the AGC hash rather than a remote."
+        : "{n} bursts were shorter than {min} pulses. Lower the minimum — but this is "
+          + "usually the AGC hash rather than a remote.",
+        { n: tooShort, min: numOr(set.min_pulses, 4) })
     };
   }
   if (r.carrier_seen) {
     return {
       kind: "warn",
-      text: "Carrier energy was sensed but no pulse stream ever emerged from it. That "
+      text: t("Carrier energy was sensed but no pulse stream ever emerged from it. That "
         + "points at the radio settings rather than these thresholds: the frequency is "
         + "close but not right, the bandwidth is too narrow, or the transmitter is not "
-        + "using OOK at all. Settings → Radio."
+        + "using OOK at all. Settings → Radio.")
     };
   }
   return {
     kind: "warn",
-    text: "The session ended with nothing recorded. The radio was alive and the band was "
-      + "quiet — press the button while the countdown is running, and within a few metres."
+    text: t("The session ended with nothing recorded. The radio was alive and the band was "
+      + "quiet — press the button while the countdown is running, and within a few metres.")
   };
 }
 
@@ -1612,10 +1826,10 @@ function openListenFlow(opts) {
     var made = null;
     var running = false;
 
-    var sh = openSheet(opts.title || "Listen for a button",
-      opts.sub || "Press the button on your remote several times. Everything the radio "
+    var sh = openSheet(opts.title || t("Listen for a button"),
+      opts.sub || t("Press the button on your remote several times. Everything the radio "
       + "hears is kept — the box ranks what it heard instead of deciding in advance what "
-      + "a real signal is allowed to look like.",
+      + "a real signal is allowed to look like."),
       function () {
         stopPoll("raw");
         if (done) return;
@@ -1638,16 +1852,16 @@ function openListenFlow(opts) {
 
     var msg = el("div", "formmsg");
     var ctl = el("div", "btnrow");
-    var startBtn = el("button", "btn primary", "Start listening");
+    var startBtn = el("button", "btn primary", t("Start listening"));
     startBtn.type = "button";
-    var stopBtn = el("button", "btn hidden", "Stop");
+    var stopBtn = el("button", "btn hidden", t("Stop"));
     stopBtn.type = "button";
     add(ctl, startBtn, stopBtn);
     add(sh.body, ctl, msg);
 
     /* Every frame, unranked — the fallback for the case the ranking got wrong,
        collapsed because it is not the answer, it is the raw material. */
-    var allSec = section("Every frame recorded", null, false);
+    var allSec = section(t("Every frame recorded"), null, false);
     var allWrap = el("div");
     add(allSec.bodyEl, allWrap);
     add(sh.body, allSec);
@@ -1657,72 +1871,72 @@ function openListenFlow(opts) {
     var offValue = numOr(lim.rssi_off_dbm, -120);
     var sug = rawSuggestedFloor();
 
-    var setSec = section("Advanced: what the receiver is allowed to hear", null, false);
+    var setSec = section(t("Advanced: what the receiver is allowed to hear"), null, false);
 
     var secSel = selectEl([
-      { value: 15, label: "15 seconds" },
-      { value: 30, label: "30 seconds" },
-      { value: 60, label: "1 minute" },
-      { value: 120, label: "2 minutes" }
+      { value: 15, label: t("15 seconds") },
+      { value: 30, label: t("30 seconds") },
+      { value: 60, label: t("1 minute") },
+      { value: 120, label: t("2 minutes") }
     ], 30);
-    add(setSec.bodyEl, field("Listen for", secSel,
-      "A session also stops as soon as its 32 slots are full, and it always stops on "
-      + "its own — the box never keeps recording behind your back."));
+    add(setSec.bodyEl, field(t("Listen for"), secSel,
+      t("A session also stops as soon as its 32 slots are full, and it always stops on "
+      + "its own — the box never keeps recording behind your back.")));
 
     var idleIn = inputEl("number", 8000, {
       min: String(numOr(lim.idle_us_min, 1000)),
       max: String(numOr(lim.idle_us_max, 32000)), step: "500"
     });
-    add(setSec.bodyEl, field("Frame boundary (µs of silence)", idleIn,
-      "How much quiet ends one recording and starts the next. Set it too LOW and one "
+    add(setSec.bodyEl, field(t("Frame boundary (µs of silence)"), idleIn,
+      t("How much quiet ends one recording and starts the next. Set it too LOW and one "
       + "transmission is chopped into pieces — the box detects that and says so — too "
-      + "HIGH and several presses are glued into one frame, and anything over "
-      + numOr(lim.max_pulses, 512) + " pulses is thrown away entirely."));
+      + "HIGH and several presses are glued into one frame, and anything over {max} "
+      + "pulses is thrown away entirely.", { max: numOr(lim.max_pulses, 512) })));
 
     var minIn = inputEl("number", 4, {
       min: String(numOr(lim.min_pulses_min, 2)),
       max: String(numOr(lim.min_pulses_max, 64)), step: "1"
     });
-    add(setSec.bodyEl, field("Minimum pulses", minIn,
-      "Shorter bursts are treated as noise and dropped. The normal receiver uses 32, "
+    add(setSec.bodyEl, field(t("Minimum pulses"), minIn,
+      t("Shorter bursts are treated as noise and dropped. The normal receiver uses 32, "
       + "which is exactly why a protocol with a short frame never shows up at all. "
-      + "Low values also let the amplifier's own hash through."));
+      + "Low values also let the amplifier's own hash through.")));
 
     var floorSel = selectEl(rawFloorOptions(sug, offValue), sug);
-    add(setSec.bodyEl, field("Squelch floor", floorSel,
-      "Bursts quieter than this are counted but not kept. Pre-set a few dB above "
+    add(setSec.bodyEl, field(t("Squelch floor"), floorSel,
+      t("Bursts quieter than this are counted but not kept. Pre-set a few dB above "
       + "whatever the band is doing right now, which is the only value that is correct "
-      + "on both a quiet bench and a busy flat. The normal receiver squelches at "
-      + numOr(lim.normal_squelch_dbm, -75) + " dBm; anything below that is more "
-      + "permissive than the box has ever been."));
+      + "on both a quiet bench and a busy flat. The normal receiver squelches at {dbm} "
+      + "dBm; anything below that is more permissive than the box has ever been.",
+      { dbm: numOr(lim.normal_squelch_dbm, -75) })));
 
     add(sh.body, setSec);
 
-    var ep = section("What a listening session actually does", null, false);
+    var ep = section(t("What a listening session actually does"), null, false);
     [
-      "The receiver is ALWAYS listening. It has to be: a button you already registered "
+      t("The receiver is ALWAYS listening. It has to be: a button you already registered "
       + "must ring the moment it is pressed, so there is no on-demand receive mode to "
       + "switch on. What a session changes is what happens to a signal the box does NOT "
-      + "recognise — normally dropped with one line in the activity feed, here kept.",
-      "The normal receive path applies four filters before you would ever see a signal, "
+      + "recognise — normally dropped with one line in the activity feed, here kept."),
+      t("The normal receive path applies four filters before you would ever see a signal, "
       + "and every one of them is a correct guess about the cheap remotes this box was "
       + "built around — and a possible lie about anything else. A session drops the "
       + "minimum frame length from 32 pulses to whatever you set, makes the frame "
       + "boundary an adjustable number instead of a fixed 8 ms, lowers (or removes) the "
       + "signal-strength squelch, and keeps every repeat separately instead of merging "
-      + "them.",
-      "Nothing is admitted or rejected on how it looks. Candidates are RANKED: a "
+      + "them."),
+      t("Nothing is admitted or rejected on how it looks. Candidates are RANKED: a "
       + "waveform heard several times outranks one heard once, and a recognised protocol "
       + "only breaks ties. A candidate no decoder understands is completely usable — the "
       + "exact timings are stored and replay works; only the human-readable name is "
-      + "missing.",
-      "Nothing is written to flash and nothing reaches your node graph: while a session "
+      + "missing."),
+      t("Nothing is written to flash and nothing reaches your node graph: while a session "
       + "runs, the doorbell keeps working exactly as it did, because only signals that "
       + "would have passed the NORMAL thresholds are still routed. Noise cannot ring "
-      + "anything.",
-      "The frames live in RAM only, and they are handed back when you start another "
-      + "session, when you close this and come back much later, or when the box reboots."
-    ].forEach(function (t) { add(ep.bodyEl, el("p", "small", t)); });
+      + "anything."),
+      t("The frames live in RAM only, and they are handed back when you start another "
+      + "session, when you close this and come back much later, or when the box reboots.")
+    ].forEach(function (line) { add(ep.bodyEl, el("p", "small", line)); });
     add(sh.body, ep);
 
     /* ---- polling ---- */
@@ -1741,7 +1955,7 @@ function openListenFlow(opts) {
         count.textContent = "—";
         count.className = "countdown idle";
         clear(state);
-        add(state, el("span", null, "Listening is not available: " + err.message));
+        add(state, el("span", null, t("Listening is not available: {msg}", { msg: err.message })));
         startBtn.disabled = true;
         stopPoll("raw");
         return;
@@ -1757,17 +1971,18 @@ function openListenFlow(opts) {
         count.className = "countdown";
         clear(state);
         add(state, el("span", "pulse"), el("span", null,
-          "Listening — press your button now, several times. " + numOr(st.count, 0)
-          + " of " + numOr(st.capacity, 32) + " slots used."));
+          t("Listening — press your button now, several times. {used} of {cap} slots used.",
+            { used: numOr(st.count, 0), cap: numOr(st.capacity, 32) })));
       } else {
         count.textContent = "—";
         count.className = "countdown idle";
         clear(state);
         add(state, el("span", null, st.held
-          ? ("Stopped (" + (st.stop_reason === "full" ? "all slots used"
-             : st.stop_reason === "time" ? "time up" : "you stopped it")
-             + ") after " + numOr(st.elapsed_s, 0) + " s.")
-          : "Not listening. Nothing is being stored and the box behaves normally."));
+          ? t("Stopped ({reason}) after {secs} s.", {
+              reason: st.stop_reason === "full" ? t("all slots used")
+                : st.stop_reason === "time" ? t("time up") : t("you stopped it"),
+              secs: numOr(st.elapsed_s, 0) })
+          : t("Not listening. Nothing is being stored and the box behaves normally.")));
       }
 
       renderFragmentation(st);
@@ -1796,21 +2011,30 @@ function openListenFlow(opts) {
 
       var note = el("div", "note warn");
       add(note, el("div", null,
-        runs + (runs === 1 ? " transmission was" : " transmissions were") + " cut into "
-        + frames + " pieces: the frame boundary (" + idle + " µs of silence) fired while "
-        + "your remote was still sending. That is why one press turns into several rows."));
+        t(runs === 1
+          ? "{runs} transmission was cut into {pieces} pieces: the frame boundary "
+            + "({idle} µs of silence) fired while your remote was still sending. That is "
+            + "why one press turns into several rows."
+          : "{runs} transmissions were cut into {pieces} pieces: the frame boundary "
+            + "({idle} µs of silence) fired while your remote was still sending. That is "
+            + "why one press turns into several rows.",
+          { runs: runs, pieces: frames, idle: idle })));
       if (rejoined > 0) {
         add(note, el("div", "small",
-          rejoined + " of them " + (rejoined === 1 ? "has" : "have") + " been stitched back "
-          + "together from the pieces, using the silence actually measured between them. "
-          + "Those are marked 🧩 in the list and are the ones to try first."));
+          t(rejoined === 1
+            ? "{n} of them has been stitched back together from the pieces, using the "
+              + "silence actually measured between them. Those are marked 🧩 in the list "
+              + "and are the ones to try first."
+            : "{n} of them have been stitched back together from the pieces, using the "
+              + "silence actually measured between them. Those are marked 🧩 in the list "
+              + "and are the ones to try first.", { n: rejoined })));
       }
       add(fragWrap, note);
 
       if (suggest) {
         var again = el("button", "btn");
         again.type = "button";
-        again.textContent = "Try again with a " + suggest + " µs gap";
+        again.textContent = t("Try again with a {us} µs gap", { us: suggest });
         again.style.marginTop = ".5rem";
         again.addEventListener("click", function () {
           idleIn.value = String(suggest);
@@ -1818,8 +2042,8 @@ function openListenFlow(opts) {
         });
         add(fragWrap, again);
         add(fragWrap, el("div", "hint",
-          "This raises the frame boundary so each press is recorded whole. Nothing you "
-          + "already have is lost until the new session starts."));
+          t("This raises the frame boundary so each press is recorded whole. Nothing you "
+          + "already have is lost until the new session starts.")));
       }
     }
 
@@ -1830,7 +2054,7 @@ function openListenFlow(opts) {
       var note = el("div", "note " + v.kind, v.text);
       add(verdict, note);
       if (typeof v.suggest === "number" && !st.running) {
-        var again = el("button", "btn", "Try again at " + v.suggest + " dBm");
+        var again = el("button", "btn", t("Try again at {dbm} dBm", { dbm: v.suggest }));
         again.type = "button";
         again.style.marginTop = ".5rem";
         again.addEventListener("click", function () {
@@ -1859,12 +2083,12 @@ function openListenFlow(opts) {
       var list = (st && st.candidates) || [];
       if (!list.length) return;
 
-      add(candWrap, el("div", "lg-label", "Most likely first"));
+      add(candWrap, el("div", "lg-label", t("Most likely first")));
       add(candWrap, el("div", "hint",
-        "Ranked by how often each waveform was heard — a real remote repeats itself and "
+        t("Ranked by how often each waveform was heard — a real remote repeats itself and "
         + "noise does not. A recognised protocol only breaks ties: an undecoded candidate "
         + "is fully usable and can be top of the list. Tap one to see it, trim it, and "
-        + "send it back out."));
+        + "send it back out.")));
 
       var ul = el("ul", "list");
       list.forEach(function (c, i) {
@@ -1875,20 +2099,22 @@ function openListenFlow(opts) {
         var main = el("div", "li-main");
         add(main, el("div", "li-title", (c.decoded && c.decoded.text)
           ? c.decoded.text
-          : "Unknown protocol — still fully replayable"));
+          : t("Unknown protocol — still fully replayable")));
 
         var why = el("div", "li-sub");
-        if (i === 0) add(why, el("span", "chip ok", "most likely"));
+        if (i === 0) add(why, el("span", "chip ok", t("most likely")));
         add(why, el("span", null, (i === 0 ? " " : "") + (c.why || "")));
         add(main, why);
 
-        var det = numOr(c.pulse_count, 0) + " pulses · "
-          + (numOr(c.airtime_us, 0) / 1000).toFixed(1) + " ms · base "
-          + numOr(c.base_us, 0) + " µs";
+        var det = t("{pulses} pulses · {ms} ms · base {base} µs", {
+          pulses: numOr(c.pulse_count, 0),
+          ms: (numOr(c.airtime_us, 0) / 1000).toFixed(1),
+          base: numOr(c.base_us, 0)
+        });
         if (c.merged && c.frames && c.frames.length) {
-          det += " · rejoined from frames " + c.frames.join(" + ");
+          det += t(" · rejoined from frames {list}", { list: c.frames.join(" + ") });
         }
-        if (c.truncated) det += " · TRUNCATED at the 512-pulse limit";
+        if (c.truncated) det += t(" · TRUNCATED at the 512-pulse limit");
         add(main, el("div", "li-sub", det));
         add(b, main);
 
@@ -1914,9 +2140,9 @@ function openListenFlow(opts) {
       var total = numOr(st.candidates_total, list.length);
       if (total > list.length) {
         add(candWrap, el("div", "hint",
-          "Showing the top " + list.length + " of " + total + " candidates. The rest "
-          + "were heard fewer times still — if none of these is yours, the frame list "
-          + "below has everything."));
+          t("Showing the top {n} of {total} candidates. The rest were heard fewer times "
+          + "still — if none of these is yours, the frame list below has everything.",
+          { n: list.length, total: total })));
       }
     }
 
@@ -1929,11 +2155,11 @@ function openListenFlow(opts) {
       if (!frames.length) return;
 
       var head = $("summary", allSec);
-      if (head) head.textContent = "Every frame recorded (" + frames.length + ")";
+      if (head) head.textContent = t("Every frame recorded ({n})", { n: frames.length });
       add(allWrap, el("div", "hint",
-        "Every frame exactly as it arrived, in order, with nothing grouped or ranked. "
+        t("Every frame exactly as it arrived, in order, with nothing grouped or ranked. "
         + "The list above is built from these — this is here so grouping can never hide "
-        + "something from you."));
+        + "something from you.")));
 
       var ul = el("ul", "list");
       frames.forEach(function (f) {
@@ -1941,15 +2167,18 @@ function openListenFlow(opts) {
         var b = el("button", "listitem"); b.type = "button";
         add(b, el("span", "li-ico", f.decoded ? "🔎" : "〰️"));
         var main = el("div", "li-main");
-        add(main, el("div", "li-title", "Frame " + f.index + " · "
-          + numOr(f.pulse_count, 0) + " pulses"));
+        add(main, el("div", "li-title", t("Frame {i} · {n} pulses",
+          { i: f.index, n: numOr(f.pulse_count, 0) })));
         add(main, el("div", "li-sub", (f.decoded && f.decoded.text)
           ? f.decoded.text
-          : "No decoder claimed this — still fully replayable"));
+          : t("No decoder claimed this — still fully replayable")));
         add(main, el("div", "li-sub",
-          (numOr(f.airtime_us, 0) / 1000).toFixed(1) + " ms · base "
-          + numOr(f.base_us, 0) + " µs · " + numOr(f.confidence, 0) + "% confidence"
-          + (f.truncated ? " · TRUNCATED at the 512-pulse limit" : "")));
+          t("{ms} ms · base {base} µs · {conf}% confidence{trunc}", {
+            ms: (numOr(f.airtime_us, 0) / 1000).toFixed(1),
+            base: numOr(f.base_us, 0),
+            conf: numOr(f.confidence, 0),
+            trunc: f.truncated ? t(" · TRUNCATED at the 512-pulse limit") : ""
+          })));
         add(b, main);
         var meta = el("div", "li-meta");
         add(meta, el("div", "mono", numOr(f.rssi_dbm, 0) + " dBm"));
@@ -1968,7 +2197,7 @@ function openListenFlow(opts) {
 
     startBtn.addEventListener("click", function () {
       startBtn.disabled = true;
-      setMsg(msg, "Starting…");
+      setMsg(msg, t("Starting…"));
       postJSON("/api/raw/start", {
         seconds: intOf(secSel, 30),
         idle_us: intOf(idleIn, 8000),
@@ -1976,7 +2205,7 @@ function openListenFlow(opts) {
         rssi_floor_dbm: intOf(floorSel, -80)
       }).then(function (st) {
         S.raw = st;
-        setMsg(msg, "Listening. Press your remote button now — several times.", "ok");
+        setMsg(msg, t("Listening. Press your remote button now — several times."), "ok");
         render(st, null);
         poll("raw", 1000, tick);
       }).catch(function (e) {
@@ -2020,8 +2249,9 @@ function openListenFlow(opts) {
  */
 function openWaveform(kind, id, onSaved) {
   var base = (kind === "candidate") ? "/api/raw/candidates/" : "/api/raw/";
-  var sh = openSheet((kind === "candidate") ? "Candidate " + id : "Frame " + id, null);
-  add(sh.body, el("div", "empty", "Loading…"));
+  var sh = openSheet((kind === "candidate") ? t("Candidate {id}", { id: id })
+                                            : t("Frame {id}", { id: id }), null);
+  add(sh.body, el("div", "empty", t("Loading…")));
 
   api(base + id).then(function (f) {
     clear(sh.body);
@@ -2031,24 +2261,27 @@ function openWaveform(kind, id, onSaved) {
 
     var chips = el("div", "chiprow");
     if (typeof f.seen === "number") {
-      add(chips, el("span", "chip ok", "seen " + f.seen + "×"));
+      add(chips, el("span", "chip ok", t("seen {n}×", { n: f.seen })));
     }
-    if (f.merged) add(chips, el("span", "chip accent", "🧩 rejoined from " + (f.frames || []).length + " pieces"));
+    if (f.merged) add(chips, el("span", "chip accent", t("🧩 rejoined from {n} pieces", { n: (f.frames || []).length })));
     if (f.decoded && f.decoded.text) add(chips, el("span", "chip accent mono", f.decoded.text));
-    else add(chips, el("span", "chip warn", "Unknown protocol — raw pulses only"));
+    else add(chips, el("span", "chip warn", t("Unknown protocol — raw pulses only")));
     add(chips, el("span", "chip mono", numOr(f.rssi_dbm, 0) + " dBm"));
     add(chips, el("span", "chip mono", numOr(f.confidence, 0) + "%"));
-    if (f.truncated) add(chips, el("span", "chip bad", "truncated at 512 pulses"));
+    if (f.truncated) add(chips, el("span", "chip bad", t("truncated at 512 pulses")));
     add(sh.body, chips);
 
-    if (f.why) add(sh.body, el("div", "hint", "Ranked here because it was " + f.why + "."));
+    if (f.why) add(sh.body, el("div", "hint", t("Ranked here because it was {why}.", { why: f.why })));
     if (f.merged) {
       add(sh.body, el("div", "note",
-        "This is one transmission that the frame boundary cut into "
-        + (f.frames || []).length + " pieces (frames " + (f.frames || []).join(" + ")
-        + "), put back together with the silence actually measured between them — "
-        + (f.gaps_us || []).join(" µs, ") + " µs. It is a reconstruction, so test it "
-        + "before you keep it; the individual pieces are still listed on their own."));
+        t("This is one transmission that the frame boundary cut into {n} pieces (frames "
+        + "{frames}), put back together with the silence actually measured between them "
+        + "— {gaps} µs. It is a reconstruction, so test it before you keep it; the "
+        + "individual pieces are still listed on their own.", {
+          n: (f.frames || []).length,
+          frames: (f.frames || []).join(" + "),
+          gaps: (f.gaps_us || []).join(" µs, ")
+        })));
     }
 
     var plot = el("div");
@@ -2060,17 +2293,17 @@ function openWaveform(kind, id, onSaved) {
     var toNum = inputEl("number", n, { min: "1", max: String(n), step: "1" });
 
     var trim = el("div", "trim");
-    add(trim, field("Start at pulse", fromRange));
-    add(trim, field("End before pulse", toRange));
+    add(trim, field(t("Start at pulse"), fromRange));
+    add(trim, field(t("End before pulse"), toRange));
     var nums = el("div", "row");
-    add(nums, field("from", fromNum), field("to", toNum));
+    add(nums, field(t("from"), fromNum), field(t("to"), toNum));
     add(trim, nums);
     add(sh.body, trim);
     add(sh.body, el("div", "hint",
-      "Indices count from 0, and `to` is the first pulse NOT included — so 0 to "
-      + n + " is the whole thing. Levels alternate, so a selection starting on an odd "
+      t("Indices count from 0, and `to` is the first pulse NOT included — so 0 to {n} "
+      + "is the whole thing. Levels alternate, so a selection starting on an odd "
       + "index starts on the opposite level; the box accounts for that when it sends "
-      + "or saves, and the caption above says which."));
+      + "or saves, and the caption above says which.", { n: n })));
 
     function redraw() {
       clear(plot);
@@ -2107,13 +2340,13 @@ function openWaveform(kind, id, onSaved) {
     /* --- transmit the selection, without saving anything --- */
     var tmsg = el("div", "formmsg");
     var trow = el("div", "btnrow");
-    var txBtn = el("button", "btn", "\u{1F4E1} Transmit selection");
+    var txBtn = el("button", "btn", t("\u{1F4E1} Transmit selection"));
     txBtn.type = "button";
     add(trow, txBtn);
-    add(sh.body, el("div", "lg-label", "Try it"));
+    add(sh.body, el("div", "lg-label", t("Try it")));
     add(sh.body, el("div", "hint",
-      "Sends the selected pulses straight out, without storing anything. This is the "
-      + "loop: send, listen at the bell, adjust the trim, send again."));
+      t("Sends the selected pulses straight out, without storing anything. This is the "
+      + "loop: send, listen at the bell, adjust the trim, send again.")));
     add(sh.body, trow, tmsg);
     var block = txBlockNote();
     if (block) add(sh.body, block);
@@ -2122,43 +2355,43 @@ function openWaveform(kind, id, onSaved) {
     txBtn.addEventListener("click", function () {
       var old = txBtn.textContent;
       txBtn.disabled = true;
-      txBtn.textContent = "Sending…";
+      txBtn.textContent = t("Sending…");
       setMsg(tmsg, "");
       postJSON(base + id + "/transmit", { from: from, to: to })
         .then(function (res) {
-          txBtn.textContent = "Sent ✓";
+          txBtn.textContent = t("Sent ✓");
           setTimeout(function () { txBtn.textContent = old; txBtn.disabled = false; }, 1400);
-          setMsg(tmsg, numOr(res.pulse_count, to - from) + " pulses × "
-            + numOr(res.repeats, 0) + ". This only confirms the pulses left the radio — "
-            + "it cannot know whether a receiver reacted.", "ok");
+          setMsg(tmsg, t("{pulses} pulses × {repeats}. This only confirms the pulses left "
+            + "the radio — it cannot know whether a receiver reacted.",
+            { pulses: numOr(res.pulse_count, to - from), repeats: numOr(res.repeats, 0) }), "ok");
         }).catch(function (e) {
           txBtn.textContent = old;
           txBtn.disabled = false;
-          if (e.status === 503) { S.txBlock = e.message; renderTxNote(); }
+          if (e.status === 503) { S.txBlock = e.message; S.txBlockKind = "api"; renderTxNote(); }
           setMsg(tmsg, e.message, "err");
         });
     });
 
     /* --- promote it to a stored signal --- */
     add(sh.body, el("div", "divider"));
-    add(sh.body, el("div", "lg-label", "Keep it"));
+    add(sh.body, el("div", "lg-label", t("Keep it")));
     add(sh.body, el("div", "hint",
-      "Saves the SELECTION as an ordinary stored signal: it can then be bound to a node, "
-      + "renamed, transmitted and matched against like any other — decoded or not."));
-    var nameIn = inputEl("text", "", { maxlength: "31", placeholder: "e.g. Front door" });
-    add(sh.body, field("Name", nameIn));
+      t("Saves the SELECTION as an ordinary stored signal: it can then be bound to a node, "
+      + "renamed, transmitted and matched against like any other — decoded or not.")));
+    var nameIn = inputEl("text", "", { maxlength: "31", placeholder: t("e.g. Front door") });
+    add(sh.body, field(t("Name"), nameIn));
     var smsg = el("div", "formmsg");
     var foot = el("div", "formfoot");
-    var saveBtn = el("button", "btn primary", "Save as signal");
+    var saveBtn = el("button", "btn primary", t("Save as signal"));
     saveBtn.type = "button";
     saveBtn.addEventListener("click", function () {
       var nm = trimOf(nameIn);
-      if (!nm) { setMsg(smsg, "Give it a name first.", "err"); nameIn.focus(); return; }
+      if (!nm) { setMsg(smsg, t("Give it a name first."), "err"); nameIn.focus(); return; }
       saveBtn.disabled = true;
-      setMsg(smsg, "Saving…");
+      setMsg(smsg, t("Saving…"));
       postJSON(base + id + "/save", { name: nm, from: from, to: to })
         .then(function (sig) {
-          setMsg(smsg, "Saved as “" + sig.name + "”.", "ok");
+          setMsg(smsg, t("Saved as “{name}”.", { name: sig.name }), "ok");
           if (onSaved) onSaved(sig);
           setTimeout(function () { sh.close(); }, 700);
         }).catch(function (e) {
@@ -2170,14 +2403,14 @@ function openWaveform(kind, id, onSaved) {
     add(sh.body, foot);
   }).catch(function (e) {
     clear(sh.body);
-    add(sh.body, el("div", "note bad", "Could not load this waveform: " + e.message));
+    add(sh.body, el("div", "note bad", t("Could not load this waveform: {msg}", { msg: e.message })));
   });
 }
 
 /* The one entry-point button, so its wording cannot drift between the places it
    appears. */
 function listenButton(label, onDone) {
-  var b = el("button", "btn", label || "\u{1F3A7} Listen for a button");
+  var b = el("button", "btn", label || t("\u{1F3A7} Listen for a button"));
   b.type = "button";
   b.addEventListener("click", function () {
     openListenFlow({}).then(function (sig) { if (onDone) onDone(sig); });
@@ -2269,9 +2502,23 @@ var NODE_TYPES = [
           "Its lamp lights whenever the chain reaches it, and its timeline shows the last " +
           "10 minutes of hits." }
 ];
-function nodeType(t) {
-  for (var i = 0; i < NODE_TYPES.length; i++) if (NODE_TYPES[i].t === t) return NODE_TYPES[i];
-  return { t: t, g: "logic", label: t || "unknown", ico: "⚙", help: "" };
+/* NODE_TYPES above holds ENGLISH text because that text is the translation key
+   (see the i18n block at the top). It is a top-level `var`, evaluated once when
+   the file loads, so it must never be translated in place — the language can
+   change afterwards. Translation happens HERE, on every lookup, which is what
+   makes a language switch redraw the palette, the cards and the handbook in the
+   new language without a reload.
+
+   `.t` (the wire name, "logic.switch") and `.g` (the group) are identifiers,
+   not copy, and stay exactly as they are. */
+function nodeType(type) {
+  for (var i = 0; i < NODE_TYPES.length; i++) {
+    if (NODE_TYPES[i].t === type) {
+      var d = NODE_TYPES[i];
+      return { t: d.t, g: d.g, ico: d.ico, label: t(d.label), help: t(d.help) };
+    }
+  }
+  return { t: type, g: "logic", label: type || t("unknown"), ico: "⚙", help: "" };
 }
 function nodeById(id) {
   var ns = (S.graph && S.graph.nodes) || [];
@@ -2280,11 +2527,11 @@ function nodeById(id) {
 }
 function nodeName(id) {
   var n = nodeById(id);
-  return n ? (n.name || nodeType(n.type).label) : ("node " + id);
+  return n ? (n.name || nodeType(n.type).label) : t("node {id}", { id: id });
 }
 function signalName(id) {
   var list = S.signals || [];
-  for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i].name || ("Signal " + id);
+  for (var i = 0; i < list.length; i++) if (list[i].id === id) return list[i].name || t("Signal {id}", { id: id });
   return null;
 }
 /* Ports follow from the group, with no exceptions left: a source has no input,
@@ -2346,47 +2593,48 @@ var TOPIC_MAX = 47;
  * so they are refused rather than silently made into a topic nobody can read.
  */
 function topicError(value, fieldName, maxLen) {
-  var t = String(value === null || value === undefined ? "" : value);
-  var f = fieldName || "topic";
+  var val = String(value === null || value === undefined ? "" : value);
+  var f = fieldName || t("topic");
   var max = maxLen || TOPIC_MAX;
 
   /* Empty is the caller's business, not a syntax error: on a node it means "no
      MQTT", in Settings it means "use the default". */
-  if (t.length === 0) return "";
+  if (val.length === 0) return "";
 
-  if (t.length > max)
-    return '"' + f + '" is too long: ' + t.length +
-           " characters, the limit is " + max + ".";
+  if (val.length > max)
+    return t("\"{field}\" is too long: {len} characters, the limit is {max}.",
+             { field: f, len: val.length, max: max });
 
-  if (t.charAt(0) === "/")
-    return '"' + f + "\" must not start with '/' \u2014 a leading slash makes an " +
-           "empty first topic level. The box adds the separators itself.";
+  if (val.charAt(0) === "/")
+    return t("\"{field}\" must not start with '/' \u2014 a leading slash makes an " +
+             "empty first topic level. The box adds the separators itself.", { field: f });
 
-  for (var i = 0; i < t.length; i++) {
-    var ch = t.charAt(i);
-    var c = t.charCodeAt(i);
+  for (var i = 0; i < val.length; i++) {
+    var ch = val.charAt(i);
+    var c = val.charCodeAt(i);
 
     if (ch === "#" || ch === "+")
-      return '"' + f + "\" contains '" + ch + "', which is an MQTT wildcard. A " +
-             "message cannot be published to a topic containing '#' or '+' \u2014 " +
-             "the broker refuses it.";
+      return t("\"{field}\" contains '{ch}', which is an MQTT wildcard. A " +
+               "message cannot be published to a topic containing '#' or '+' \u2014 " +
+               "the broker refuses it.", { field: f, ch: ch });
 
     if (c < 0x20 || c >= 0x7F) {
       var hex = c.toString(16).toUpperCase();
       if (hex.length < 2) hex = "0" + hex;
-      return '"' + f + '" contains a non-printable character (byte 0x' + hex +
-             ") at position " + (i + 1) + ". Only plain printable ASCII is allowed.";
+      return t("\"{field}\" contains a non-printable character (byte 0x{hex}) " +
+               "at position {pos}. Only plain printable ASCII is allowed.",
+               { field: f, hex: hex, pos: i + 1 });
     }
 
-    if (ch === "/" && t.charAt(i + 1) === "/")
-      return '"' + f + "\" contains an empty level ('//') at position " + (i + 1) +
-             ". That is legal MQTT but almost always a typo, so it is refused " +
-             "rather than producing a topic nobody can read.";
+    if (ch === "/" && val.charAt(i + 1) === "/")
+      return t("\"{field}\" contains an empty level ('//') at position {pos}. " +
+               "That is legal MQTT but almost always a typo, so it is refused " +
+               "rather than producing a topic nobody can read.", { field: f, pos: i + 1 });
   }
 
-  if (t.charAt(t.length - 1) === "/")
-    return '"' + f + "\" must not end with '/' \u2014 a trailing slash makes an " +
-           "empty last topic level.";
+  if (val.charAt(val.length - 1) === "/")
+    return t("\"{field}\" must not end with '/' \u2014 a trailing slash makes an " +
+             "empty last topic level.", { field: f });
 
   return "";
 }
@@ -2406,11 +2654,11 @@ function topicError(value, fieldName, maxLen) {
  * something somebody could legitimately want to publish to.
  */
 function exposeField(n, onChange) {
-  var f = checkField("Expose to Home Assistant / MQTT", n.mqtt_enabled !== false,
-    "On by default. Uncheck it and this node disappears from MQTT completely \u2014 nothing " +
-    "subscribed, nothing published, and its Home Assistant entity removed rather than left " +
-    "behind permanently unavailable. Inside the graph nothing changes: it still fires, still " +
-    "gates, still works from this page and the REST API.");
+  var f = checkField(t("Expose to Home Assistant / MQTT"), n.mqtt_enabled !== false,
+    t("On by default. Uncheck it and this node disappears from MQTT completely \u2014 nothing " +
+      "subscribed, nothing published, and its Home Assistant entity removed rather than left " +
+      "behind permanently unavailable. Inside the graph nothing changes: it still fires, still " +
+      "gates, still works from this page and the REST API."));
   f.classList.add("full");
   f.input.addEventListener("change", onChange);
   return f;
@@ -2444,9 +2692,9 @@ function bindTopicCheck(input, errEl, field, after) {
 
 /* "outside_bell" -> "Outside bell". Mirrors what the firmware does when a
    switch node still carries its default name: the topic becomes the label. */
-function prettyTopic(t) {
-  var s = String(t || "").replace(/[_\-/]+/g, " ").trim();
-  return s ? s.charAt(0).toUpperCase() + s.slice(1) : "Switch";
+function prettyTopic(topic) {
+  var s = String(topic || "").replace(/[_\-/]+/g, " ").trim();
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : t("Switch");
 }
 
 function isSwitch(n) { return !!n && n.type === "logic.switch"; }
@@ -2465,10 +2713,10 @@ function linkBlocked(a, b) {
    does NOT rewrite flash on every toggle (see docs/API.md). */
 function setSwitch(n, on, btn, msgNode) {
   if (btn) btn.disabled = true;
-  setMsg(msgNode, on ? "Switching on…" : "Switching off…");
+  setMsg(msgNode, on ? t("Switching on…") : t("Switching off…"));
   return postJSON("/api/graph/nodes/" + n.id + "/switch", { on: !!on })
     .then(function () {
-      setMsg(msgNode, on ? "On — this path conducts again." : "Off — this path is blocked.", "ok");
+      setMsg(msgNode, on ? t("On — this path conducts again.") : t("Off — this path is blocked."), "ok");
       return loadGraph().then(function () { return true; });
     }).catch(function (e) {
       setMsg(msgNode, e.message, "err");
@@ -2490,10 +2738,10 @@ function linkExists(from, to) {
    not a second one that could drift out of step with it. */
 function deleteNodeConfirmed(n, onError, onDone) {
   var ty = nodeType(n.type);
-  return confirmSheet("Delete “" + (n.name || ty.label) + "”?",
-    ["The node and every link to or from it are removed.",
-     "Stored signals are NOT touched — nothing has to be learned again."],
-    "Delete node", true).then(function (ok) {
+  return confirmSheet(t("Delete “{name}”?", { name: n.name || ty.label }),
+    [t("The node and every link to or from it are removed."),
+     t("Stored signals are NOT touched — nothing has to be learned again.")],
+    t("Delete node"), true).then(function (ok) {
     if (!ok) return false;
     return api("/api/graph/nodes/" + n.id, { method: "DELETE" }).then(function () {
       if (onDone) onDone();
@@ -2542,7 +2790,7 @@ function monitorLamp(id, cls) {
   var s = el("span", "lamp" + (cls ? " " + cls : ""));
   s.setAttribute("data-monlamp", id);
   s.setAttribute("role", "img");
-  s.setAttribute("aria-label", "Monitor indicator");
+  s.setAttribute("aria-label", t("Monitor indicator"));
   return s;
 }
 
@@ -2572,8 +2820,9 @@ function monitorTimeline(id) {
   svg.setAttribute("preserveAspectRatio", "none");
   svg.setAttribute("role", "img");
   svg.setAttribute("aria-label",
-    hits.length ? (hits.length + " hits in the last " + Math.round(win / 60) + " minutes")
-                : ("No hits in the last " + Math.round(win / 60) + " minutes"));
+    hits.length ? t("{n} hits in the last {min} minutes",
+                    { n: hits.length, min: Math.round(win / 60) })
+                : t("No hits in the last {min} minutes", { min: Math.round(win / 60) }));
 
   /* One tick a minute: enough to read "about four minutes ago" off the strip
      without turning it into graph paper. */
@@ -2585,8 +2834,8 @@ function monitorTimeline(id) {
   }
 
   var drawn = 0;
-  hits.forEach(function (t) {
-    var age = now - t;
+  hits.forEach(function (hit) {
+    var age = now - hit;
     if (age < 0) age = 0;
     if (age > win) return;
     /* A 3 s hold is 0.5% of a ten-minute strip — under two pixels on a phone,
@@ -2599,7 +2848,7 @@ function monitorTimeline(id) {
     r.setAttribute("width", w.toFixed(1)); r.setAttribute("height", H - 6);
     r.setAttribute("rx", "2");
     var tip = svgEl("title");
-    tip.textContent = shortDur(age) + " ago";
+    tip.textContent = t("{ago} ago", { ago: shortDur(age) });
     add(r, tip);
     add(svg, r);
     drawn++;
@@ -2607,17 +2856,18 @@ function monitorTimeline(id) {
   add(box, svg);
 
   var ax = el("div", "montl-axis");
-  add(ax, el("span", null, Math.round(win / 60) + " min ago"));
+  add(ax, el("span", null, t("{min} min ago", { min: Math.round(win / 60) })));
   add(ax, el("span", null,
-    drawn ? (drawn + (hits.length > drawn ? "+" : "") + (drawn === 1 ? " hit" : " hits")) : ""));
-  add(ax, el("span", null, "now"));
+    drawn ? t(drawn === 1 ? "{n} hit" : "{n} hits",
+              { n: drawn + (hits.length > drawn ? "+" : "") }) : ""));
+  add(ax, el("span", null, t("now")));
   add(box, ax);
 
   if (!drawn) {
     add(box, el("div", "montl-empty",
-      S.monitor ? "Nothing yet — this monitor has not fired in the last "
-                  + Math.round(win / 60) + " minutes."
-                : "Waiting for the box…"));
+      S.monitor ? t("Nothing yet — this monitor has not fired in the last {min} minutes.",
+                    { min: Math.round(win / 60) })
+                : t("Waiting for the box…")));
   }
   return box;
 }
@@ -2646,9 +2896,9 @@ function refreshMonitors() {
    waiting out the next poll tick. */
 function fireNode(id, btn, msgNode) {
   if (btn) btn.disabled = true;
-  setMsg(msgNode, "Firing…");
+  setMsg(msgNode, t("Firing…"));
   return postJSON("/api/graph/nodes/" + id + "/fire", {}).then(function () {
-    setMsg(msgNode, "Fired. Watch the monitors and the Activity feed for what it triggered.", "ok");
+    setMsg(msgNode, t("Fired. Watch the monitors and the Activity feed for what it triggered."), "ok");
     if (S.has.monitor && monitorNodes().length) setTimeout(loadMonitor, 120);
     return true;
   }).catch(function (e) {
@@ -2675,8 +2925,8 @@ function buildDashboard() {
      exactly this — and what is left is a title and one clause. */
   var p = el("div", "panel");
   var h = el("div", "panel-head");
-  add(h, el("h2", null, "Your box, as a flow"));
-  add(h, el("p", "hint", "Events run left to right. Tap a node to edit it."));
+  add(h, el("h2", null, t("Your box, as a flow")));
+  add(h, el("p", "hint", t("Events run left to right. Tap a node to edit it.")));
   add(p, h);
 
   /* The two things that make the whole screen a lie if they are wrong: no
@@ -2697,7 +2947,7 @@ function buildDashboard() {
      inside the canvas panel, which meant two toolbars stacked above the map for
      no reason other than where the code that built them happened to be. */
   var topRow = el("div", "row toolbar");
-  var addBtn = el("button", "btn primary", "➕ Add node");
+  var addBtn = el("button", "btn primary", t("➕ Add node"));
   addBtn.type = "button";
   addBtn.addEventListener("click", openAddNode);
   add(topRow, addBtn);
@@ -2710,8 +2960,8 @@ function buildDashboard() {
      while on a phone it is a cramped picture you cannot edit. An explicit
      choice is remembered and wins on screens wide enough to honour it. */
   autoEls.viewSwitch = el("div", "segmented graph-viewswitch");
-  var bList = el("button", null, "List"); bList.type = "button";
-  var bMap = el("button", null, "Map"); bMap.type = "button";
+  var bList = el("button", null, t("List")); bList.type = "button";
+  var bMap = el("button", null, t("Map")); bMap.type = "button";
   autoEls.bList = bList; autoEls.bMap = bMap;
   bList.addEventListener("click", function () { setGraphView("list", bList, bMap, true); });
   bMap.addEventListener("click", function () { setGraphView("map", bList, bMap, true); });
@@ -2733,7 +2983,7 @@ function buildDashboard() {
   autoEls.canvasWrap = el("div", "panel hidden");
   add(root, autoEls.canvasWrap);
   autoEls.empty = el("div", "empty",
-    "Nothing wired yet. Tap ➕ Add node and start with a Signal receiver for your doorbell.");
+    t("Nothing wired yet. Tap ➕ Add node and start with a Signal receiver for your doorbell."));
   add(root, autoEls.empty);
 
   setGraphView(defaultGraphView(), bList, bMap, false);
@@ -2851,7 +3101,7 @@ function renderStatusChips(err) {
     /* Everything else on the row would be the last known value of a box that
        is no longer answering, which is the one thing a status row must not
        show. So the row collapses to the single true statement. */
-    setHdrChip(hdrChips.radio, "● Box not reachable", "bad");
+    setHdrChip(hdrChips.radio, t("● Box not reachable"), "bad");
     setHdrChip(hdrChips.part, null);
     setHdrChip(hdrChips.freq, null);
     setHdrChip(hdrChips.floor, null);
@@ -2862,8 +3112,8 @@ function renderStatusChips(err) {
   }
 
   var radio = sys.radio || {};
-  if (radio.present === false) setHdrChip(hdrChips.radio, "● No radio", "bad");
-  else setHdrChip(hdrChips.radio, "● Radio listening", "ok");
+  if (radio.present === false) setHdrChip(hdrChips.radio, t("● No radio"), "bad");
+  else setHdrChip(hdrChips.radio, t("● Radio listening"), "ok");
 
   setHdrChip(hdrChips.part, typeof radio.version === "number"
     ? ("CC1101 v0x" + (radio.version || 0).toString(16) + " p" + numOr(radio.partnum, 0))
@@ -2872,10 +3122,11 @@ function renderStatusChips(err) {
   setHdrChip(hdrChips.freq,
     (S.radio && typeof S.radio.freq_hz === "number") ? fmtHz(S.radio.freq_hz) : null);
   setHdrChip(hdrChips.floor,
-    (S.radio && typeof S.radio.rssi_dbm === "number") ? (S.radio.rssi_dbm + " dBm floor") : null);
+    (S.radio && typeof S.radio.rssi_dbm === "number")
+      ? t("{dbm} dBm floor", { dbm: S.radio.rssi_dbm }) : null);
 
   setHdrChip(hdrChips.wifi,
-    sys.sta_connected ? ("Wi-Fi " + (sys.sta_ssid || "?")) : "AP only",
+    sys.sta_connected ? ("Wi-Fi " + (sys.sta_ssid || "?")) : t("AP only"),
     sys.sta_connected ? "ok" : "warn");
 
   /* Only when MQTT is switched on. A chip reading "MQTT off" on the majority of
@@ -2896,7 +3147,7 @@ function renderStatusChips(err) {
 function tickUptimeChip() {
   if (!hdrChips.up || S.recovery) return;
   var up = uptimeNow();
-  setHdrChip(hdrChips.up, up === null ? null : ("up " + durText(up)));
+  setHdrChip(hdrChips.up, up === null ? null : t("up {d}", { d: durText(up) }));
 }
 
 /* ------------------------------------------------------- dashboard notes --
@@ -2913,14 +3164,14 @@ function renderDashNotes() {
   var radio = sys.radio || {};
   if (radio.present === false) {
     add(note, el("div", "note bad",
-      "The CC1101 module did not answer on SPI, so this box can neither receive nor " +
-      "transmit. Check the 3V3/GND and the four SPI wires, then open Diagnostics for " +
-      "the exact probe result."));
+      t("The CC1101 module did not answer on SPI, so this box can neither receive nor " +
+        "transmit. Check the 3V3/GND and the four SPI wires, then open Diagnostics for " +
+        "the exact probe result.")));
   } else if (!sys.sta_connected) {
     add(note, el("div", "note warn",
-      "No home Wi-Fi connection. The box works normally over its own access point " +
-      (sys.ap_ssid ? "(" + sys.ap_ssid + ") " : "") +
-      "but is not reachable from your LAN. Add a network under Settings."));
+      t("No home Wi-Fi connection. The box works normally over its own access point " +
+        "{ap}but is not reachable from your LAN. Add a network under Settings.",
+        { ap: sys.ap_ssid ? "(" + sys.ap_ssid + ") " : "" })));
   }
 }
 
@@ -2965,32 +3216,32 @@ function buildActivity() {
 
   var p = el("div", "panel");
   var h = el("div", "panel-head");
-  add(h, el("h2", null, "Activity"));
+  add(h, el("h2", null, t("Activity")));
   add(h, el("p", null,
-    "Everything the receiver hears and everything the nodes do about it, as it happens. " +
-    "The radio listens continuously; a listening session only decides what happens to a " +
-    "signal it does not recognise."));
+    t("Everything the receiver hears and everything the nodes do about it, as it happens. " +
+      "The radio listens continuously; a listening session only decides what happens to a " +
+      "signal it does not recognise.")));
   add(p, h);
 
   var tools = el("div", "feedtools");
 
-  actEls.feedSearch = inputEl("search", "", { placeholder: "Search activity…" });
-  actEls.feedSearch.setAttribute("aria-label", "Search activity");
+  actEls.feedSearch = inputEl("search", "", { placeholder: t("Search activity…") });
+  actEls.feedSearch.setAttribute("aria-label", t("Search activity"));
   actEls.feedSearch.addEventListener("input", renderFeed);
 
   actEls.feedKind = selectEl(
-    [{ value: "", label: "All kinds" }].concat(
+    [{ value: "", label: t("All kinds") }].concat(
       Object.keys(EVENT_KINDS).map(function (k) {
-        return { value: k, label: EVENT_KINDS[k].ico + " " + EVENT_KINDS[k].label };
+        return { value: k, label: EVENT_KINDS[k].ico + " " + t(EVENT_KINDS[k].label) };
       })), "");
-  actEls.feedKind.setAttribute("aria-label", "Filter by kind");
+  actEls.feedKind.setAttribute("aria-label", t("Filter by kind"));
   actEls.feedKind.addEventListener("change", renderFeed);
 
   /* One tap back to everything. Without it, clearing a filter on a phone means
      selecting the search text and deleting it AND remembering the kind select
      is still set — two operations to undo what one tap set up. It hides itself
      when nothing is filtered, so it is never a control that does nothing. */
-  actEls.feedClear = el("button", "btn feedclear", "✕ Clear");
+  actEls.feedClear = el("button", "btn feedclear", t("✕ Clear"));
   actEls.feedClear.type = "button";
   actEls.feedClear.addEventListener("click", function () {
     actEls.feedSearch.value = "";
@@ -3007,7 +3258,7 @@ function buildActivity() {
 
   actEls.feed = el("ul", "feed");
   add(p, actEls.feed);
-  actEls.feedEmpty = el("div", "empty", "Nothing heard yet. Press a doorbell button.");
+  actEls.feedEmpty = el("div", "empty", t("Nothing heard yet. Press a doorbell button."));
   add(p, actEls.feedEmpty);
   add(root, p);
 
@@ -3036,9 +3287,11 @@ function renderFeed() {
     if (kindSel && ev.kind !== kindSel) return false;
     if (!q) return true;
     var k = EVENT_KINDS[ev.kind];
-    /* Search the text, the kind's wire name and its human label, so both
-       "transmit" and "Transmit" find the same rows. */
-    var hay = ((ev.text || "") + " " + (ev.kind || "") + " " + (k ? k.label : "")).toLowerCase();
+    /* Search the text, the kind's wire name and its human label -- in BOTH
+       languages, so both "transmit" and "Transmit" find the same rows, and so a
+       German reader typing the word they can actually see finds it too. */
+    var hay = ((ev.text || "") + " " + (ev.kind || "") + " " +
+               (k ? k.label + " " + t(k.label) : "")).toLowerCase();
     return hay.indexOf(q) !== -1;
   });
 
@@ -3054,25 +3307,25 @@ function renderFeed() {
     clear(actEls.feedCount);
     if (S.events.length) {
       actEls.feedCount.textContent = filtering
-        ? (matched.length + " of " + S.events.length + " events")
-        : (S.events.length + " events, newest first");
+        ? t("{n} of {total} events", { n: matched.length, total: S.events.length })
+        : t("{n} events, newest first", { n: S.events.length });
     }
   }
 
   actEls.feedEmpty.classList.toggle("hidden", matched.length > 0);
   if (matched.length === 0)
     actEls.feedEmpty.textContent = filtering
-      ? "Nothing in the feed matches that filter."
-      : "Nothing heard yet. Press a doorbell button.";
+      ? t("Nothing in the feed matches that filter.")
+      : t("Nothing heard yet. Press a doorbell button.");
 
   shown.forEach(function (ev) {
     var kind = EVENT_KINDS[ev.kind] || { ico: "·", label: ev.kind || "event" };
     var li = el("li", "feeditem k-" + (ev.kind || "other"));
     add(li, el("div", "fi-ico", kind.ico));
     var body = el("div", "fi-body");
-    add(body, el("div", "fi-text", ev.text || kind.label));
+    add(body, el("div", "fi-text", ev.text || t(kind.label)));
     var meta = [];
-    if (ev.kind && !ev.text) meta.push(kind.label);
+    if (ev.kind && !ev.text) meta.push(t(kind.label));
     else if (ev.kind) meta.push(ev.kind);
     if (typeof ev.rssi_dbm === "number") meta.push(ev.rssi_dbm + " dBm");
     if (typeof ev.repeats === "number" && ev.repeats) meta.push(ev.repeats + "x");
@@ -3146,7 +3399,8 @@ function renderGraph(err) {
   var wrap = clear(autoEls.listWrap);
 
   if (err) {
-    add(wrap, el("div", "note bad", "Could not read the node graph: " + err.message));
+    add(wrap, el("div", "note bad",
+      t("Could not read the node graph: {msg}", { msg: err.message })));
     autoEls.empty.classList.add("hidden");
     return;
   }
@@ -3189,57 +3443,57 @@ function nodeSummary(n) {
        appear only on the sender, because they are the only node they act on. */
     case "signal.rx": {
       var rn = signalName(n.signal_id);
-      if (!rn) return n.signal_id ? "Signal " + n.signal_id + " (missing from the store)"
-                                  : "No signal chosen yet";
-      return rn + " · fires when this code is heard on air";
+      if (!rn) return n.signal_id ? t("Signal {id} (missing from the store)", { id: n.signal_id })
+                                  : t("No signal chosen yet");
+      return t("{name} · fires when this code is heard on air", { name: rn });
     }
     case "signal.tx": {
       var tn = signalName(n.signal_id);
-      if (!tn) return n.signal_id ? "Signal " + n.signal_id + " (missing from the store)"
-                                  : "No signal chosen yet";
-      return tn + " · sends this code when triggered (" +
-             numOr(n.repeats, 6) + "x, " + numOr(n.gap_us, 8000) + " us gap)";
+      if (!tn) return n.signal_id ? t("Signal {id} (missing from the store)", { id: n.signal_id })
+                                  : t("No signal chosen yet");
+      return t("{name} · sends this code when triggered ({repeats}x, {gap} us gap)",
+               { name: tn, repeats: numOr(n.repeats, 6), gap: numOr(n.gap_us, 8000) });
     }
     case "source.gpio":
-      return (n.gpio_pin >= 0 ? "GPIO " + n.gpio_pin : "No pin chosen") +
-        " · " + (n.gpio_active_low === false ? "active high" : "active low") +
-        " · " + numOr(n.gpio_debounce_ms, 50) + " ms debounce";
+      return (n.gpio_pin >= 0 ? "GPIO " + n.gpio_pin : t("No pin chosen")) +
+        " · " + (n.gpio_active_low === false ? t("active high") : t("active low")) +
+        " · " + t("{ms} ms debounce", { ms: numOr(n.gpio_debounce_ms, 50) });
     case "source.virtual":
       /* No new badge and no extra line: the subtitle already had a slot for the
          topic, and naming a topic nothing is listening on would be a lie. */
-      if (n.mqtt_enabled === false) return "Not on MQTT · fired from this page or the REST API";
+      if (n.mqtt_enabled === false) return t("Not on MQTT · fired from this page or the REST API");
       return n.topic
-        ? ("MQTT trigger: " + mqttTriggerTopic(n.topic))
-        : "Fired from this page or the REST API only";
+        ? t("MQTT trigger: {topic}", { topic: mqttTriggerTopic(n.topic) })
+        : t("Fired from this page or the REST API only");
     case "source.any_rf":
-      return "Fires on every received burst — registered buttons and strangers alike";
+      return t("Fires on every received burst — registered buttons and strangers alike");
     /* The window is named only where it is used. Printing "window 1 s" beside
        mode ANY described a rule the firmware does not have: ANY passes the
        first thing through immediately and never looks at the clock. */
     case "logic.group":
       return n.group_mode === "all"
-        ? ("ALL — fires only when every input has fired within " + numOr(n.window_s, 1) + " s")
-        : "ANY — a merge point: anything arriving passes straight through";
+        ? t("ALL — fires only when every input has fired within {s} s", { s: numOr(n.window_s, 1) })
+        : t("ANY — a merge point: anything arriving passes straight through");
     case "logic.throttle":
-      return "Rings once, then ignores presses for " + numOr(n.window_s, 10) + " s";
+      return t("Rings once, then ignores presses for {s} s", { s: numOr(n.window_s, 10) });
     case "logic.repeat": {
       /* "1x" would read as a setting the user got wrong; it is a legal
          pass-through, so say what it actually does. */
       var times = numOr(n.repeats, 3);
       return times <= 1
-        ? "Passes through once (no repeat)"
-        : "Rings " + times + "x total, " + numOr(n.window_s, 5) + " s apart";
+        ? t("Passes through once (no repeat)")
+        : t("Rings {times}x total, {s} s apart", { times: times, s: numOr(n.window_s, 5) });
     }
     case "logic.switch":
-      return (switchOn(n) ? "ON — events pass through" : "OFF — everything past it is blocked") +
-             (n.mqtt_enabled === false ? " · not on MQTT"
-               : (n.topic ? (" · " + mqttSwitchTopic(n.topic, "set")) : " · no MQTT topic"));
+      return (switchOn(n) ? t("ON — events pass through") : t("OFF — everything past it is blocked")) +
+             (n.mqtt_enabled === false ? " · " + t("not on MQTT")
+               : (n.topic ? (" · " + mqttSwitchTopic(n.topic, "set")) : " · " + t("no MQTT topic")));
     case "sink.mqtt":
-      if (n.mqtt_enabled === false) return "Not on MQTT — publishes nothing";
-      return n.topic ? ("Publishes to " + mqttPublishTopic(n.topic)) : "No topic set";
+      if (n.mqtt_enabled === false) return t("Not on MQTT — publishes nothing");
+      return n.topic ? t("Publishes to {topic}", { topic: mqttPublishTopic(n.topic) }) : t("No topic set");
     case "sink.monitor":
-      return "Watches only — nothing is sent or published. Lamp stays lit " +
-             numOr(n.window_s, 3) + " s per hit.";
+      return t("Watches only — nothing is sent or published. Lamp stays lit {s} s per hit.",
+               { s: numOr(n.window_s, 3) });
     default:
       return "";
   }
@@ -3279,8 +3533,8 @@ function nodeCard(n, links) {
   add(wrapT, main, el("div", "node-type", ty.label));
   add(head, wrapT);
   if (sw) add(head, el("span", "chip " + (switchOn(n) ? "ok" : "bad"),
-                       switchOn(n) ? "ON" : "OFF"));
-  else if (n.enabled === false) add(head, el("span", "chip warn", "disabled"));
+                       switchOn(n) ? t("ON") : t("OFF")));
+  else if (n.enabled === false) add(head, el("span", "chip warn", t("disabled")));
   /* The lamp belongs in the head, beside the name: on a phone the list IS the
      diagram, so this is where you watch a chain fire. */
   if (isMonitor(n)) add(head, monitorLamp(n.id));
@@ -3298,12 +3552,12 @@ function nodeCard(n, links) {
   var ins = links.filter(function (l) { return l.to === n.id; });
   var outs = links.filter(function (l) { return l.from === n.id; });
 
-  if (hasInput(n)) add(c, linkGroup("Inputs", ins, n, "in"));
-  if (hasOutput(n)) add(c, linkGroup("Outputs", outs, n, "out"));
+  if (hasInput(n)) add(c, linkGroup(t("Inputs"), ins, n, "in"));
+  if (hasOutput(n)) add(c, linkGroup(t("Outputs"), outs, n, "out"));
 
   var msg = el("div", "formmsg");
   var row = el("div", "btnrow");
-  var edit = el("button", "btn", "Edit");
+  var edit = el("button", "btn", t("Edit"));
   edit.type = "button";
   edit.addEventListener("click", function () { openNodeEditor(n); });
   /* Firing a node makes that node do ITS OWN thing, and since the split there
@@ -3326,19 +3580,19 @@ function nodeCard(n, links) {
        walks straight past the very thing the node exists to control, so it
        would be a button that lies. */
     fire = el("button", "btn " + (switchOn(n) ? "danger" : "primary"),
-              switchOn(n) ? "Switch OFF" : "Switch ON");
+              switchOn(n) ? t("Switch OFF") : t("Switch ON"));
     fire.type = "button";
     fire.addEventListener("click", function () { setSwitch(n, !switchOn(n), fire, msg); });
   } else {
     fire = el("button", "btn" + (virt ? " primary" : ""),
-      virt ? "▶ Trigger"
-        : isSignalRx(n) ? "📥 Simulate heard"
-        : isSignalTx(n) ? "📡 Transmit now"
-        : "Test fire");
+      virt ? t("▶ Trigger")
+        : isSignalRx(n) ? t("📥 Simulate heard")
+        : isSignalTx(n) ? t("📡 Transmit now")
+        : t("Test fire"));
     fire.type = "button";
     fire.addEventListener("click", function () { fireNode(n.id, fire, msg); });
   }
-  var del = el("button", "btn danger", "Delete");
+  var del = el("button", "btn danger", t("Delete"));
   del.type = "button";
   del.addEventListener("click", function () {
     deleteNodeConfirmed(n, function (e) { setMsg(msg, e.message, "err"); });
@@ -3362,16 +3616,18 @@ function linkGroup(label, list, n, dir) {
     add(chip, el("span", "lc-text",
       (dir === "in" ? "← " : "→ ") + nodeName(otherId)));
     add(chip, el("span", "lc-x", "✕"));
-    chip.setAttribute("aria-label", "Remove link " + (dir === "in" ? "from " : "to ") + nodeName(otherId));
+    chip.setAttribute("aria-label", dir === "in"
+      ? t("Remove link from {name}", { name: nodeName(otherId) })
+      : t("Remove link to {name}", { name: nodeName(otherId) }));
     chip.addEventListener("click", function () {
-      confirmSheet("Remove this link?",
+      confirmSheet(t("Remove this link?"),
         [(dir === "in" ? nodeName(otherId) + "  →  " + nodeName(n.id)
                        : nodeName(n.id) + "  →  " + nodeName(otherId)),
-         "Both nodes stay; only the connection between them goes away."],
-        "Remove link", true).then(function (ok) {
+         t("Both nodes stay; only the connection between them goes away.")],
+        t("Remove link"), true).then(function (ok) {
         if (!ok) return;
         delJSON("/api/graph/links", { from: l.from, to: l.to }).then(loadGraph)
-          .catch(function (e) { alertSheet("Could not remove the link", e.message); });
+          .catch(function (e) { alertSheet(t("Could not remove the link"), e.message); });
       });
     });
     add(row, chip);
@@ -3379,7 +3635,7 @@ function linkGroup(label, list, n, dir) {
 
   var addChip = el("button", "linkchip add");
   addChip.type = "button";
-  add(addChip, el("span", "lc-text", dir === "in" ? "＋ Add input" : "＋ Add output"));
+  add(addChip, el("span", "lc-text", dir === "in" ? t("＋ Add input") : t("＋ Add output")));
   addChip.addEventListener("click", function () { openLinkPicker(n, dir); });
   add(row, addChip);
   add(g, row);
@@ -3390,7 +3646,7 @@ function alertSheet(title, text) {
   var sh = openSheet(title);
   add(sh.body, el("p", "small", text));
   var foot = el("div", "formfoot");
-  var ok = el("button", "btn primary", "OK"); ok.type = "button";
+  var ok = el("button", "btn primary", t("OK")); ok.type = "button";
   ok.addEventListener("click", sh.close);
   add(foot, ok);
   add(sh.body, foot);
@@ -3411,26 +3667,26 @@ function openLinkPicker(n, dir) {
     items.push({
       value: o.id, icon: ty.ico,
       label: o.name || ty.label,
-      sub: dup ? "Already linked" : nodeSummary(o),
+      sub: dup ? t("Already linked") : nodeSummary(o),
       meta: ty.label,
       disabled: dup
     });
   });
   if (!items.length) {
-    alertSheet(dir === "in" ? "Nothing can feed this node" : "Nothing this node can feed",
+    alertSheet(dir === "in" ? t("Nothing can feed this node") : t("Nothing this node can feed"),
       dir === "in"
-        ? "Add a source or a logic node first — sinks have no output to connect from."
-        : "Add a logic or sink node first — sources have no input to connect to.");
+        ? t("Add a source or a logic node first — sinks have no output to connect from.")
+        : t("Add a logic or sink node first — sources have no input to connect to."));
     return;
   }
-  pickerSheet(dir === "in" ? "Pick the node that feeds " + (n.name || nodeType(n.type).label)
-                           : "Pick the node to send to",
-    dir === "in" ? "It will fire this node when it triggers."
-                 : "This node will fire it when it triggers.",
+  pickerSheet(dir === "in" ? t("Pick the node that feeds {name}", { name: n.name || nodeType(n.type).label })
+                           : t("Pick the node to send to"),
+    dir === "in" ? t("It will fire this node when it triggers.")
+                 : t("This node will fire it when it triggers."),
     items, function (otherId) {
       var body = dir === "in" ? { from: otherId, to: n.id } : { from: n.id, to: otherId };
       postJSON("/api/graph/links", body).then(loadGraph)
-        .catch(function (e) { alertSheet("Could not add the link", e.message); });
+        .catch(function (e) { alertSheet(t("Could not add the link"), e.message); });
     });
 }
 
@@ -3465,17 +3721,17 @@ function nextPosition(group) {
 }
 
 function openAddNode() {
-  var items = NODE_TYPES.filter(function (t) {
-    return !(t.t === "source.gpio" && !S.has.gpio) &&
-           !(t.t === "sink.monitor" && !S.has.monitor);
-  }).map(function (t) {
+  var items = NODE_TYPES.filter(function (ty) {
+    return !(ty.t === "source.gpio" && !S.has.gpio) &&
+           !(ty.t === "sink.monitor" && !S.has.monitor);
+  }).map(function (ty) {
     return {
-      value: t.t, icon: t.ico, label: t.label, sub: t.help, meta: t.g
+      value: ty.t, icon: ty.ico, label: t(ty.label), sub: t(ty.help), meta: t(ty.g)
     };
   });
-  pickerSheet("Add a node",
-    "Sources hear things, logic shapes, sinks act. A 433 MHz code needs a receiver to " +
-    "hear it and a sender to say it — pick whichever end you are wiring.",
+  pickerSheet(t("Add a node"),
+    t("Sources hear things, logic shapes, sinks act. A 433 MHz code needs a receiver to " +
+      "hear it and a sender to say it — pick whichever end you are wiring."),
     items, function (type) {
     /* A node that needs a signal is never created empty: the signal IS the
        node's identity, so the choice of one is part of adding it. Both halves
@@ -3514,7 +3770,7 @@ function createNode(type, sig) {
       var n = created && created.id ? nodeById(created.id) : null;
       if (n) openNodeEditor(n);
     });
-  }).catch(function (e) { alertSheet("Could not add the node", e.message); });
+  }).catch(function (e) { alertSheet(t("Could not add the node"), e.message); });
 }
 
 /* The fork that replaces the old Learn tab and the old Signals tab in one
@@ -3524,14 +3780,14 @@ function openSignalNodeFlow(type) {
   var rx = (type !== "signal.tx");
   function listen() {
     openListenFlow({
-      title: "Listen for a signal",
+      title: t("Listen for a signal"),
       sub: rx
-        ? "Press the remote button a few times. Everything heard is kept and ranked; pick " +
-          "the one that is yours, test it, name it — this node then fires whenever it is " +
-          "heard again."
-        : "Press the remote button a few times. Everything heard is kept and ranked; pick " +
-          "the one that is yours, test it, name it — this node then sends that same code " +
-          "whenever it is triggered."
+        ? t("Press the remote button a few times. Everything heard is kept and ranked; pick " +
+            "the one that is yours, test it, name it — this node then fires whenever it is " +
+            "heard again.")
+        : t("Press the remote button a few times. Everything heard is kept and ranked; pick " +
+            "the one that is yours, test it, name it — this node then sends that same code " +
+            "whenever it is triggered.")
     }).then(function (sig) { if (sig) createNode(type, sig); });
   }
   function virtual() {
@@ -3540,7 +3796,7 @@ function openSignalNodeFlow(type) {
   }
   function existing() {
     openSignalPicker({
-      title: "Signal for this node",
+      title: t("Signal for this node"),
       onPick: function (sig) { createNode(type, sig); },
       onListen: S.has.raw ? listen : null,
       onVirtual: virtual
@@ -3555,24 +3811,24 @@ function openSignalNodeFlow(type) {
      is what makes that decision possible here. */
   var items = [];
   if (S.has.raw) items.push(
-    { value: "listen", icon: "🎧", label: "Listen for a new button",
-      sub: "Press your remote a few times. Everything heard is ranked, and you pick the one "
-        + "that rings your bell — decoded or not.",
-      meta: "capture" });
+    { value: "listen", icon: "🎧", label: t("Listen for a new button"),
+      sub: t("Press your remote a few times. Everything heard is ranked, and you pick the one "
+        + "that rings your bell — decoded or not."),
+      meta: t("capture") });
   items = items.concat([
-    { value: "existing", icon: "📚", label: "Use a signal you already have",
-      sub: "Everything this box has stored, whether a node uses it or not.",
-      meta: "stored" },
-    { value: "virtual", icon: "✨", label: "Configure by hand",
-      sub: "Type an EV1527 code you know, or roll a random one to pair your own chime to.",
-      meta: "by hand" }
+    { value: "existing", icon: "📚", label: t("Use a signal you already have"),
+      sub: t("Everything this box has stored, whether a node uses it or not."),
+      meta: t("stored") },
+    { value: "virtual", icon: "✨", label: t("Configure by hand"),
+      sub: t("Type an EV1527 code you know, or roll a random one to pair your own chime to."),
+      meta: t("by hand") }
   ]);
-  pickerSheet(rx ? "Which code should this node listen for?"
-                 : "Which code should this node send?",
-    rx ? "A Signal receiver IS its signal: it fires whenever that code is heard on air, and " +
-         "sends nothing. Pick where the code comes from."
-       : "A Signal sender IS its signal: it puts that code on air whenever something " +
-         "triggers it, and listens for nothing. Pick where the code comes from.",
+  pickerSheet(rx ? t("Which code should this node listen for?")
+                 : t("Which code should this node send?"),
+    rx ? t("A Signal receiver IS its signal: it fires whenever that code is heard on air, and " +
+           "sends nothing. Pick where the code comes from.")
+       : t("A Signal sender IS its signal: it puts that code on air whenever something " +
+           "triggers it, and listens for nothing. Pick where the code comes from."),
     items, function (choice) {
       if (choice === "listen") listen();
       else if (choice === "virtual") virtual();
@@ -3586,15 +3842,15 @@ function openNodeEditor(n) {
   var patch = {};   /* only what the user touched is sent */
 
   var nameIn = inputEl("text", n.name || "", { maxlength: "40" });
-  add(sh.body, field("Name", nameIn));
+  add(sh.body, field(t("Name"), nameIn));
 
   /* On a Switch node this field IS the position, and it already has a control
      of its own further down that says so in the right words and moves it
      through the endpoint built for it. Offering "Enabled" as well would be two
      controls for one flag, and the wrong one would win on Save. */
   var enabled = isSwitch(n) ? null
-    : checkField("Enabled", n.enabled !== false,
-                 "A disabled node stays in the graph but never fires.");
+    : checkField(t("Enabled"), n.enabled !== false,
+                 t("A disabled node stays in the graph but never fires."));
   if (enabled) add(sh.body, enabled);
 
   var ctl = {};   /* type-specific controls */
@@ -3606,12 +3862,12 @@ function openNodeEditor(n) {
      somewhere else. */
   if (isSignalNode(n)) {
     var sigSec = el("div", "sigsec");
-    add(sh.body, el("div", "lg-label", "Signal"));
+    add(sh.body, el("div", "lg-label", t("Signal")));
     add(sh.body, el("div", "hint", isSignalRx(n)
-      ? "This node fires when this code is heard on air. It never transmits — to send a " +
-        "code, add a Signal sender node and wire something into it."
-      : "This node transmits this code whenever something linked into it fires. It never " +
-        "listens — to react to a code, add a Signal receiver node for it."));
+      ? t("This node fires when this code is heard on air. It never transmits — to send a " +
+          "code, add a Signal sender node and wire something into it.")
+      : t("This node transmits this code whenever something linked into it fires. It never " +
+          "listens — to react to a code, add a Signal receiver node for it.")));
     add(sh.body, sigSec);
     renderNodeSignal(sigSec, n);
   }
@@ -3627,42 +3883,42 @@ function openNodeEditor(n) {
   if (isSignalTx(n)) {
     ctl.repeats = inputEl("number", numOr(n.repeats, 6), { min: "1", max: "32", step: "1", inputmode: "numeric" });
     ctl.gap = inputEl("number", numOr(n.gap_us, 8000), { min: "500", max: "60000", step: "500", inputmode: "numeric" });
-    add(grid, field("Repeats when sending", ctl.repeats,
-      "Many cheap receivers need several identical copies before they act."));
-    add(grid, field("Gap between copies (us)", ctl.gap));
-    if (!txAvailable()) add(sh.body, el("div", "note bad", S.txBlock));
+    add(grid, field(t("Repeats when sending"), ctl.repeats,
+      t("Many cheap receivers need several identical copies before they act.")));
+    add(grid, field(t("Gap between copies (us)"), ctl.gap));
+    if (!txAvailable()) add(sh.body, el("div", "note bad", txBlockText()));
   }
 
   if (n.type === "source.gpio") {
-    var opts = [{ value: -1, label: "— choose a pin —" }];
+    var opts = [{ value: -1, label: t("— choose a pin —") }];
     var g = S.gpio;
     if (g) {
       (g.suggested || []).forEach(function (p) {
-        opts.push({ value: p, label: "GPIO " + p + "  (recommended)" });
+        opts.push({ value: p, label: t("GPIO {pin}  (recommended)", { pin: p }) });
       });
       (g.available || []).forEach(function (p) {
         if ((g.suggested || []).indexOf(p) >= 0) return;
         opts.push({ value: p, label: "GPIO " + p });
       });
       (g.in_use || []).forEach(function (p) {
-        opts.push({ value: p, label: "GPIO " + p + "  (in use — unavailable)", disabled: true });
+        opts.push({ value: p, label: t("GPIO {pin}  (in use — unavailable)", { pin: p }), disabled: true });
       });
     } else if (n.gpio_pin >= 0) {
       opts.push({ value: n.gpio_pin, label: "GPIO " + n.gpio_pin });
     }
     ctl.pin = selectEl(opts, numOr(n.gpio_pin, -1));
-    add(grid, field("Pin", ctl.pin,
-      g ? "Recommended pins are listed first; pins already used by the radio are disabled." :
-          "The pin list is unavailable, so only the current pin is offered.", "full"));
-    ctl.activeLow = checkField("Button pulls the pin to ground (active low)", n.gpio_active_low !== false);
+    add(grid, field(t("Pin"), ctl.pin,
+      g ? t("Recommended pins are listed first; pins already used by the radio are disabled.") :
+          t("The pin list is unavailable, so only the current pin is offered."), "full"));
+    ctl.activeLow = checkField(t("Button pulls the pin to ground (active low)"), n.gpio_active_low !== false);
     add(grid, ctl.activeLow);
     ctl.pin.parentNode.classList.add("full");
     ctl.activeLow.classList.add("full");
     ctl.debounce = inputEl("number", numOr(n.gpio_debounce_ms, 50), { min: "0", max: "1000", step: "5", inputmode: "numeric" });
-    add(grid, field("Debounce (ms)", ctl.debounce, "Ignores contact bounce. 50 ms suits an ordinary push button."));
+    add(grid, field(t("Debounce (ms)"), ctl.debounce, t("Ignores contact bounce. 50 ms suits an ordinary push button.")));
     add(sh.body, el("div", "note",
-      "Wiring: one leg of the button to the chosen GPIO, the other leg to GND — the " +
-      "internal pull-up does the rest, so no resistor and no extra supply is needed."));
+      t("Wiring: one leg of the button to the chosen GPIO, the other leg to GND — the " +
+        "internal pull-up does the rest, so no resistor and no extra supply is needed.")));
   }
 
   if (n.type === "source.virtual") {
@@ -3670,7 +3926,7 @@ function openNodeEditor(n) {
        hand, so the button that does it comes before the topic it may never
        need. Same action and the same words as the card and the canvas ▶. */
     var fireMsg = el("div", "formmsg");
-    var fireBtn = el("button", "btn primary block", "▶ Trigger");
+    var fireBtn = el("button", "btn primary block", t("▶ Trigger"));
     fireBtn.type = "button";
     fireBtn.addEventListener("click", function () { fireNode(n.id, fireBtn, fireMsg); });
     sh.body.insertBefore(fireBtn, grid);
@@ -3680,19 +3936,19 @@ function openNodeEditor(n) {
       { maxlength: String(TOPIC_MAX), placeholder: "front_gate" });
     var topicPreview = el("div", "hint mono");
     var topicErr = el("div", "hint");
-    var tf = field("MQTT trigger topic (optional)", ctl.topic, null, "full");
+    var tf = field(t("MQTT trigger topic (optional)"), ctl.topic, null, "full");
 
     function syncTopic() {
       if (!ctl.mqttOn.input.checked) {
         topicPreview.textContent =
-          "Not exposed \u2014 nothing subscribes to this node and Home Assistant has no button " +
-          "for it. The topic is kept for when you switch it back on.";
+          t("Not exposed \u2014 nothing subscribes to this node and Home Assistant has no button " +
+            "for it. The topic is kept for when you switch it back on.");
         return;
       }
-      var t = trimOf(ctl.topic);
-      topicPreview.textContent = t
-        ? ("Full topic:  " + mqttTriggerTopic(t))
-        : "No topic — this node can only be fired from this page or the REST API.";
+      var topic = trimOf(ctl.topic);
+      topicPreview.textContent = topic
+        ? t("Full topic:  {topic}", { topic: mqttTriggerTopic(topic) })
+        : t("No topic — this node can only be fired from this page or the REST API.");
     }
     /* The topic and the checkbox must never look as though they disagree: with
        the node not exposed the field is disabled and dimmed, so it plainly does
@@ -3711,29 +3967,29 @@ function openNodeEditor(n) {
     add(grid, tf);
     syncExposed();
     add(sh.body, el("div", "note",
-      "Publishing ANY message to that topic fires this node — that is how a virtual input " +
-      "becomes reachable from Home Assistant, Node-RED or a shell one-liner, with no RF involved. " +
-      "Leave it empty and the node still works from the Trigger button below and from " +
-      "POST /api/graph/nodes/" + n.id + "/fire."));
+      t("Publishing ANY message to that topic fires this node — that is how a virtual input " +
+        "becomes reachable from Home Assistant, Node-RED or a shell one-liner, with no RF involved. " +
+        "Leave it empty and the node still works from the Trigger button below and from " +
+        "POST /api/graph/nodes/{id}/fire.", { id: n.id })));
     if (S.has.config && !mqttEnabled()) {
       add(sh.body, el("div", "note warn",
-        "MQTT is currently disabled, so the topic is stored but nothing subscribes to it yet. " +
-        "Enable MQTT under Settings and it starts working — no change needed here."));
+        t("MQTT is currently disabled, so the topic is stored but nothing subscribes to it yet. " +
+          "Enable MQTT under Settings and it starts working — no change needed here.")));
     }
   }
 
   if (n.type === "source.any_rf") {
     /* Deliberately no parameters: the whole point is that it is a wildcard. */
     add(sh.body, el("div", "note",
-      "This node has nothing to configure. It fires on every burst the receiver hears, " +
-      "including signals from buttons you never registered. Wire it to an MQTT publish sink " +
-      "and Home Assistant sees every press on the band."));
+      t("This node has nothing to configure. It fires on every burst the receiver hears, " +
+        "including signals from buttons you never registered. Wire it to an MQTT publish sink " +
+        "and Home Assistant sees every press on the band.")));
     add(sh.body, el("div", "note",
-      "It fires IN ADDITION to any matching Signal receiver — a registered press drives both its " +
-      "own chain and this wildcard chain. That is intended, not double-firing."));
+      t("It fires IN ADDITION to any matching Signal receiver — a registered press drives both its " +
+        "own chain and this wildcard chain. That is intended, not double-firing.")));
     add(sh.body, el("div", "note warn",
-      "If the band around you is busy, put a Rate limit between this node and its sink. " +
-      "A chatty neighbouring remote will otherwise spam your broker."));
+      t("If the band around you is busy, put a Rate limit between this node and its sink. " +
+        "A chatty neighbouring remote will otherwise spam your broker.")));
   }
 
   /* TWO MODES, TWO DIFFERENT NODES really, and the editor stops pretending
@@ -3744,16 +4000,16 @@ function openNodeEditor(n) {
      still saved, and comes straight back if the mode is switched to ALL. */
   if (n.type === "logic.group") {
     ctl.mode = selectEl([
-      { value: "any", label: "ANY — merge: pass everything straight through" },
-      { value: "all", label: "ALL — coincidence: wait until every input has fired" }
+      { value: "any", label: t("ANY — merge: pass everything straight through") },
+      { value: "all", label: t("ALL — coincidence: wait until every input has fired") }
     ], n.group_mode === "all" ? "all" : "any");
     ctl.windowS = inputEl("number", numOr(n.window_s, 1), { min: "1", max: "6000", step: "1", inputmode: "numeric" });
     ctl.windowDflt = 1;
-    add(grid, field("Mode", ctl.mode, null, "full"));
+    add(grid, field(t("Mode"), ctl.mode, null, "full"));
     /* The API's field is window_s, in SECONDS -- this said "ms" and passed the
        wrong variable, so the input never reached the DOM at all. */
-    var winField = field("Window (seconds)", ctl.windowS,
-      "How long an input is remembered while the group waits for the others.");
+    var winField = field(t("Window (seconds)"), ctl.windowS,
+      t("How long an input is remembered while the group waits for the others."));
     add(grid, winField);
     var modeNote = el("div", "note");
     add(sh.body, modeNote);
@@ -3761,14 +4017,14 @@ function openNodeEditor(n) {
       var all = ctl.mode.value === "all";
       winField.classList.toggle("hidden", !all);
       modeNote.textContent = all
-        ? "ALL is a coincidence detector. Nothing passes until EVERY link into this node has " +
-          "carried an event inside the window; when that happens it fires once, forgets them " +
-          "all and starts over. Use it for “both buttons within 10 seconds means something”. " +
-          "A group with no inputs can never be satisfied."
-        : "ANY is a merge point, not a filter. Whatever arrives is passed straight on, " +
-          "immediately — the window is not used at all in this mode. Its value is that " +
-          "several buttons can meet at one node, so the chain after it is wired and edited " +
-          "in a single place.";
+        ? t("ALL is a coincidence detector. Nothing passes until EVERY link into this node has " +
+            "carried an event inside the window; when that happens it fires once, forgets them " +
+            "all and starts over. Use it for “both buttons within 10 seconds means something”. " +
+            "A group with no inputs can never be satisfied.")
+        : t("ANY is a merge point, not a filter. Whatever arrives is passed straight on, " +
+            "immediately — the window is not used at all in this mode. Its value is that " +
+            "several buttons can meet at one node, so the chain after it is wired and edited " +
+            "in a single place.");
     }
     ctl.mode.addEventListener("change", syncGroupMode);
     syncGroupMode();
@@ -3776,27 +4032,27 @@ function openNodeEditor(n) {
 
   if (n.type === "logic.throttle") {
     ctl.windowS = inputEl("number", numOr(n.window_s, 10), { min: "1", max: "6000", step: "1", inputmode: "numeric" });
-    add(grid, field("Cooldown (seconds)", ctl.windowS,
-      "The first press passes straight through; anything within the cooldown after it " +
-      "is dropped. Set 30 and the bell rings at most once every 30 seconds, no matter " +
-      "how often the button is pressed."));
-    add(grid, noteRow("Works the same for every input — a 433 MHz remote, a wired button " +
-      "or an MQTT trigger. It limits whatever is linked into it."));
+    add(grid, field(t("Cooldown (seconds)"), ctl.windowS,
+      t("The first press passes straight through; anything within the cooldown after it " +
+        "is dropped. Set 30 and the bell rings at most once every 30 seconds, no matter " +
+        "how often the button is pressed.")));
+    add(grid, noteRow(t("Works the same for every input — a 433 MHz remote, a wired button " +
+      "or an MQTT trigger. It limits whatever is linked into it.")));
   }
 
   if (n.type === "logic.repeat") {
     ctl.times = inputEl("number", numOr(n.repeats, 3), { min: "1", max: "20", step: "1", inputmode: "numeric" });
     ctl.windowS = inputEl("number", numOr(n.window_s, 5), { min: "1", max: "6000", step: "1", inputmode: "numeric" });
     ctl.windowDflt = 5;
-    add(grid, field("Times", ctl.times,
-      "How many times in total, counting the first one. 3 rings the chime three times."));
-    add(grid, field("Interval (seconds)", ctl.windowS,
-      "The gap between rings. 3 times at 5 seconds rings at 0 s, 5 s and 10 s."));
-    add(grid, noteRow("The first ring is immediate — nobody waits at the door for a chime. " +
-      "Set Times to 1 and the node simply passes the press through unchanged."));
+    add(grid, field(t("Times"), ctl.times,
+      t("How many times in total, counting the first one. 3 rings the chime three times.")));
+    add(grid, field(t("Interval (seconds)"), ctl.windowS,
+      t("The gap between rings. 3 times at 5 seconds rings at 0 s, 5 s and 10 s.")));
+    add(grid, noteRow(t("The first ring is immediate — nobody waits at the door for a chime. " +
+      "Set Times to 1 and the node simply passes the press through unchanged.")));
     add(sh.body, el("div", "note",
-      "Pressing again while it is still running starts the count over rather than adding a " +
-      "second run, so leaning on the button cannot queue up a dozen chimes."));
+      t("Pressing again while it is still running starts the count over rather than adding a " +
+        "second run, so leaning on the button cannot queue up a dozen chimes.")));
   }
 
   if (n.type === "logic.switch") {
@@ -3804,14 +4060,14 @@ function openNodeEditor(n) {
        switch is nearly always "is it on, and make it the other thing". */
     var swMsg = el("div", "formmsg");
     var swBtn = el("button", "btn block " + (switchOn(n) ? "danger" : "primary"),
-                   switchOn(n) ? "Switch OFF — block this path"
-                               : "Switch ON — let this path conduct");
+                   switchOn(n) ? t("Switch OFF — block this path")
+                               : t("Switch ON — let this path conduct"));
     swBtn.type = "button";
     var swState = el("div", "note " + (switchOn(n) ? "" : "warn"),
       switchOn(n)
-        ? "Currently ON. Events reaching this node pass straight through, unchanged."
-        : "Currently OFF. Nothing gets past this node — everything wired after it is dead " +
-          "until it is switched back on. The nodes and links are all still there.");
+        ? t("Currently ON. Events reaching this node pass straight through, unchanged.")
+        : t("Currently OFF. Nothing gets past this node — everything wired after it is dead " +
+            "until it is switched back on. The nodes and links are all still there."));
     swBtn.addEventListener("click", function () {
       setSwitch(n, !switchOn(n), swBtn, swMsg).then(function (ok) {
         if (ok) sh.close();
@@ -3825,32 +4081,32 @@ function openNodeEditor(n) {
       { maxlength: String(TOPIC_MAX), placeholder: "outside_bell" });
     var swPreview = el("div", "hint mono");
     var swErr = el("div", "hint");
-    var sf = field("MQTT topic", ctl.topic, null, "full");
+    var sf = field(t("MQTT topic"), ctl.topic, null, "full");
 
     function syncSw() {
       var typed = trimOf(ctl.topic);
       var auto = topicSlug(trimOf(nameIn));
-      var t = typed || auto;
+      var topic = typed || auto;
       clear(swPreview);
       ctl.topic.placeholder = auto || "outside_bell";
       /* Said first and on its own, because with the node not exposed every other
          line below would be describing a topic that is not live. */
       if (!ctl.mqttOn.input.checked) {
         add(swPreview, el("div", null,
-          "Not exposed \u2014 no subscription, no Home Assistant entity, and the retained " +
-          "state cleared. The switch still works from this page and the REST API."));
+          t("Not exposed \u2014 no subscription, no Home Assistant entity, and the retained " +
+            "state cleared. The switch still works from this page and the REST API.")));
         return;
       }
-      if (!t) {
+      if (!topic) {
         swPreview.textContent =
-          "Give this node a name (or a topic) and Home Assistant can switch it.";
+          t("Give this node a name (or a topic) and Home Assistant can switch it.");
         return;
       }
       if (!typed)
         add(swPreview, el("div", "muted",
-          "Following the node name. Type your own to pin it; clear it to follow again."));
-      add(swPreview, el("div", null, "Home Assistant sets:  " + mqttSwitchTopic(t, "set")));
-      add(swPreview, el("div", null, "Box reports (retained):  " + mqttSwitchTopic(t, "state")));
+          t("Following the node name. Type your own to pin it; clear it to follow again.")));
+      add(swPreview, el("div", null, t("Home Assistant sets:  {topic}", { topic: mqttSwitchTopic(topic, "set") })));
+      add(swPreview, el("div", null, t("Box reports (retained):  {topic}", { topic: mqttSwitchTopic(topic, "state") })));
       /* What HA will actually CALL it. A node still named "Switch" would appear
          as "Klingelbox Switch" on every box ever built, so the firmware falls
          back to the topic -- but that is invisible unless it is said here, and
@@ -3859,8 +4115,8 @@ function openNodeEditor(n) {
       var nm = trimOf(nameIn);
       var generic = !nm || /^(switch|logic\.switch)$/i.test(nm);
       add(swPreview, el("div", null,
-        "Appears in Home Assistant as:  " + (generic ? prettyTopic(t) : nm) +
-        (generic ? "   (from the topic \u2014 rename this node to change it)" : "")));
+        t("Appears in Home Assistant as:  {name}", { name: generic ? prettyTopic(topic) : nm }) +
+        (generic ? t("   (from the topic \u2014 rename this node to change it)") : "")));
     }
     function syncSwExposed() {
       var on = ctl.mqttOn.input.checked;
@@ -3877,19 +4133,19 @@ function openNodeEditor(n) {
     add(grid, sf);
     syncSwExposed();
     add(sh.body, el("div", "note",
-      "With a topic set, Home Assistant discovers this as a real switch entity on the " +
-      "Klingelbox device — a toggle, not a workaround. ON, OFF, 1, 0, true and false are all " +
-      "accepted on the set topic; the box answers on the state topic, retained, so the toggle " +
-      "is never stale after a restart."));
+      t("With a topic set, Home Assistant discovers this as a real switch entity on the " +
+        "Klingelbox device — a toggle, not a workaround. ON, OFF, 1, 0, true and false are all " +
+        "accepted on the set topic; the box answers on the state topic, retained, so the toggle " +
+        "is never stale after a restart.")));
     add(sh.body, el("div", "note",
-      "Several Switch nodes may share ONE topic on purpose: give “Outside bell” to two switches " +
-      "and a single Home Assistant toggle gates both paths at once. The reported state is ON if " +
-      "any of them is conducting."));
+      t("Several Switch nodes may share ONE topic on purpose: give “Outside bell” to two switches " +
+        "and a single Home Assistant toggle gates both paths at once. The reported state is ON if " +
+        "any of them is conducting.")));
     if (S.has.config && !mqttEnabled()) {
       add(sh.body, el("div", "note warn",
-        "MQTT is currently disabled, so the topic is stored but nothing subscribes to it yet. " +
-        "The switch still works from this page. Enable MQTT under Settings and Home Assistant " +
-        "picks it up — no change needed here."));
+        t("MQTT is currently disabled, so the topic is stored but nothing subscribes to it yet. " +
+          "The switch still works from this page. Enable MQTT under Settings and Home Assistant " +
+          "picks it up — no change needed here.")));
     }
   }
 
@@ -3898,17 +4154,17 @@ function openNodeEditor(n) {
       { maxlength: String(TOPIC_MAX), placeholder: "front" });
     var pubPreview = el("div", "hint mono");
     var pubErr = el("div", "hint");
-    var pf = field("Topic", ctl.topic, null, "full");
+    var pf = field(t("Topic"), ctl.topic, null, "full");
 
     function syncPub() {
       if (!ctl.mqttOn.input.checked) {
         pubPreview.textContent =
-          "Not exposed \u2014 this node publishes nothing at all, not even to the " +
-          mqttBase() + "/event stream. The chain still reaches it.";
+          t("Not exposed \u2014 this node publishes nothing at all, not even to the " +
+            "{base}/event stream. The chain still reaches it.", { base: mqttBase() });
         return;
       }
-      var t = trimOf(ctl.topic);
-      pubPreview.textContent = t ? ("Publishes to:  " + mqttPublishTopic(t)) : "No topic set — nothing is published.";
+      var topic = trimOf(ctl.topic);
+      pubPreview.textContent = topic ? t("Publishes to:  {topic}", { topic: mqttPublishTopic(topic) }) : t("No topic set — nothing is published.");
     }
     function syncPubExposed() {
       var on = ctl.mqttOn.input.checked;
@@ -3925,38 +4181,38 @@ function openNodeEditor(n) {
     syncPubExposed();
     if (S.has.config && !mqttEnabled()) {
       add(sh.body, el("div", "note warn",
-        "MQTT is disabled under Settings, so this node stores its topic but publishes nothing yet."));
+        t("MQTT is disabled under Settings, so this node stores its topic but publishes nothing yet.")));
     }
   }
 
   if (n.type === "sink.monitor") {
     /* The timeline is the node, so it leads — before the one setting it has. */
     var monHead = el("div", "montl-head");
-    add(monHead, el("span", "lg-label", "Last 10 minutes"), monitorLamp(n.id, "lamp-lg"));
+    add(monHead, el("span", "lg-label", t("Last 10 minutes")), monitorLamp(n.id, "lamp-lg"));
     sh.body.insertBefore(monHead, grid);
     sh.body.insertBefore(monitorTimeline(n.id), grid);
 
     ctl.windowS = inputEl("number", numOr(n.window_s, 3),
       { min: "1", max: "60", step: "1", inputmode: "numeric" });
     ctl.windowDflt = 3;
-    add(grid, field("Lamp stays lit (seconds)", ctl.windowS,
-      "How long the indicator glows after each hit, and how wide each mark is drawn " +
-      "on the timeline. 1–60 s."));
+    add(grid, field(t("Lamp stays lit (seconds)"), ctl.windowS,
+      t("How long the indicator glows after each hit, and how wide each mark is drawn " +
+        "on the timeline. 1–60 s.")));
     add(sh.body, el("div", "note",
-      "This node acts on nothing. It transmits no signal, publishes no message and touches " +
-      "no pin — it only records that the chain reached it, in RAM, for the last 10 minutes. " +
-      "Nothing is written to flash and nothing survives a reboot."));
+      t("This node acts on nothing. It transmits no signal, publishes no message and touches " +
+        "no pin — it only records that the chain reached it, in RAM, for the last 10 minutes. " +
+        "Nothing is written to flash and nothing survives a reboot.")));
     add(sh.body, el("div", "note",
-      "Wire one alongside a real sink to prove a chain fires without ringing anything: " +
-      "link the same node into both the Signal sender you would use and this Monitor, then " +
-      "trigger the chain and watch the lamp instead of listening for the chime."));
+      t("Wire one alongside a real sink to prove a chain fires without ringing anything: " +
+        "link the same node into both the Signal sender you would use and this Monitor, then " +
+        "trigger the chain and watch the lamp instead of listening for the chime.")));
   }
 
   var msg = el("div", "formmsg");
   var foot = el("div", "formfoot");
   /* Delete belongs here too, not only on the list card: opening a node from the
      map was a one-way trip with Save as the only exit. */
-  var delBtn = el("button", "btn danger", "Delete node");
+  var delBtn = el("button", "btn danger", t("Delete node"));
   delBtn.type = "button";
   delBtn.addEventListener("click", function () {
     deleteNodeConfirmed(n,
@@ -3964,7 +4220,7 @@ function openNodeEditor(n) {
       function () { sh.close(); });
   });
 
-  var save = el("button", "btn primary", "Save");
+  var save = el("button", "btn primary", t("Save"));
   save.type = "button";
   save.addEventListener("click", function () {
     /* signal_id is deliberately absent: binding a signal is an action of its
@@ -3996,13 +4252,13 @@ function openNodeEditor(n) {
       return;
     }
     save.disabled = true;
-    setMsg(msg, "Saving…");
+    setMsg(msg, t("Saving…"));
     postJSON("/api/graph/nodes/" + n.id, patch).then(function () {
       sh.close();
       loadGraph();
     }).catch(function (e) { save.disabled = false; setMsg(msg, e.message, "err"); });
   });
-  var cancel = el("button", "btn", "Cancel");
+  var cancel = el("button", "btn", t("Cancel"));
   cancel.type = "button";
   cancel.addEventListener("click", sh.close);
   add(foot, save, cancel, delBtn, msg);
@@ -4016,16 +4272,18 @@ function renderNodeSignal(wrap, n) {
   var sid = numOr(n.signal_id, 0);
 
   if (!sid) {
-    add(wrap, el("div", "note warn", (isSignalTx(n)
-      ? "This node has no signal yet, so there is nothing for it to send. "
-      : "This node has no signal yet, so nothing on air can ever fire it. ") +
-      "Listen for the button it should stand for, pick one you already have, or invent a " +
-      "code your own receiver can be paired to."));
+    add(wrap, el("div", "note warn", isSignalTx(n)
+      ? t("This node has no signal yet, so there is nothing for it to send. " +
+          "Listen for the button it should stand for, pick one you already have, or invent a " +
+          "code your own receiver can be paired to.")
+      : t("This node has no signal yet, so nothing on air can ever fire it. " +
+          "Listen for the button it should stand for, pick one you already have, or invent a " +
+          "code your own receiver can be paired to.")));
     add(wrap, signalChooser(wrap, n));
     return;
   }
 
-  add(wrap, el("div", "empty", "Loading signal…"));
+  add(wrap, el("div", "empty", t("Loading signal…")));
   api("/api/signals/" + sid).then(function (sig) {
     clear(wrap);
     add(wrap, signalBlock(sig, { node: n }));
@@ -4033,8 +4291,8 @@ function renderNodeSignal(wrap, n) {
   }).catch(function (e) {
     clear(wrap);
     add(wrap, el("div", "note bad",
-      "This node points at signal " + sid + ", which the box cannot produce: " + e.message +
-      " Pick another one below."));
+      t("This node points at signal {id}, which the box cannot produce: {err} Pick another one below.",
+        { id: sid, err: e.message })));
     add(wrap, signalChooser(wrap, n));
   });
 }
@@ -4050,7 +4308,7 @@ function signalChooser(wrap, n) {
 
   function bind(sig) {
     if (!sig) return;
-    setMsg(msg, "Linking…");
+    setMsg(msg, t("Linking…"));
     postJSON("/api/graph/nodes/" + n.id, { signal_id: sig.id }).then(function () {
       n.signal_id = sig.id;
       loadGraph();
@@ -4058,11 +4316,11 @@ function signalChooser(wrap, n) {
     }).catch(function (e) { setMsg(msg, e.message, "err"); });
   }
 
-  var pick = el("button", "btn", bound ? "🔀 Use a different signal" : "📚 Choose a stored signal");
+  var pick = el("button", "btn", bound ? t("🔀 Use a different signal") : t("📚 Choose a stored signal"));
   pick.type = "button";
   pick.addEventListener("click", function () {
     openSignalPicker({
-      title: "Signal for this node",
+      title: t("Signal for this node"),
       node: n,
       onPick: bind,
       onListen: S.has.raw ? function () { relisten(); } : null,
@@ -4072,17 +4330,17 @@ function signalChooser(wrap, n) {
 
   function relisten() {
     openListenFlow({
-      title: bound ? "Listen for a replacement" : "Listen for a button",
-      sub: "Press the button this node should stand for from now on, several times."
-        + (bound
-            ? " The signal it uses today stays in the store under its name — this only "
-              + "changes what the node points at."
-            : "")
+      title: bound ? t("Listen for a replacement") : t("Listen for a button"),
+      sub: bound
+        ? t("Press the button this node should stand for from now on, several times."
+            + " The signal it uses today stays in the store under its name — this only "
+            + "changes what the node points at.")
+        : t("Press the button this node should stand for from now on, several times.")
     }).then(bind);
   }
   add(row, pick);
   if (S.has.raw) {
-    var listen = el("button", "btn", bound ? "🎧 Listen again" : "🎧 Listen for a button");
+    var listen = el("button", "btn", bound ? t("🎧 Listen again") : t("🎧 Listen for a button"));
     listen.type = "button";
     listen.addEventListener("click", relisten);
     add(row, listen);
@@ -4091,7 +4349,7 @@ function signalChooser(wrap, n) {
   /* The third path: a code entered by hand rather than learned or picked.
      openVirtualFlow does the explaining about what a made-up code means. */
   function makeVirtual() { openVirtualFlow({ mode: "signal" }).then(bind); }
-  var virt = el("button", "btn", "✨ Configure by hand");
+  var virt = el("button", "btn", t("✨ Configure by hand"));
   virt.type = "button";
   virt.addEventListener("click", makeVirtual);
   add(row, virt);
@@ -4111,7 +4369,7 @@ function renderCanvas() {
   var links = (S.graph && S.graph.links) || [];
   if (!nodes.length) {
     if (autoEls.zoomSlot) clear(autoEls.zoomSlot);   /* nothing to zoom */
-    add(wrap, el("div", "empty", "No nodes to draw."));
+    add(wrap, el("div", "empty", t("No nodes to draw.")));
     return;
   }
 
@@ -4146,11 +4404,11 @@ function renderCanvas() {
      second bar of its own above the canvas. */
   var zbar = clear(autoEls.zoomSlot);
   var zOut = el("button", "btn small", "\u2212"); zOut.type = "button";
-  zOut.setAttribute("aria-label", "Zoom out");
+  zOut.setAttribute("aria-label", t("Zoom out"));
   var zLbl = el("span", "hint mono zoom-lbl");
   var zIn = el("button", "btn small", "+"); zIn.type = "button";
-  zIn.setAttribute("aria-label", "Zoom in");
-  var zFit = el("button", "btn small", "Fit"); zFit.type = "button";
+  zIn.setAttribute("aria-label", t("Zoom in"));
+  var zFit = el("button", "btn small", t("Fit")); zFit.type = "button";
   add(zbar, zOut, zLbl, zIn, zFit);
   add(wrap, canvasMsg);
 
@@ -4234,13 +4492,13 @@ function renderCanvas() {
       path.setAttribute("d", curve(p1.x, p1.y, p2.x, p2.y));
       function removeLink(ev) {
         ev.stopPropagation();
-        confirmSheet("Remove this link?",
+        confirmSheet(t("Remove this link?"),
           [nodeName(l.from) + "  \u2192  " + nodeName(l.to),
-           "Both nodes stay; only the connection between them goes away."],
-          "Remove link", true).then(function (ok) {
+           t("Both nodes stay; only the connection between them goes away.")],
+          t("Remove link"), true).then(function (ok) {
           if (!ok) return;
           delJSON("/api/graph/links", { from: l.from, to: l.to }).then(loadGraph)
-            .catch(function (e) { alertSheet("Could not remove the link", e.message); });
+            .catch(function (e) { alertSheet(t("Could not remove the link"), e.message); });
         });
       }
       hit.addEventListener("click", removeLink);
@@ -4297,20 +4555,20 @@ function renderCanvas() {
        silently. */
     if (target.id === from) {
       if (hasIn(nodeType(target.type)) && hasOut(nodeType(target.type)))
-        alertSheet("A node cannot feed itself",
-          nodeName(from) + " would be its own input, which is a loop of one and would " +
-          "never settle. Link it to another node instead.");
+        alertSheet(t("A node cannot feed itself"),
+          t("{name} would be its own input, which is a loop of one and would " +
+            "never settle. Link it to another node instead.", { name: nodeName(from) }));
       return;
     }
     if (!hasIn(nodeType(target.type))) {
-      alertSheet("That node has no input",
-                 nodeName(target.id) + " is a source, so nothing can feed into it.");
+      alertSheet(t("That node has no input"),
+                 t("{name} is a source, so nothing can feed into it.", { name: nodeName(target.id) }));
       return;
     }
     var dup = links.some(function (l) { return l.from === from && l.to === target.id; });
     if (dup) return;
     postJSON("/api/graph/links", { from: from, to: target.id }).then(loadGraph)
-      .catch(function (e) { alertSheet("Could not create the link", e.message); });
+      .catch(function (e) { alertSheet(t("Could not create the link"), e.message); });
   });
   svg.addEventListener("pointerleave", cancelLink);
 
@@ -4405,11 +4663,11 @@ function renderCanvas() {
     c.setAttribute("cx", cx); c.setAttribute("cy", cy); c.setAttribute("r", BADGE_R);
     add(g, c);
     if (glyph) {
-      var t = svgEl("text", "nbadge-gl " + cls);
-      t.setAttribute("x", cx); t.setAttribute("y", cy + 3.5);
-      t.setAttribute("text-anchor", "middle");
-      t.textContent = glyph;
-      add(g, t);
+      var txt = svgEl("text", "nbadge-gl " + cls);
+      txt.setAttribute("x", cx); txt.setAttribute("y", cy + 3.5);
+      txt.setAttribute("text-anchor", "middle");
+      txt.textContent = glyph;
+      add(g, txt);
     }
     return c;
   }
@@ -4429,11 +4687,11 @@ function renderCanvas() {
     r.setAttribute("width", w); r.setAttribute("height", BADGE_R * 2);
     r.setAttribute("rx", BADGE_R);
     add(g, r);
-    var t = svgEl("text", "nbadge-gl npill " + cls);
-    t.setAttribute("x", x + w / 2); t.setAttribute("y", cy + 3.5);
-    t.setAttribute("text-anchor", "middle");
-    t.textContent = text;
-    add(g, t);
+    var txt = svgEl("text", "nbadge-gl npill " + cls);
+    txt.setAttribute("x", x + w / 2); txt.setAttribute("y", cy + 3.5);
+    txt.setAttribute("text-anchor", "middle");
+    txt.textContent = text;
+    add(g, txt);
     return r;
   }
 
@@ -4474,7 +4732,8 @@ function renderCanvas() {
   function playAction(n) {
     if (n.type === "source.virtual") {
       return {
-        tip: "Trigger “" + nodeName(n.id) + "” now (fires its output; nothing is sent on air)",
+        tip: t("Trigger “{name}” now (fires its output; nothing is sent on air)",
+               { name: nodeName(n.id) }),
         why: null,
         run: function (flash) { flash(); fireNode(n.id, null, canvasMsg); }
       };
@@ -4486,36 +4745,38 @@ function renderCanvas() {
        it before the code exists. */
     if (n.type === "signal.rx") {
       var rsid = numOr(n.signal_id, 0);
-      var what = rsid ? ("“" + (signalName(rsid) || ("signal " + rsid)) + "”")
-                      : "this node's code";
+      var what = rsid ? t("“{name}”", { name: signalName(rsid) || t("signal {id}", { id: rsid }) })
+                      : t("this node's code");
       return {
-        tip: "Simulate hearing " + what + " — fires this node's output and runs the chain " +
-             "after it. NOTHING is transmitted; no chime rings from this.",
+        tip: t("Simulate hearing {what} — fires this node's output and runs the chain " +
+               "after it. NOTHING is transmitted; no chime rings from this.", { what: what }),
         why: null,
         run: function (flash) {
           flash();
-          setMsg(canvasMsg, "Simulating " + what + " — nothing was sent on air.");
+          setMsg(canvasMsg, t("Simulating {what} — nothing was sent on air.", { what: what }));
           fireNode(n.id, null, canvasMsg);
         }
       };
     }
     if (n.type === "signal.tx") {
       var sid = numOr(n.signal_id, 0);
-      var why = !sid ? "This sender has no code bound to it yet, so there is nothing to send."
-                     : (!txAvailable() ? S.txBlock : null);
+      var why = !sid ? t("This sender has no code bound to it yet, so there is nothing to send.")
+                     : (!txAvailable() ? txBlockText() : null);
       return {
         /* Says OVER THE AIR in as many words. One click here can ring a chime
            in someone's house, so the tooltip must not be coy about it. */
-        tip: why || ("Transmit “" + (signalName(sid) || ("signal " + sid)) +
-                     "” OVER THE AIR now — this rings anything paired to it"),
+        tip: why || t("Transmit “{name}” OVER THE AIR now — this rings anything paired to it",
+                      { name: signalName(sid) || t("signal {id}", { id: sid }) }),
         why: why,
         run: function (flash) {
           flash();
-          setMsg(canvasMsg, "Sending “" + (signalName(sid) || ("signal " + sid)) + "”…");
+          setMsg(canvasMsg, t("Sending “{name}”…",
+                              { name: signalName(sid) || t("signal {id}", { id: sid }) }));
           transmit(sid, null, canvasMsg, {
             body: { repeats: numOr(n.repeats, 6), gap_us: numOr(n.gap_us, 8000) },
-            ok: "Sent “" + (signalName(sid) || ("signal " + sid)) + "” over the air ✓ " +
-                "(that the pulses left the radio — it cannot know a receiver reacted)"
+            ok: t("Sent “{name}” over the air ✓ " +
+                  "(that the pulses left the radio — it cannot know a receiver reacted)",
+                  { name: signalName(sid) || t("signal {id}", { id: sid }) })
           });
         }
       };
@@ -4571,7 +4832,8 @@ function renderCanvas() {
     } else if (n.type === "logic.group") {
       /* ANY ignores the window entirely, so showing one would be a lie. */
       pill(g, BADGE_X_ACT + BADGE_R, BADGE_Y, "nval",
-           n.group_mode === "all" ? ("ALL " + shortSecs(numOr(n.window_s, 1))) : "ANY");
+           n.group_mode === "all"
+             ? t("ALL {win}", { win: shortSecs(numOr(n.window_s, 1)) }) : t("ANY"));
     }
 
     if (hasIn(ty)) {
@@ -4637,8 +4899,10 @@ function renderCanvas() {
       var on = switchOn(n);
       var sbg = badge(g, BADGE_X_ACT, BADGE_Y, "nsw" + (on ? " on" : " off"), on ? "I" : "O");
       hitDisc(g, BADGE_X_ACT, BADGE_Y, BADGE_HIT,
-        (on ? "Switch “" + (n.name || ty.label) + "” OFF — blocks everything wired after it"
-            : "Switch “" + (n.name || ty.label) + "” ON — lets this path conduct again"),
+        (on ? t("Switch “{name}” OFF — blocks everything wired after it",
+                { name: n.name || ty.label })
+            : t("Switch “{name}” ON — lets this path conduct again",
+                { name: n.name || ty.label })),
         function () {
           if (sbg.classList) sbg.classList.add("fired");
           setSwitch(n, !on, null, canvasMsg);
@@ -4649,7 +4913,8 @@ function renderCanvas() {
        confirmation is what makes a bare ✕ on the map safe; a second dialog or a
        second delete path would only be a second thing to keep in step. */
     badge(g, BADGE_X_DEL, BADGE_Y, "ndel", "✕");
-    hitDisc(g, BADGE_X_DEL, BADGE_Y, BADGE_HIT, "Delete " + (n.name || ty.label), function () {
+    hitDisc(g, BADGE_X_DEL, BADGE_Y, BADGE_HIT,
+            t("Delete {name}", { name: n.name || ty.label }), function () {
       deleteNodeConfirmed(n, function (e) {
         setMsg(canvasMsg, e.message, "err");
       });
@@ -4741,20 +5006,20 @@ function buildSettings() {
 }
 
 function sectionIdentity() {
-  var s = section("Name on the network", "Sets the mDNS hostname: http://<name>.local", true);
+  var s = section(t("Name on the network"), t("Sets the mDNS hostname: http://<name>.local"), true);
   var input = inputEl("text", (S.sys && S.sys.hostname) || "klingelbox", { maxlength: "31" });
-  add(s.bodyEl, field("Hostname", input, "Letters, digits and hyphens. Applies after a reboot."));
+  add(s.bodyEl, field("Hostname", input, t("Letters, digits and hyphens. Applies after a reboot.")));
   var msg = el("div", "formmsg");
   var foot = el("div", "formfoot");
-  var save = el("button", "btn primary", "Save hostname");
+  var save = el("button", "btn primary", t("Save hostname"));
   save.type = "button";
   save.addEventListener("click", function () {
     var h = trimOf(input);
-    if (!h) { setMsg(msg, "The hostname cannot be empty.", "err"); return; }
+    if (!h) { setMsg(msg, t("The hostname cannot be empty."), "err"); return; }
     save.disabled = true;
-    setMsg(msg, "Saving…");
+    setMsg(msg, t("Saving…"));
     postJSON("/api/system/hostname", { hostname: h }).then(function () {
-      setMsg(msg, "Saved. It takes effect on the next reboot: http://" + h + ".local", "ok");
+      setMsg(msg, t("Saved. It takes effect on the next reboot: http://{host}.local", { host: h }), "ok");
     }).catch(function (e) { setMsg(msg, e.message, "err"); })
       .then(function () { save.disabled = false; });
   });
@@ -4764,11 +5029,11 @@ function sectionIdentity() {
 }
 
 function sectionWifi() {
-  var s = section("Wi-Fi networks", "Up to three home networks, tried in order.");
+  var s = section(t("Wi-Fi networks"), t("Up to three home networks, tried in order."));
   var body = s.bodyEl;
   add(body, el("div", "note",
-    "Losing the LAN at runtime never drops this box into setup mode — it keeps retrying " +
-    "in the background and stays usable over its own access point."));
+    t("Losing the LAN at runtime never drops this box into setup mode — it keeps retrying " +
+      "in the background and stays usable over its own access point.")));
   var slots = [];
   var dl = el("datalist");
   dl.id = "wifi-seen";
@@ -4778,17 +5043,17 @@ function sectionWifi() {
   slots.forEach(function (sl) { add(body, sl.wrap); });
 
   var scanRow = el("div", "row");
-  var scanBtn = el("button", "btn", "Scan for networks");
+  var scanBtn = el("button", "btn", t("Scan for networks"));
   scanBtn.type = "button";
   var scanMsg = el("div", "formmsg");
   scanBtn.addEventListener("click", function () {
     scanBtn.disabled = true;
-    setMsg(scanMsg, "Scanning…");
+    setMsg(scanMsg, t("Scanning…"));
     api("/api/wifi/scan").then(function (res) {
       var nets = dedupeNetworks(res.networks || []);
       clear(dl);
       nets.forEach(function (nw) { var o = el("option"); o.value = nw.ssid; add(dl, o); });
-      setMsg(scanMsg, nets.length + " network(s) found — tap an SSID box to pick one.", "ok");
+      setMsg(scanMsg, t("{n} network(s) found — tap an SSID box to pick one.", { n: nets.length }), "ok");
     }).catch(function (e) { setMsg(scanMsg, e.message, "err"); })
       .then(function () { scanBtn.disabled = false; });
   });
@@ -4797,7 +5062,7 @@ function sectionWifi() {
 
   var msg = el("div", "formmsg");
   var foot = el("div", "formfoot");
-  var save = el("button", "btn primary", "Save networks");
+  var save = el("button", "btn primary", t("Save networks"));
   save.type = "button";
   save.addEventListener("click", function () {
     var nets = slots.map(function (sl) {
@@ -4808,9 +5073,9 @@ function sectionWifi() {
       return o;
     });
     save.disabled = true;
-    setMsg(msg, "Saving…");
+    setMsg(msg, t("Saving…"));
     postJSON("/api/config", { sta: { networks: nets } }).then(function () {
-      setMsg(msg, "Saved. The box connects on the next reboot, or when the current network drops.", "ok");
+      setMsg(msg, t("Saved. The box connects on the next reboot, or when the current network drops."), "ok");
       slots.forEach(function (sl) { sl.pass.value = ""; });
       loadConfig().then(function () { slots.forEach(function (sl) { sl.refresh(); }); });
     }).catch(function (e) { setMsg(msg, e.message, "err"); })
@@ -4836,12 +5101,14 @@ function dedupeNetworks(list) {
 
 function wifiSlot(idx, dl) {
   var fs = el("fieldset");
-  add(fs, el("legend", null, "Network " + (idx + 1) + (idx === 0 ? " (tried first)" : "")));
+  add(fs, el("legend", null, idx === 0
+    ? t("Network {n} (tried first)", { n: idx + 1 })
+    : t("Network {n}", { n: idx + 1 })));
   var ssid = inputEl("text", "", { maxlength: "32", list: dl.id, placeholder: "SSID" });
-  var pass = inputEl("password", "", { maxlength: "63", placeholder: "leave empty to keep" });
+  var pass = inputEl("password", "", { maxlength: "63", placeholder: t("leave empty to keep") });
   pass.autocomplete = "new-password";
   var passHint = el("span", "hint", "");
-  add(fs, field("Network name", ssid));
+  add(fs, field(t("Network name"), ssid));
   var pf = field("Passphrase", pass);
   add(pf, passHint);
   add(fs, pf);
@@ -4850,18 +5117,18 @@ function wifiSlot(idx, dl) {
     var n = nets[idx] || {};
     ssid.value = n.ssid || "";
     passHint.textContent = n.has_pass
-      ? "A passphrase is stored. Leave empty to keep it; type a new one to replace it."
-      : "No passphrase stored (open network, or slot unused).";
+      ? t("A passphrase is stored. Leave empty to keep it; type a new one to replace it.")
+      : t("No passphrase stored (open network, or slot unused).");
   }
   refresh();
   return { wrap: fs, ssid: ssid, pass: pass, refresh: refresh };
 }
 
 function sectionAp() {
-  var s = section("Access point", "The box's own hotspot -- how you reach it with no LAN.");
+  var s = section(t("Access point"), t("The box's own hotspot -- how you reach it with no LAN."));
   var body = s.bodyEl;
   var msg = el("div", "formmsg");
-  var loading = el("div", "empty", "Loading…");
+  var loading = el("div", "empty", t("Loading…"));
   add(body, loading);
 
   api("/api/ap").then(function (ap) {
@@ -4870,26 +5137,26 @@ function sectionAp() {
     var grid = el("div", "formgrid");
     var ssid = inputEl("text", ap.ssid || "", { maxlength: "32" });
     var chan = inputEl("number", numOr(ap.channel, 6), { min: "1", max: "13", step: "1", inputmode: "numeric" });
-    var enabled = checkField("Access point enabled", ap.enabled !== false);
-    var fallback = checkField("Raise a setup hotspot at boot when no network connects",
+    var enabled = checkField(t("Access point enabled"), ap.enabled !== false);
+    var fallback = checkField(t("Raise a setup hotspot at boot when no network connects"),
       ap.fallback_enabled !== false,
-      "This is what puts a factory-fresh box on the air. Turning it off can lock you out.");
+      t("This is what puts a factory-fresh box on the air. Turning it off can lock you out."));
     var rpass = inputEl("password", "", { maxlength: "63",
-      placeholder: ap.has_recovery_pass ? "set - leave empty to keep" : "empty = open hotspot" });
+      placeholder: ap.has_recovery_pass ? t("set - leave empty to keep") : t("empty = open hotspot") });
     rpass.autocomplete = "new-password";
-    add(grid, field("Hotspot name (SSID)", ssid, null, "full"));
-    add(grid, field("Channel", chan));
-    var ipRow = field("IP address", inputEl("text", ap.ip || "", {}), "Read-only.");
+    add(grid, field(t("Hotspot name (SSID)"), ssid, null, "full"));
+    add(grid, field(t("Channel"), chan));
+    var ipRow = field(t("IP address"), inputEl("text", ap.ip || "", {}), t("Read-only."));
     $("input", ipRow).disabled = true;
     add(grid, ipRow);
     add(body, grid);
     add(body, enabled);
     add(body, fallback);
-    add(body, field("Setup hotspot passphrase", rpass,
-      "8-63 characters, or leave empty to keep the current setting. An open hotspot is fine on a trusted site."));
+    add(body, field(t("Setup hotspot passphrase"), rpass,
+      t("8-63 characters, or leave empty to keep the current setting. An open hotspot is fine on a trusted site.")));
 
     var foot = el("div", "formfoot");
-    var save = el("button", "btn primary", "Save access point");
+    var save = el("button", "btn primary", t("Save access point"));
     save.type = "button";
     save.addEventListener("click", function () {
       var body2 = {
@@ -4900,9 +5167,9 @@ function sectionAp() {
       };
       if (rpass.value) body2.recovery_pass = rpass.value;
       save.disabled = true;
-      setMsg(msg, "Saving…");
+      setMsg(msg, t("Saving…"));
       postJSON("/api/ap", body2).then(function () {
-        setMsg(msg, "Saved. Changes to the hotspot apply on the next reboot.", "ok");
+        setMsg(msg, t("Saved. Changes to the hotspot apply on the next reboot."), "ok");
         rpass.value = "";
       }).catch(function (e) { setMsg(msg, e.message, "err"); })
         .then(function () { save.disabled = false; });
@@ -4912,51 +5179,51 @@ function sectionAp() {
   }).catch(function (e) {
     loading.remove();
     S.has.ap = false;
-    add(body, el("div", "note warn", "Access-point settings are not available on this firmware (" + e.message + ")."));
+    add(body, el("div", "note warn", t("Access-point settings are not available on this firmware ({err}).", { err: e.message })));
   });
   return s;
 }
 
 function sectionMqtt() {
-  var s = section("MQTT / Home Assistant", "Publish presses to a broker and get discovered by HA.");
+  var s = section("MQTT / Home Assistant", t("Publish presses to a broker and get discovered by HA."));
   var body = s.bodyEl;
-  var loading = el("div", "empty", "Loading…");
+  var loading = el("div", "empty", t("Loading…"));
   add(body, loading);
 
   loadConfig().then(function (cfg) {
     loading.remove();
     if (!cfg || !cfg.mqtt) {
-      add(body, el("div", "note warn", "This firmware does not expose MQTT settings."));
+      add(body, el("div", "note warn", t("This firmware does not expose MQTT settings.")));
       return;
     }
     var m = cfg.mqtt;
-    var enabled = checkField("MQTT enabled", !!m.enabled);
+    var enabled = checkField(t("MQTT enabled"), !!m.enabled);
     add(body, enabled);
     var grid = el("div", "formgrid");
     var host = inputEl("text", m.host || "", { maxlength: "63", placeholder: "192.168.1.10" });
     var port = inputEl("number", numOr(m.port, 1883), { min: "1", max: "65535", step: "1", inputmode: "numeric" });
     var user = inputEl("text", m.user || "", { maxlength: "63" });
-    var pass = inputEl("password", "", { maxlength: "63", placeholder: "leave empty to keep" });
+    var pass = inputEl("password", "", { maxlength: "63", placeholder: t("leave empty to keep") });
     pass.autocomplete = "new-password";
     var base = inputEl("text", m.base_topic || "klingelbox", { maxlength: String(TOPIC_MAX) });
     var disc = inputEl("text", m.discovery_prefix || "homeassistant", { maxlength: String(TOPIC_MAX) });
     var baseErr = el("div", "hint");
     var discErr = el("div", "hint");
-    var ha = checkField("Home Assistant discovery", m.homeassistant !== false);
-    add(grid, field("Broker host", host, null, "full"));
+    var ha = checkField(t("Home Assistant discovery"), m.homeassistant !== false);
+    add(grid, field(t("Broker host"), host, null, "full"));
     add(grid, field("Port", port));
-    add(grid, field("Username", user));
-    add(grid, field("Password", pass, "Never sent back to this page.", "full"));
+    add(grid, field(t("Username"), user));
+    add(grid, field(t("Password"), pass, t("Never sent back to this page."), "full"));
     /* These two matter more than any single node's topic: the base topic is the
        prefix of EVERY topic the box publishes, and the discovery prefix is the
        root of everything Home Assistant reads. A '#' in either does not break
        one entity, it takes the whole bridge down. Same rule, same words, same
        moment — as you type. */
-    var baseField = field("Base topic", base,
-      "Everything is published under this prefix, and virtual triggers listen on <base>/trigger/<topic>.");
+    var baseField = field(t("Base topic"), base,
+      t("Everything is published under this prefix, and virtual triggers listen on <base>/trigger/<topic>."));
     add(baseField, baseErr);
     add(grid, baseField);
-    var discField = field("Discovery prefix", disc);
+    var discField = field(t("Discovery prefix"), disc);
     add(discField, discErr);
     add(grid, discField);
     var baseCheck = bindTopicCheck(base, baseErr, "mqtt.base_topic");
@@ -4965,7 +5232,7 @@ function sectionMqtt() {
 
     var msg = el("div", "formmsg");
     var foot = el("div", "formfoot");
-    var save = el("button", "btn primary", "Save MQTT");
+    var save = el("button", "btn primary", t("Save MQTT"));
     save.type = "button";
     save.addEventListener("click", function () {
       /* Refused here rather than as a server error, and refused BEFORE the rest
@@ -4992,9 +5259,9 @@ function sectionMqtt() {
       };
       if (pass.value) mm.password = pass.value;
       save.disabled = true;
-      setMsg(msg, "Saving…");
+      setMsg(msg, t("Saving…"));
       postJSON("/api/config", { mqtt: mm }).then(function () {
-        setMsg(msg, "Saved.", "ok");
+        setMsg(msg, t("Saved."), "ok");
         pass.value = "";
         return loadConfig();
       }).catch(function (e) { setMsg(msg, e.message, "err"); })
@@ -5004,15 +5271,15 @@ function sectionMqtt() {
     add(body, foot);
   }).catch(function (e) {
     loading.remove();
-    add(body, el("div", "note warn", "Could not load MQTT settings: " + e.message));
+    add(body, el("div", "note warn", t("Could not load MQTT settings: {err}", { err: e.message })));
   });
   return s;
 }
 
 function sectionRadio() {
-  var s = section("Radio", "433 MHz front end. Change these only if you know why.");
+  var s = section(t("Radio"), t("433 MHz front end. Change these only if you know why."));
   var body = s.bodyEl;
-  var loading = el("div", "empty", "Loading…");
+  var loading = el("div", "empty", t("Loading…"));
   add(body, loading);
 
   api("/api/radio").then(function (r) {
@@ -5027,26 +5294,26 @@ function sectionRadio() {
     var pwr = inputEl("number", numOr(r.tx_power_dbm, 10), { min: "-30", max: "12", step: "1", inputmode: "numeric" });
     var reps = inputEl("number", numOr(r.tx_repeats, 6), { min: "1", max: "32", step: "1", inputmode: "numeric" });
     var gap = inputEl("number", numOr(r.tx_gap_us, 8000), { min: "500", max: "60000", step: "500", inputmode: "numeric" });
-    add(grid, field("Frequency (Hz)", freq, "433920000 for European doorbells.", "full"));
+    add(grid, field(t("Frequency (Hz)"), freq, t("433920000 for European doorbells."), "full"));
     add(grid, field("Modulation", mod));
-    add(grid, field("Data rate (bps)", rate));
-    add(grid, field("Receive bandwidth (Hz)", bw));
-    add(grid, field("TX power (dBm)", pwr, "Keep this modest: 433 MHz duty-cycle limits vary by region."));
-    add(grid, field("Default TX repeats", reps));
-    add(grid, field("Default TX gap (us)", gap));
+    add(grid, field(t("Data rate (bps)"), rate));
+    add(grid, field(t("Receive bandwidth (Hz)"), bw));
+    add(grid, field(t("TX power (dBm)"), pwr, t("Keep this modest: 433 MHz duty-cycle limits vary by region.")));
+    add(grid, field(t("Default TX repeats"), reps));
+    add(grid, field(t("Default TX gap (us)"), gap));
     add(body, grid);
     if (typeof r.rssi_dbm === "number") {
       add(body, el("div", "note",
-        "Current noise floor: " + r.rssi_dbm + " dBm. On a quiet band this sits near -95 dBm; " +
-        "a real press in the same room measures -24 to -42 dBm."));
+        t("Current noise floor: {dbm} dBm. On a quiet band this sits near -95 dBm; " +
+          "a real press in the same room measures -24 to -42 dBm.", { dbm: r.rssi_dbm })));
     }
     var msg = el("div", "formmsg");
     var foot = el("div", "formfoot");
-    var save = el("button", "btn primary", "Apply to the radio");
+    var save = el("button", "btn primary", t("Apply to the radio"));
     save.type = "button";
     save.addEventListener("click", function () {
       save.disabled = true;
-      setMsg(msg, "Reconfiguring…");
+      setMsg(msg, t("Reconfiguring…"));
       postJSON("/api/radio", {
         freq_hz: intOf(freq, 433920000),
         modulation: mod.value,
@@ -5057,7 +5324,7 @@ function sectionRadio() {
         tx_gap_us: intOf(gap, 8000)
       }).then(function (res) {
         S.radio = res && res.freq_hz ? res : S.radio;
-        setMsg(msg, "Applied live — no reboot needed.", "ok");
+        setMsg(msg, t("Applied live — no reboot needed."), "ok");
         renderStatusChips();
       }).catch(function (e) { setMsg(msg, e.message, "err"); })
         .then(function () { save.disabled = false; });
@@ -5068,8 +5335,8 @@ function sectionRadio() {
     loading.remove();
     S.has.radioCfg = false;
     add(body, el("div", "note bad",
-      "The radio is not answering, so its parameters cannot be read or changed (" + e.message + "). " +
-      "Open Diagnostics for the probe result."));
+      t("The radio is not answering, so its parameters cannot be read or changed ({err}). " +
+        "Open Diagnostics for the probe result.", { err: e.message })));
   });
   return s;
 }
@@ -5097,7 +5364,7 @@ var settingsSigRender = null;   /* set once Settings is built */
 function sectionSignals() {
   /* The blurb and the create buttons sit BELOW the list: the list is what you
      came for, and pushing it under two paragraphs of explanation buries it. */
-  var s = section("Stored signals", "", false);
+  var s = section(t("Stored signals"), "", false);
   /* Signals can be born here too, not only while wiring a node. Learning a
      remote you want on the box before you have decided what it should DO is a
      perfectly normal order to work in, and hand-entering a code you already know
@@ -5109,19 +5376,19 @@ function sectionSignals() {
   /* ...and everything explanatory goes after it. */
   add(s.bodyEl, el("div", "divider"));
   add(s.bodyEl, el("p", "muted",
-    "Every waveform the box has learned or synthesized. Nodes come and go without "
-    + "touching this list — removing one here is permanent."));
+    t("Every waveform the box has learned or synthesized. Nodes come and go without "
+      + "touching this list — removing one here is permanent.")));
 
   var mkRow = el("div", "row");
   /* Two ways to make a signal, and only two: hear one, or invent one. There
      used to be three, because "learn" and "raw capture" were separate screens
      doing the same job with different thresholds. */
   if (S.has.raw) {
-    add(mkRow, listenButton("\u{1F3A7} Listen for a signal", function (sig) {
+    add(mkRow, listenButton(t("\u{1F3A7} Listen for a signal"), function (sig) {
       if (sig) { loadSignals(); if (S.graph) loadGraph(); }
     }));
   }
-  var bMake = el("button", "btn", "\u2728 Create custom or random");
+  var bMake = el("button", "btn", t("\u2728 Create custom or random"));
   bMake.type = "button";
   bMake.addEventListener("click", function () {
     openVirtualFlow({ mode: "sink" }).then(function (sig) { if (sig) loadSignals(); });
@@ -5135,15 +5402,15 @@ function sectionSignals() {
      rest -- a partial restore that reports success is the failure mode worth
      designing out. The file format is identical either way, so the same export
      works in both places; only the acceptance rule differs. */
-  var bImp = el("button", "btn", "\u2b06 Import a signal");
+  var bImp = el("button", "btn", t("\u2b06 Import a signal"));
   bImp.type = "button";
   bImp.addEventListener("click", function () { openImportSignal(); });
   add(mkRow, bImp);
 
   add(s.bodyEl, mkRow);
   add(s.bodyEl, el("div", "hint",
-    "A signal created here belongs to no node yet. Wire it up later from the "
-    + "Dashboard, or test it straight away by opening it above."));
+    t("A signal created here belongs to no node yet. Wire it up later from the "
+      + "Dashboard, or test it straight away by opening it above.")));
 
   /* The rows stay a maintenance list: name, what it decodes to, whether a node
      uses it. Everything else is one tap away, in the same signalBlock() the
@@ -5153,14 +5420,14 @@ function sectionSignals() {
     clear(listWrap);
     if (S.signalsErr) {
       add(listWrap, el("div", "note bad",
-        "Could not read the signal store: " + S.signalsErr.message));
+        t("Could not read the signal store: {err}", { err: S.signalsErr.message })));
       return;
     }
     var list = S.signals || [];
     if (!list.length) {
       add(listWrap, el("div", "empty",
-        "Nothing stored yet. Signals appear here once you listen for a button or create a " +
-        "virtual one while adding a node."));
+        t("Nothing stored yet. Signals appear here once you listen for a button or create a " +
+          "virtual one while adding a node.")));
       return;
     }
     var ul = el("ul", "list");
@@ -5172,14 +5439,14 @@ function sectionSignals() {
       var main = el("div", "li-main");
       add(main, el("div", "li-title", signalLabel(sig)));
       add(main, el("div", "li-sub", signalIdent(sig) + "  ·  " +
-        (sig.origin === "synthesized" ? "virtual" : "learned")));
+        (sig.origin === "synthesized" ? t("virtual") : t("learned"))));
       add(main, el("div", "li-sub", usedByText(users)));
       add(b, main);
       var meta = el("div", "li-meta");
       if (typeof sig.last_seen_s === "number") add(meta, el("div", null, agoText(sig.last_seen_s)));
       add(b, meta);
-      b.setAttribute("aria-label", "Open " + signalLabel(sig));
-      b.title = "Waveform, transmit, rename, delete";
+      b.setAttribute("aria-label", t("Open {name}", { name: signalLabel(sig) }));
+      b.title = t("Waveform, transmit, rename, delete");
       b.addEventListener("click", function () { openStoredSignal(sig.id); });
       add(li, b);
       add(ul, li);
@@ -5208,7 +5475,7 @@ function sectionSignals() {
  * that is allowed to have one. */
 function openStoredSignal(id) {
   var sh = openSheet("Signal", null);
-  add(sh.body, el("div", "empty", "Loading…"));
+  add(sh.body, el("div", "empty", t("Loading…")));
   api("/api/signals/" + id).then(function (sig) {
     clear(sh.body);
     $("h3", sh.sheet).textContent = signalLabel(sig);
@@ -5223,28 +5490,28 @@ function openStoredSignal(id) {
     /* --- the one destructive action in the whole UI --- */
     var users = nodesUsingSignal(sig.id, 0);
     add(sh.body, el("div", "divider"));
-    add(sh.body, el("div", "lg-label", "Remove from the box"));
+    add(sh.body, el("div", "lg-label", t("Remove from the box")));
     add(sh.body, el("div", "hint", users.length
-      ? usedByText(users) + ". Deleting leaves those nodes without a signal until you give " +
-        "them another one — they are not deleted with it."
-      : "No node uses this signal, so deleting it changes nothing in your graph."));
+      ? t("{used}. Deleting leaves those nodes without a signal until you give " +
+          "them another one — they are not deleted with it.", { used: usedByText(users) })
+      : t("No node uses this signal, so deleting it changes nothing in your graph.")));
 
     var msg = el("div", "formmsg");
     var foot = el("div", "formfoot");
-    var del = el("button", "btn danger", "Delete signal");
+    var del = el("button", "btn danger", t("Delete signal"));
     del.type = "button";
     del.addEventListener("click", function () {
-      var lines = ["The stored waveform is removed permanently. " +
-        "If it came off a remote you will have to learn that button again."];
+      var lines = [t("The stored waveform is removed permanently. " +
+        "If it came off a remote you will have to learn that button again.")];
       if (users.length) {
-        lines.push(usedByText(users) + ". Those nodes keep existing but are left without a " +
-          "signal, and do nothing until you give them another one.");
+        lines.push(t("{used}. Those nodes keep existing but are left without a " +
+          "signal, and do nothing until you give them another one.", { used: usedByText(users) }));
       } else {
-        lines.push("No node uses it, so nothing in your graph changes.");
+        lines.push(t("No node uses it, so nothing in your graph changes."));
       }
-      confirmSheet("Delete “" + signalLabel(sig) + "”?", lines, "Delete", true).then(function (ok) {
+      confirmSheet(t("Delete “{name}”?", { name: signalLabel(sig) }), lines, t("Delete"), true).then(function (ok) {
         if (!ok) return;
-        setMsg(msg, "Deleting…");
+        setMsg(msg, t("Deleting…"));
         api("/api/signals/" + sig.id, { method: "DELETE" }).then(function () {
           sh.close();
           loadSignals();
@@ -5256,7 +5523,7 @@ function openStoredSignal(id) {
     add(sh.body, foot);
   }).catch(function (e) {
     clear(sh.body);
-    add(sh.body, el("div", "note bad", "Could not load this signal: " + e.message));
+    add(sh.body, el("div", "note bad", t("Could not load this signal: {err}", { err: e.message })));
   });
 }
 
@@ -5269,12 +5536,12 @@ function openStoredSignal(id) {
  * recovery hint. A second implementation would inevitably drift from this one.
  */
 function startOta(path, payload, what, btn, msgNode, lines) {
-  return confirmSheet("Update the " + what + "?", lines, "Update").then(function (ok) {
+  return confirmSheet(t("Update the {what}?", { what: what }), lines, t("Update")).then(function (ok) {
     if (!ok) return;
     btn.disabled = true;
-    setMsg(msgNode, "Downloading and flashing… this can take a minute.");
+    setMsg(msgNode, t("Downloading and flashing… this can take a minute."));
     return postJSON(path, payload).then(function () {
-      setMsg(msgNode, "Flashed. The box is rebooting — reload this page in a few seconds.", "ok");
+      setMsg(msgNode, t("Flashed. The box is rebooting — reload this page in a few seconds."), "ok");
     }).catch(function (e) { setMsg(msgNode, e.message, "err"); })
       .then(function () { btn.disabled = false; });
   });
@@ -5296,10 +5563,10 @@ var updateRefresh = null;   /* set once Settings is built; null = no such endpoi
 
 function updateCheckBlock() {
   var wrap = el("div", "hidden");
-  add(wrap, el("h3", null, "Newer release"));
+  add(wrap, el("h3", null, t("Newer release")));
   add(wrap, el("p", "hint",
-    "Asks GitHub for the newest published release. The answer is cached for a few hours — " +
-    "GitHub rate-limits anonymous requests, so checking is deliberately not automatic."));
+    t("Asks GitHub for the newest published release. The answer is cached for a few hours — " +
+      "GitHub rate-limits anonymous requests, so checking is deliberately not automatic.")));
 
   var chips = el("div", "chiprow");
   var info = el("div");
@@ -5308,11 +5575,11 @@ function updateCheckBlock() {
   var row = el("div", "btnrow");
   row.style.marginTop = ".6rem";
 
-  var checkBtn = el("button", "btn", "Check for updates");
+  var checkBtn = el("button", "btn", t("Check for updates"));
   checkBtn.type = "button";
-  var appBtn = el("button", "btn primary hidden", "Install firmware");
+  var appBtn = el("button", "btn primary hidden", t("Install firmware"));
   appBtn.type = "button";
-  var uiBtn = el("button", "btn hidden", "Install web UI");
+  var uiBtn = el("button", "btn hidden", t("Install web UI"));
   uiBtn.type = "button";
   add(row, checkBtn, appBtn, uiBtn);
   add(wrap, chips, info, row, msg);
@@ -5329,21 +5596,21 @@ function updateCheckBlock() {
     clear(chips);
     clear(info);
 
-    add(chips, el("span", "chip mono", "running " + (st.current || "?")));
+    add(chips, el("span", "chip mono", t("running {version}", { version: st.current || "?" })));
     if (st.checking) {
-      add(chips, el("span", "chip", "checking…"));
+      add(chips, el("span", "chip", t("checking…")));
     } else if (st.valid) {
-      add(chips, el("span", "chip mono", "latest " + (st.latest || "?")));
-      add(chips, st.update_available ? el("span", "chip warn", "update available")
-                                     : el("span", "chip ok", "up to date"));
+      add(chips, el("span", "chip mono", t("latest {version}", { version: st.latest || "?" })));
+      add(chips, st.update_available ? el("span", "chip warn", t("update available"))
+                                     : el("span", "chip ok", t("up to date")));
     } else if (!st.error) {
-      add(chips, el("span", "chip", "not checked yet"));
+      add(chips, el("span", "chip", t("not checked yet")));
     }
 
     if (st.error) add(info, el("div", "note warn", st.error));
 
     if (st.valid && st.html_url) {
-      var a = el("a", "small", "Release notes for " + (st.latest || "the newest release") + " ↗");
+      var a = el("a", "small", t("Release notes for {version} ↗", { version: st.latest || t("the newest release") }));
       a.href = st.html_url;
       a.target = "_blank";
       a.rel = "noopener noreferrer";
@@ -5353,18 +5620,18 @@ function updateCheckBlock() {
       add(info, a);
     }
     if (st.valid && st.checked_at_s) {
-      add(info, el("div", "hint", "Checked " + agoText(st.checked_at_s) + "."));
+      add(info, el("div", "hint", t("Checked {ago}.", { ago: agoText(st.checked_at_s) })));
     }
     /* The box downloads the image itself, so no home network means no check and
        no install -- the browser upload below is the answer in that case. */
     if (st.sta_connected === false) {
       add(info, el("div", "note",
-        "The box is not on a home network, so it cannot reach GitHub. Upload an image from " +
-        "this device instead — that path needs no internet on the box at all."));
+        t("The box is not on a home network, so it cannot reach GitHub. Upload an image from " +
+          "this device instead — that path needs no internet on the box at all.")));
     }
 
     checkBtn.disabled = !!st.checking || st.sta_connected === false;
-    checkBtn.textContent = st.checking ? "Checking…" : "Check for updates";
+    checkBtn.textContent = st.checking ? t("Checking…") : t("Check for updates");
     show(appBtn, !!(st.update_available && st.app_url));
     show(uiBtn, !!(st.update_available && st.webui_url));
   }
@@ -5391,7 +5658,7 @@ function updateCheckBlock() {
   checkBtn.addEventListener("click", function () {
     setMsg(msg, "");
     checkBtn.disabled = true;
-    checkBtn.textContent = "Checking…";
+    checkBtn.textContent = t("Checking…");
     postJSON("/api/update/check", { force: true }).then(function (st) {
       render(st);
       /* The fetch runs on the box; poll the local status until it settles. */
@@ -5399,7 +5666,7 @@ function updateCheckBlock() {
     }).catch(function (e) {
       setMsg(msg, e.message, "err");
       checkBtn.disabled = false;
-      checkBtn.textContent = "Check for updates";
+      checkBtn.textContent = t("Check for updates");
     });
   });
 
@@ -5407,12 +5674,13 @@ function updateCheckBlock() {
     if (!last) return;
     var url = webui ? last.webui_url : last.app_url;
     startOta("/api/update/install", { webui: webui },
-      (webui ? "web UI" : "firmware") + " to " + (last.latest || "the newest release"),
+      t("{what} to {version}", { what: webui ? t("web UI") : t("firmware"),
+                                 version: last.latest || t("the newest release") }),
       btn, msg,
       [url,
-       "The box downloads and flashes it, then reboots. Do not power it off.",
-       webui ? "The current web UI is erased first; the firmware and your signals are untouched."
-             : "Only the app is replaced. Update the web UI as a second step once the box is back."]);
+       t("The box downloads and flashes it, then reboots. Do not power it off."),
+       webui ? t("The current web UI is erased first; the firmware and your signals are untouched.")
+             : t("Only the app is replaced. Update the web UI as a second step once the box is back.")]);
   }
   appBtn.addEventListener("click", function () { install(false, appBtn); });
   uiBtn.addEventListener("click", function () { install(true, uiBtn); });
@@ -5428,13 +5696,13 @@ function updateCheckBlock() {
 }
 
 function sectionFirmware() {
-  var s = section("Firmware & web UI update",
-    "Two separate images: the app, and this web UI. Updating one leaves the other alone.");
+  var s = section(t("Firmware & web UI update"),
+    t("Two separate images: the app, and this web UI. Updating one leaves the other alone."));
   var body = s.bodyEl;
 
   add(body, el("div", "note",
-    "The app image and the web UI live in different partitions. After an app update the old " +
-    "UI is still being served until you update it too — that is normal, not a failure."));
+    t("The app image and the web UI live in different partitions. After an app update the old " +
+      "UI is still being served until you update it too — that is normal, not a failure.")));
 
   /* --- is there a newer release? --- */
   add(body, updateCheckBlock());
@@ -5446,33 +5714,33 @@ function sectionFirmware() {
      prefilled with the stable release asset for its own kind, so the common
      case is a click. */
   add(body, el("div", "divider"));
-  add(body, el("h3", null, "From a URL"));
+  add(body, el("h3", null, t("From a URL")));
   add(body, el("div", "note",
-    "Prefilled with the latest stable release of each image. They are ordinary text fields — " +
-    "point them at a fork, a test build or a file on your own web server and the box fetches " +
-    "that instead. The automatic check above needs none of this: it uses the URLs it finds in " +
-    "the release itself."));
+    t("Prefilled with the latest stable release of each image. They are ordinary text fields — " +
+      "point them at a fork, a test build or a file on your own web server and the box fetches " +
+      "that instead. The automatic check above needs none of this: it uses the URLs it finds in " +
+      "the release itself.")));
 
   var urlIn = inputEl("url", "", { placeholder: OTA_DEFAULT_APP_URL });
   urlIn.type = "url";
-  add(body, field("Firmware image URL", urlIn,
-    "The box downloads it itself, so it needs working internet."));
+  add(body, field(t("Firmware image URL"), urlIn,
+    t("The box downloads it itself, so it needs working internet.")));
   var uiUrlIn = inputEl("url", "", { placeholder: OTA_DEFAULT_WEBUI_URL });
   uiUrlIn.type = "url";
-  add(body, field("Web UI image URL", uiUrlIn,
-    "The second, separate image — this page itself."));
+  add(body, field(t("Web UI image URL"), uiUrlIn,
+    t("The second, separate image — this page itself.")));
 
   var urlMsg = el("div", "formmsg");
   var urlRow = el("div", "btnrow");
-  var appBtn = el("button", "btn primary", "Update firmware");
+  var appBtn = el("button", "btn primary", t("Update firmware"));
   appBtn.type = "button";
-  var uiBtn = el("button", "btn", "Update web UI");
+  var uiBtn = el("button", "btn", t("Update web UI"));
   uiBtn.type = "button";
   function urlUpdate(path, what, btn, input) {
     var u = trimOf(input);
-    if (!u) { setMsg(urlMsg, "Enter the " + what + " image URL first.", "err"); return; }
-    startOta(path, { url: u }, what + " from this URL", btn, urlMsg,
-      [u, "The box downloads and flashes it, then reboots. Do not power it off."]);
+    if (!u) { setMsg(urlMsg, t("Enter the {what} image URL first.", { what: t(what) }), "err"); return; }
+    startOta(path, { url: u }, t("{what} from this URL", { what: t(what) }), btn, urlMsg,
+      [u, t("The box downloads and flashes it, then reboots. Do not power it off.")]);
   }
   appBtn.addEventListener("click", function () { urlUpdate("/api/ota", "firmware", appBtn, urlIn); });
   uiBtn.addEventListener("click", function () { urlUpdate("/api/ota/webui", "web UI", uiBtn, uiUrlIn); });
@@ -5494,9 +5762,9 @@ function sectionFirmware() {
 
   /* --- browser upload --- */
   add(body, el("div", "divider"));
-  add(body, el("h3", null, "Or upload from this device"));
+  add(body, el("h3", null, t("Or upload from this device")));
   add(body, el("p", "hint",
-    "Works with no internet on the box at all — useful over the setup hotspot."));
+    t("Works with no internet on the box at all — useful over the setup hotspot.")));
 
   var prog = el("div", "progress hidden");
   var bar = el("i");
@@ -5510,24 +5778,24 @@ function sectionFirmware() {
     f.style.fontSize = "1rem";
     f.style.padding = ".55rem 0";
     var wrap = field(labelText, f);
-    var b = el("button", "btn", "Upload & flash");
+    var b = el("button", "btn", t("Upload & flash"));
     b.type = "button";
     b.style.marginTop = ".3rem";
     b.addEventListener("click", function () {
       var file = f.files && f.files[0];
-      if (!file) { setMsg(upMsg, "Choose a .bin file first.", "err"); return; }
-      confirmSheet("Flash “" + file.name + "” as the new " + what + "?",
-        [(file.size / 1048576).toFixed(2) + " MB, written into flash as it arrives.",
+      if (!file) { setMsg(upMsg, t("Choose a .bin file first."), "err"); return; }
+      confirmSheet(t("Flash “{name}” as the new {what}?", { name: file.name, what: t(what) }),
+        [t("{size} MB, written into flash as it arrives.", { size: (file.size / 1048576).toFixed(2) }),
          what === "web UI"
-           ? "The current web UI is erased first. If the upload is interrupted the UI stays blank until a good image is pushed; the firmware and your signals are untouched."
-           : "The image is validated before it becomes the boot target, and a bad one is rolled back on the next boot.",
-         "Do not close this page or power the box off during the upload."],
-        "Upload & flash").then(function (ok) {
+           ? t("The current web UI is erased first. If the upload is interrupted the UI stays blank until a good image is pushed; the firmware and your signals are untouched.")
+           : t("The image is validated before it becomes the boot target, and a bad one is rolled back on the next boot."),
+         t("Do not close this page or power the box off during the upload.")],
+        t("Upload & flash")).then(function (ok) {
         if (!ok) return;
         b.disabled = true;
         prog.classList.remove("hidden");
         bar.style.width = "0%";
-        setMsg(upMsg, "Uploading…");
+        setMsg(upMsg, t("Uploading…"));
         var xhr = new XMLHttpRequest();
         xhr.open("POST", path);
         xhr.setRequestHeader("Content-Type", "application/octet-stream");
@@ -5536,7 +5804,7 @@ function sectionFirmware() {
           if (!ev.lengthComputable) return;
           var pc = Math.round(ev.loaded * 100 / ev.total);
           bar.style.width = pc + "%";
-          setMsg(upMsg, "Uploading… " + pc + "%");
+          setMsg(upMsg, t("Uploading… {pc}%", { pc: pc }));
         };
         xhr.onload = function () {
           var res = {};
@@ -5544,16 +5812,16 @@ function sectionFirmware() {
           b.disabled = false;
           if (xhr.status === 200 && !res.error) {
             bar.style.width = "100%";
-            setMsg(upMsg, "Flashed. The box is rebooting — reload this page in a few seconds.", "ok");
+            setMsg(upMsg, t("Flashed. The box is rebooting — reload this page in a few seconds."), "ok");
           } else {
             prog.classList.add("hidden");
-            setMsg(upMsg, "Upload failed: " + (res.error || ("HTTP " + xhr.status)), "err");
+            setMsg(upMsg, t("Upload failed: {err}", { err: res.error || ("HTTP " + xhr.status) }), "err");
           }
         };
         xhr.onerror = xhr.ontimeout = function () {
           b.disabled = false;
           prog.classList.add("hidden");
-          setMsg(upMsg, "Upload failed: the connection dropped. If the box was mid-flash it reboots on its current image.", "err");
+          setMsg(upMsg, t("Upload failed: the connection dropped. If the box was mid-flash it reboots on its current image."), "err");
         };
         xhr.send(file);
       });
@@ -5563,8 +5831,8 @@ function sectionFirmware() {
   }
   /* The release asset is called klingelbox.bin; the label said doorbell433.bin,
      which is the project's old name and matches no file anyone can download. */
-  add(body, uploadRow("Firmware image (klingelbox.bin)", "/api/ota/upload", "firmware"));
-  add(body, uploadRow("Web UI image (storage.bin)", "/api/ota/webui/upload", "web UI"));
+  add(body, uploadRow(t("Firmware image (klingelbox.bin)"), "/api/ota/upload", "firmware"));
+  add(body, uploadRow(t("Web UI image (storage.bin)"), "/api/ota/webui/upload", "web UI"));
   add(body, prog, upMsg);
   return s;
 }
@@ -5610,32 +5878,32 @@ function sectionFirmware() {
    and a pointer to Settings -> Backup, because "wrong file" is not a useful
    thing to tell someone holding a file that is perfectly valid elsewhere. */
 function openImportSignal() {
-  var sh = openSheet("Import a signal", "");
+  var sh = openSheet(t("Import a signal"), "");
   var body = sh.bodyEl;
 
   add(body, el("p", "muted",
-    "Choose a .json exported from a signal's Export button \u2014 on this box or another one. " +
-    "The waveform is re-analysed here, so the imported signal behaves exactly like one you learned yourself."));
+    t("Choose a .json exported from a signal's Export button \u2014 on this box or another one. " +
+      "The waveform is re-analysed here, so the imported signal behaves exactly like one you learned yourself.")));
 
   var file = el("input");
   file.type = "file";
   file.accept = ".json,application/json";
   file.style.fontSize = "1rem";
   file.style.padding = ".55rem 0";
-  add(body, field("Signal file", file, "Nothing is written until you choose Import below."));
+  add(body, field(t("Signal file"), file, t("Nothing is written until you choose Import below.")));
 
-  var nameIn = inputEl("text", "", { maxlength: "31", placeholder: "leave empty to keep the exported name" });
-  add(body, field("Name on this box", nameIn, "Optional \u2014 useful when you already have a signal with the same name."));
+  var nameIn = inputEl("text", "", { maxlength: "31", placeholder: t("leave empty to keep the exported name") });
+  add(body, field(t("Name on this box"), nameIn, t("Optional \u2014 useful when you already have a signal with the same name.")));
 
   var info = el("div", "note hidden");
   add(body, info);
 
   var msg = el("div", "formmsg");
   var foot = el("div", "formfoot");
-  var go = el("button", "btn primary", "Import");
+  var go = el("button", "btn primary", t("Import"));
   go.type = "button";
   go.disabled = true;
-  var cancel = el("button", "btn ghost", "Cancel");
+  var cancel = el("button", "btn ghost", t("Cancel"));
   cancel.type = "button";
   cancel.addEventListener("click", function () { sh.close(); });
   add(foot, go, cancel, msg);
@@ -5653,14 +5921,14 @@ function openImportSignal() {
     rd.onload = function () {
       var b;
       try { b = JSON.parse(String(rd.result)); }
-      catch (e) { setMsg(msg, "That file is not valid JSON.", "err"); return; }
+      catch (e) { setMsg(msg, t("That file is not valid JSON."), "err"); return; }
 
       if (!b || b.kind !== BACKUP_KIND) {
-        setMsg(msg, "That is not a Klingelbox export.", "err"); return;
+        setMsg(msg, t("That is not a Klingelbox export."), "err"); return;
       }
       if (numOr(b.version, 0) > BACKUP_VERSION) {
-        setMsg(msg, "That file was written by a newer Klingelbox (format v" + b.version +
-                    "). Update this box first.", "err"); return;
+        setMsg(msg, t("That file was written by a newer Klingelbox (format v{version}). Update this box first.",
+                      { version: b.version }), "err"); return;
       }
       var sigs = isArr(b.signals) ? b.signals : [];
       var nodes = (b.graph && isArr(b.graph.nodes)) ? b.graph.nodes : [];
@@ -5668,48 +5936,52 @@ function openImportSignal() {
 
       if (sigs.length !== 1 || nodes.length || links.length) {
         /* Name what it actually is, and where it DOES work. */
-        setMsg(msg, "This looks like a full backup (" + sigs.length + " signal" +
-                    (sigs.length === 1 ? "" : "s") +
-                    (nodes.length ? ", " + nodes.length + " node" + (nodes.length === 1 ? "" : "s") : "") +
-                    "). Import it from Settings \u2192 Backup instead \u2014 this button takes a single " +
-                    "exported signal.", "err");
+        var what = (sigs.length === 1 ? t("{n} signal", { n: sigs.length })
+                                      : t("{n} signals", { n: sigs.length })) +
+                   (nodes.length ? (nodes.length === 1 ? t(", {n} node", { n: nodes.length })
+                                                       : t(", {n} nodes", { n: nodes.length })) : "");
+        setMsg(msg, t("This looks like a full backup ({what}). Import it from Settings \u2192 Backup " +
+                      "instead \u2014 this button takes a single exported signal.", { what: what }), "err");
         return;
       }
       var sig = sigs[0];
       if (!isArr(sig.durations_us) || !sig.durations_us.length) {
-        setMsg(msg, "That signal carries no waveform, so there is nothing to import.", "err"); return;
+        setMsg(msg, t("That signal carries no waveform, so there is nothing to import."), "err"); return;
       }
       pending = sig;
       info.classList.remove("hidden");
       clear(info);
-      add(info, el("div", null, "\u201c" + (sig.name || "unnamed") + "\u201d \u2014 " +
-                                sig.durations_us.length + " pulses, origin " + (sig.origin || "captured")));
+      add(info, el("div", null, t("\u201c{name}\u201d \u2014 {pulses} pulses, origin {origin}",
+                                  { name: sig.name || t("unnamed"),
+                                    pulses: sig.durations_us.length,
+                                    origin: sig.origin || "captured" })));
       if (b.device && b.device.hostname)
-        add(info, el("div", "hint", "Exported from " + b.device.hostname));
+        add(info, el("div", "hint", t("Exported from {host}", { host: b.device.hostname })));
       if (!trimOf(nameIn)) nameIn.value = sig.name || "";
       go.disabled = false;
       setMsg(msg, "");
     };
-    rd.onerror = function () { setMsg(msg, "Could not read that file.", "err"); };
+    rd.onerror = function () { setMsg(msg, t("Could not read that file."), "err"); };
     rd.readAsText(f);
   });
 
   go.addEventListener("click", function () {
     if (!pending) return;
     go.disabled = true;
-    setMsg(msg, "Importing\u2026");
+    setMsg(msg, t("Importing\u2026"));
     postJSON("/api/signals/import", {
-      name: trimOf(nameIn) || pending.name || "Imported signal",
+      name: trimOf(nameIn) || pending.name || t("Imported signal"),
       first_level: numOr(pending.first_level, 0),
       durations_us: pending.durations_us,
       origin: "imported"
     }).then(function (created) {
       loadSignals();
       sh.close();
-      alertSheet("Signal imported",
-        "\u201c" + (created.name || "") + "\u201d is stored as id " + created.id + ". " +
-        (created.decoded ? "It decodes as " + created.decoded.text + ". " : "No decoder recognised it, which is fine \u2014 it can still be transmitted. ") +
-        "Wire it up from the Dashboard, or open it here to test it.");
+      alertSheet(t("Signal imported"),
+        t("\u201c{name}\u201d is stored as id {id}. {decoded}Wire it up from the Dashboard, or open it here to test it.",
+          { name: created.name || "", id: created.id,
+            decoded: (created.decoded ? t("It decodes as {text}. ", { text: created.decoded.text })
+                                      : t("No decoder recognised it, which is fine \u2014 it can still be transmitted. ")) }));
     }).catch(function (e) {
       go.disabled = false;
       setMsg(msg, e.message, "err");
@@ -5806,7 +6078,7 @@ function buildBundle(onStep) {
           first_level: numOr(sig.first_level, 0),
           durations_us: sig.durations_us || []
         });
-        tick("Read “" + signalLabel(meta) + "”…");
+        tick(t("Read “{name}”…", { name: signalLabel(meta) }));
       });
     });
   }).then(function () {
@@ -5820,7 +6092,7 @@ function buildBundle(onStep) {
     bundle.graph.links = (g.links || []).map(function (l) {
       return { from: l.from, to: l.to };
     });
-    tick("Read the node graph.");
+    tick(t("Read the node graph."));
     return bundle;
   });
 }
@@ -5845,19 +6117,19 @@ function downloadBundle(bundle, name) {
    importing nonsense approximately. Returns null when the bundle is readable. */
 function validateBundle(b) {
   if (!b || typeof b !== "object" || isArr(b))
-    return "That file is not a Klingelbox backup — it is not even a JSON object.";
+    return t("That file is not a Klingelbox backup — it is not even a JSON object.");
   if (b.kind !== BACKUP_KIND)
-    return "That is not a Klingelbox backup. Its “kind” is " +
-           (b.kind ? "“" + String(b.kind) + "”" : "missing") +
-           ", and a backup says “" + BACKUP_KIND + "”.";
+    return t("That is not a Klingelbox backup. Its “kind” is {kind}, and a backup says “{expected}”.",
+             { kind: (b.kind ? "“" + String(b.kind) + "”" : t("missing")),
+               expected: BACKUP_KIND });
   var v = numOr(b.version, 0);
-  if (v < 1) return "That backup has no usable version number, so it cannot be read.";
+  if (v < 1) return t("That backup has no usable version number, so it cannot be read.");
   if (v > BACKUP_VERSION)
-    return "That backup is version " + v + " and this box understands version " +
-           BACKUP_VERSION + ". Update the firmware first — importing it " +
-           "half-understood would be worse than not importing it at all.";
+    return t("That backup is version {version} and this box understands version {supported}. " +
+             "Update the firmware first — importing it half-understood would be worse than " +
+             "not importing it at all.", { version: v, supported: BACKUP_VERSION });
   if (!isArr(b.signals) || !b.graph || !isArr(b.graph.nodes) || !isArr(b.graph.links))
-    return "That backup is missing its signals or its graph, so it cannot be read.";
+    return t("That backup is missing its signals or its graph, so it cannot be read.");
   return null;
 }
 
@@ -5880,17 +6152,19 @@ function capacityCheck(b, mode) {
   if (!bad.length) return { rows: rows, error: null };
 
   var parts = bad.map(function (r) {
-    return (r[1] + r[2]) + " " + r[0].toLowerCase() + " (the limit is " + r[3] + ")";
+    return t("{count} {what} (the limit is {limit})",
+             { count: r[1] + r[2], what: t(r[0].toLowerCase()), limit: r[3] });
   });
   if (wipe) {
     return { rows: rows, error:
-      "Even on an empty box this backup does not fit: it needs " + parts.join(", and ") +
-      ". Nothing has been changed. Trim the backup on the box it came from and export it again." };
+      t("Even on an empty box this backup does not fit: it needs {needs}. Nothing has been " +
+        "changed. Trim the backup on the box it came from and export it again.",
+        { needs: parts.join(t(", and ")) }) };
   }
   return { rows: rows, error:
-    "Merging would need " + parts.join(", and ") +
-    ". Nothing has been changed. Delete what you no longer need first, or use Replace, " +
-    "which clears this box before importing." };
+    t("Merging would need {needs}. Nothing has been changed. Delete what you no longer need " +
+      "first, or use Replace, which clears this box before importing.",
+      { needs: parts.join(t(", and ")) }) };
 }
 
 /*
@@ -5921,15 +6195,15 @@ function runImport(bundle, mode, withRadio, onStep, onLog) {
       return api("/api/graph/nodes/" + n.id, { method: "DELETE" }).then(function () {
         rep.clearedNodes++;
       }).catch(function (e) {
-        skip("Could not delete node “" + (n.name || n.id) + "”: " + e.message);
-      }).then(function () { tick("Clearing the graph…"); });
+        skip(t("Could not delete node “{name}”: {error}", { name: n.name || n.id, error: e.message }));
+      }).then(function () { tick(t("Clearing the graph…")); });
     }).then(function () {
       return serialEach(oldSigs, function (s) {
         return api("/api/signals/" + s.id, { method: "DELETE" }).then(function () {
           rep.clearedSignals++;
         }).catch(function (e) {
-          skip("Could not delete signal “" + signalLabel(s) + "”: " + e.message);
-        }).then(function () { tick("Clearing the signal store…"); });
+          skip(t("Could not delete signal “{name}”: {error}", { name: signalLabel(s), error: e.message }));
+        }).then(function () { tick(t("Clearing the signal store…")); });
       });
     });
   }
@@ -5937,15 +6211,15 @@ function runImport(bundle, mode, withRadio, onStep, onLog) {
   /* 2. Signals, recording old id -> new id as the DEVICE assigns them. */
   function signalsPhase() {
     return serialEach(bundle.signals, function (s) {
-      var label = s.name || ("Signal " + s.id);
+      var label = s.name || t("Signal {id}", { id: s.id });
       if (storeFull) {
-        skip("“" + label + "” — no room left in the signal store.");
+        skip(t("“{label}” — no room left in the signal store.", { label: label }));
         tick("");
         return;
       }
       var pulses = isArr(s.durations_us) ? s.durations_us : [];
       if (!pulses.length) {
-        skip("“" + label + "” — the backup carries no waveform for it.");
+        skip(t("“{label}” — the backup carries no waveform for it.", { label: label }));
         tick("");
         return;
       }
@@ -5957,14 +6231,14 @@ function runImport(bundle, mode, withRadio, onStep, onLog) {
       }).then(function (created) {
         if (s.id) sigMap[s.id] = created.id;
         rep.signals++;
-        note("Signal “" + label + "” → #" + created.id);
+        note(t("Signal “{label}” → #{id}", { label: label, id: created.id }));
       }).catch(function (e) {
         /* 507 is "nothing more will ever fit", not "this one was wrong", so the
            rest are skipped with an honest reason instead of 30 identical
            failures scrolling past. */
         if (e.status === 507) storeFull = true;
-        skip("“" + label + "” — " + e.message);
-      }).then(function () { tick("Importing signals…"); });
+        skip(t("“{label}” — {error}", { label: label, error: e.message }));
+      }).then(function () { tick(t("Importing signals…")); });
     });
   }
 
@@ -5996,14 +6270,14 @@ function runImport(bundle, mode, withRadio, onStep, onLog) {
         rep.nodes++;
         if (unbound) {
           rep.unbound++;
-          skip("Node “" + (n.name || created.id) + "” was created unbound and switched " +
-               "off — its signal did not import. Pick a signal for it, then enable it.");
+          skip(t("Node “{name}” was created unbound and switched off — its signal did not " +
+                 "import. Pick a signal for it, then enable it.", { name: n.name || created.id }));
         } else {
-          note("Node “" + (n.name || created.id) + "” → #" + created.id);
+          note(t("Node “{name}” → #{id}", { name: n.name || created.id, id: created.id }));
         }
       }).catch(function (e) {
-        skip("Node “" + (n.name || n.id) + "” — " + e.message);
-      }).then(function () { tick("Importing nodes…"); });
+        skip(t("Node “{name}” — {error}", { name: n.name || n.id, error: e.message }));
+      }).then(function () { tick(t("Importing nodes…")); });
     });
   }
 
@@ -6013,18 +6287,18 @@ function runImport(bundle, mode, withRadio, onStep, onLog) {
       var from = nodeMap[numOr(l.from, 0)];
       var to = nodeMap[numOr(l.to, 0)];
       if (!from || !to) {
-        skip("A link (" + l.from + " → " + l.to + ") was dropped: " +
-             (!from && !to ? "neither of its nodes"
-                           : (!from ? "the node it starts at" : "the node it ends at")) +
-             " could be created.");
+        skip(t("A link ({from} → {to}) was dropped: {which} could be created.",
+               { from: l.from, to: l.to,
+                 which: (!from && !to ? t("neither of its nodes")
+                                      : (!from ? t("the node it starts at") : t("the node it ends at"))) }));
         tick("");
         return;
       }
       return postJSON("/api/graph/links", { from: from, to: to }).then(function () {
         rep.links++;
       }).catch(function (e) {
-        skip("A link (" + l.from + " → " + l.to + ") — " + e.message);
-      }).then(function () { tick("Importing links…"); });
+        skip(t("A link ({from} → {to}) — {error}", { from: l.from, to: l.to, error: e.message }));
+      }).then(function () { tick(t("Importing links…")); });
     });
   }
 
@@ -6033,8 +6307,8 @@ function runImport(bundle, mode, withRadio, onStep, onLog) {
     return postJSON("/api/radio", bundle.radio).then(function () {
       rep.radio = true;
     }).catch(function (e) {
-      skip("Radio settings — " + e.message);
-    }).then(function () { tick("Applying radio settings…"); });
+      skip(t("Radio settings — {error}", { error: e.message }));
+    }).then(function () { tick(t("Applying radio settings…")); });
   }
 
   return clearPhase().then(signalsPhase).then(nodesPhase)
@@ -6042,28 +6316,28 @@ function runImport(bundle, mode, withRadio, onStep, onLog) {
 }
 
 function sectionBackup() {
-  var s = section("Backup",
-    "Save this box's signals and automations to a file, and restore them here or on another Klingelbox.");
+  var s = section(t("Backup"),
+    t("Save this box's signals and automations to a file, and restore them here or on another Klingelbox."));
   var body = s.bodyEl;
 
   add(body, el("div", "note",
-    "A backup holds the learned waveforms and the whole node graph. It deliberately holds " +
-    "NO passwords: not the Wi-Fi passphrase, not the hotspot password, not the MQTT " +
-    "credentials, not even their hashes. Set those up again on the new box."));
+    t("A backup holds the learned waveforms and the whole node graph. It deliberately holds " +
+      "NO passwords: not the Wi-Fi passphrase, not the hotspot password, not the MQTT " +
+      "credentials, not even their hashes. Set those up again on the new box.")));
 
   /* ---- export ---- */
-  add(body, el("h3", null, "Export"));
+  add(body, el("h3", null, t("Export")));
   var exMsg = el("div", "formmsg");
   var exProg = el("div", "progress hidden");
   var exBar = el("i");
   add(exProg, exBar);
-  var exBtn = el("button", "btn primary", "Export backup file");
+  var exBtn = el("button", "btn primary", t("Export backup file"));
   exBtn.type = "button";
   exBtn.addEventListener("click", function () {
     exBtn.disabled = true;
     exProg.classList.remove("hidden");
     exBar.style.width = "0%";
-    setMsg(exMsg, "Reading the box…");
+    setMsg(exMsg, t("Reading the box…"));
     buildBundle(function (done, total, text) {
       exBar.style.width = Math.round(done * 100 / Math.max(1, total)) + "%";
       if (text) setMsg(exMsg, text);
@@ -6071,12 +6345,13 @@ function sectionBackup() {
       var name = backupFilename(bundle.device && bundle.device.hostname);
       var bytes = downloadBundle(bundle, name);
       exBar.style.width = "100%";
-      setMsg(exMsg, "Saved " + name + " — " + bundle.signals.length + " signals, " +
-                    bundle.graph.nodes.length + " nodes, " + bundle.graph.links.length +
-                    " links, " + Math.max(1, Math.round(bytes / 1024)) + " KB.", "ok");
+      setMsg(exMsg, t("Saved {file} — {signals} signals, {nodes} nodes, {links} links, {kb} KB.",
+                      { file: name, signals: bundle.signals.length,
+                        nodes: bundle.graph.nodes.length, links: bundle.graph.links.length,
+                        kb: Math.max(1, Math.round(bytes / 1024)) }), "ok");
     }).catch(function (e) {
       exProg.classList.add("hidden");
-      setMsg(exMsg, "Export failed: " + e.message, "err");
+      setMsg(exMsg, t("Export failed: {error}", { error: e.message }), "err");
     }).then(function () { exBtn.disabled = false; });
   });
   var exFoot = el("div", "formfoot");
@@ -6085,18 +6360,18 @@ function sectionBackup() {
 
   /* ---- import ---- */
   add(body, el("div", "divider"));
-  add(body, el("h3", null, "Restore"));
+  add(body, el("h3", null, t("Restore")));
 
   var file = el("input");
   file.type = "file";
   file.accept = ".json,application/json";
   file.style.fontSize = "1rem";
   file.style.padding = ".55rem 0";
-  add(body, field("Backup file", file, "Nothing is written to the box until you choose Merge or Replace."));
+  add(body, field(t("Backup file"), file, t("Nothing is written to the box until you choose Merge or Replace.")));
 
-  var radioOpt = checkField("Also restore the radio settings", false,
-    "Frequency, bandwidth, TX power and repeats. Off by default: those are this box's " +
-    "behaviour, and the box you are restoring to may have a different antenna.");
+  var radioOpt = checkField(t("Also restore the radio settings"), false,
+    t("Frequency, bandwidth, TX power and repeats. Off by default: those are this box's " +
+      "behaviour, and the box you are restoring to may have a different antenna."));
   var preview = el("div");
   var log = el("div", "note hidden");
   /* One-off styles rather than a stylesheet rule, as elsewhere in this file:
@@ -6129,13 +6404,14 @@ function sectionBackup() {
     /* The truthful summary. A partial import that claims success is worse than
        a visible failure, so the counts come from what the device actually
        acknowledged and the skips are listed in full above. */
-    var parts = [rep.signals + " signals", rep.nodes + " nodes", rep.links + " links"];
-    if (rep.radio) parts.push("radio settings");
-    var line = (mode === "replace" ? "Replaced. " : "Merged. ") + "Imported " +
-               parts.join(", ") + ".";
-    if (rep.unbound) line += " " + rep.unbound + " node(s) came in unbound and switched off.";
+    var parts = [t("{n} signals", { n: rep.signals }), t("{n} nodes", { n: rep.nodes }),
+                 t("{n} links", { n: rep.links })];
+    if (rep.radio) parts.push(t("radio settings"));
+    var line = (mode === "replace" ? t("Replaced. ") : t("Merged. ")) +
+               t("Imported {items}.", { items: parts.join(", ") });
+    if (rep.unbound) line += " " + t("{n} node(s) came in unbound and switched off.", { n: rep.unbound });
     if (rep.skipped.length) {
-      line += " " + rep.skipped.length + " item(s) were skipped — see the list above.";
+      line += " " + t("{n} item(s) were skipped — see the list above.", { n: rep.skipped.length });
       setMsg(imMsg, line, "warn");
     } else {
       setMsg(imMsg, line, "ok");
@@ -6155,7 +6431,7 @@ function sectionBackup() {
     /* Re-read the box first: Settings is built once, the user may have edited
        the graph on the Dashboard since, and the capacity arithmetic below is
        only worth anything if it is arithmetic about the CURRENT box. */
-    setMsg(imMsg, "Checking what will fit…");
+    setMsg(imMsg, t("Checking what will fit…"));
     Promise.all([loadSignals(), loadGraph()]).then(function () {
       var cap = capacityCheck(bundle, mode);
       if (cap.error) { setMsg(imMsg, cap.error, "err"); return; }
@@ -6163,33 +6439,37 @@ function sectionBackup() {
       var lines;
       if (mode === "replace") {
         lines = [
-          "This DELETES all " + (S.signals || []).length + " stored signals and all " +
-          ((S.graph && S.graph.nodes) || []).length + " nodes with their " +
-          ((S.graph && S.graph.links) || []).length + " links on this box, and cannot be undone.",
-          "Then it imports " + bundle.signals.length + " signals, " +
-          bundle.graph.nodes.length + " nodes and " + bundle.graph.links.length + " links.",
-          "Wi-Fi, hotspot and MQTT settings are not touched.",
-          "The import is not atomic: if it fails half way, what got in stays in."
+          t("This DELETES all {signals} stored signals and all {nodes} nodes with their " +
+            "{links} links on this box, and cannot be undone.",
+            { signals: (S.signals || []).length,
+              nodes: ((S.graph && S.graph.nodes) || []).length,
+              links: ((S.graph && S.graph.links) || []).length }),
+          t("Then it imports {signals} signals, {nodes} nodes and {links} links.",
+            { signals: bundle.signals.length, nodes: bundle.graph.nodes.length,
+              links: bundle.graph.links.length }),
+          t("Wi-Fi, hotspot and MQTT settings are not touched."),
+          t("The import is not atomic: if it fails half way, what got in stays in.")
         ];
       } else {
         lines = [
-          "Nothing existing is deleted. " + bundle.signals.length + " signals, " +
-          bundle.graph.nodes.length + " nodes and " + bundle.graph.links.length +
-          " links are ADDED, with new ids.",
-          "Signals identical to ones you already have will be duplicated — a merge " +
-          "cannot tell a re-import from a second doorbell.",
-          "The import is not atomic: if it fails half way, what got in stays in."
+          t("Nothing existing is deleted. {signals} signals, {nodes} nodes and {links} links " +
+            "are ADDED, with new ids.",
+            { signals: bundle.signals.length, nodes: bundle.graph.nodes.length,
+              links: bundle.graph.links.length }),
+          t("Signals identical to ones you already have will be duplicated — a merge " +
+            "cannot tell a re-import from a second doorbell."),
+          t("The import is not atomic: if it fails half way, what got in stays in.")
         ];
       }
-      return confirmSheet(mode === "replace" ? "Replace everything on this box?" : "Merge this backup in?",
-                          lines, mode === "replace" ? "Erase & import" : "Merge",
+      return confirmSheet(mode === "replace" ? t("Replace everything on this box?") : t("Merge this backup in?"),
+                          lines, mode === "replace" ? t("Erase & import") : t("Merge"),
                           mode === "replace").then(function (ok) {
         if (!ok) { setMsg(imMsg, ""); return; }
         clear(log);
         log.classList.remove("hidden");
         imProg.classList.remove("hidden");
         imBar.style.width = "0%";
-        setMsg(imMsg, "Importing…");
+        setMsg(imMsg, t("Importing…"));
         $$("button", preview).forEach(function (b) { b.disabled = true; });
         file.disabled = true;
         return runImport(bundle, mode, !!radioOpt.input.checked, function (done, total, text) {
@@ -6201,7 +6481,7 @@ function sectionBackup() {
         });
       });
     }).catch(function (e) {
-      setMsg(imMsg, "Import failed: " + e.message, "err");
+      setMsg(imMsg, t("Import failed: {error}", { error: e.message }), "err");
     }).then(function () {
       file.disabled = false;
       $$("button", preview).forEach(function (b) { b.disabled = false; });
@@ -6213,14 +6493,16 @@ function sectionBackup() {
     var dev = bundle.device || {};
     var when = fmtEpoch(numOr(bundle.exported_at, 0));
     add(preview, el("div", "note ok",
-      "From “" + (dev.hostname || "an unnamed box") + "”" +
-      (dev.version ? ", firmware " + dev.version : "") +
-      (when ? ", exported " + when : "") + "."));
+      t("From “{host}”{firmware}{when}.", {
+        host: dev.hostname || t("an unnamed box"),
+        firmware: (dev.version ? t(", firmware {version}", { version: dev.version }) : ""),
+        when: (when ? t(", exported {when}", { when: when }) : "")
+      })));
     var dl = el("dl", "kv");
-    [["Signals", String(bundle.signals.length)],
-     ["Nodes", String(bundle.graph.nodes.length)],
-     ["Links", String(bundle.graph.links.length)],
-     ["Radio settings", bundle.radio ? "included (optional below)" : "not in this file"]
+    [[t("Signals"), String(bundle.signals.length)],
+     [t("Nodes"), String(bundle.graph.nodes.length)],
+     [t("Links"), String(bundle.graph.links.length)],
+     [t("Radio settings"), bundle.radio ? t("included (optional below)") : t("not in this file")]
     ].forEach(function (kv) {
       add(dl, el("dt", null, kv[0]), el("dd", null, kv[1]));
     });
@@ -6228,22 +6510,22 @@ function sectionBackup() {
     if (bundle.radio) add(preview, radioOpt);
 
     add(preview, el("p", "small muted",
-      "Signal and node numbers are re-assigned by this box, and the graph is rewritten to " +
-      "match as it is imported. A node whose signal cannot be imported is created unbound " +
-      "and switched off rather than pointed at whatever happens to have that number here."));
+      t("Signal and node numbers are re-assigned by this box, and the graph is rewritten to " +
+        "match as it is imported. A node whose signal cannot be imported is created unbound " +
+        "and switched off rather than pointed at whatever happens to have that number here.")));
 
     var row = el("div", "btnrow");
-    var merge = el("button", "btn primary", "Merge");
+    var merge = el("button", "btn primary", t("Merge"));
     merge.type = "button";
     merge.addEventListener("click", function () { start("merge"); });
-    var repl = el("button", "btn danger", "Replace everything");
+    var repl = el("button", "btn danger", t("Replace everything"));
     repl.type = "button";
     repl.addEventListener("click", function () { start("replace"); });
     add(row, merge, repl);
     add(preview, row);
     add(preview, el("div", "hint",
-      "Merge adds to what is here. Replace erases this box's signals and graph first — " +
-      "capacity is checked before anything is deleted."));
+      t("Merge adds to what is here. Replace erases this box's signals and graph first — " +
+        "capacity is checked before anything is deleted.")));
   }
 
   file.addEventListener("change", function () {
@@ -6251,17 +6533,17 @@ function sectionBackup() {
     var f = file.files && file.files[0];
     if (!f) return;
     if (f.size > 4 * 1024 * 1024) {
-      setMsg(imMsg, "That file is " + Math.round(f.size / 1048576) + " MB. A full backup is " +
-                    "well under one — that is not a Klingelbox backup.", "err");
+      setMsg(imMsg, t("That file is {mb} MB. A full backup is well under one — that is not a " +
+                      "Klingelbox backup.", { mb: Math.round(f.size / 1048576) }), "err");
       return;
     }
-    setMsg(imMsg, "Reading " + f.name + "…");
+    setMsg(imMsg, t("Reading {file}…", { file: f.name }));
     var fr = new FileReader();
-    fr.onerror = function () { setMsg(imMsg, "Could not read that file.", "err"); };
+    fr.onerror = function () { setMsg(imMsg, t("Could not read that file."), "err"); };
     fr.onload = function () {
       var b;
       try { b = JSON.parse(fr.result); }
-      catch (e) { setMsg(imMsg, "That file is not valid JSON, so it cannot be a backup.", "err"); return; }
+      catch (e) { setMsg(imMsg, t("That file is not valid JSON, so it cannot be a backup."), "err"); return; }
       var bad = validateBundle(b);
       if (bad) { setMsg(imMsg, bad, "err"); return; }
       loaded = b;
@@ -6278,20 +6560,20 @@ function sectionBackup() {
 }
 
 function sectionReboot() {
-  var s = section("Reboot", "Restart the box. Signals, automations and settings all survive.");
+  var s = section(t("Reboot"), t("Restart the box. Signals, automations and settings all survive."));
   var msg = el("div", "formmsg");
-  var b = el("button", "btn danger", "Reboot now");
+  var b = el("button", "btn danger", t("Reboot now"));
   b.type = "button";
   b.addEventListener("click", function () {
-    confirmSheet("Reboot the box?",
-      ["It is back in a few seconds. Nothing stored is lost.",
-       "A doorbell press during the reboot is missed."], "Reboot", true).then(function (ok) {
+    confirmSheet(t("Reboot the box?"),
+      [t("It is back in a few seconds. Nothing stored is lost."),
+       t("A doorbell press during the reboot is missed.")], t("Reboot"), true).then(function (ok) {
       if (!ok) return;
       b.disabled = true;
-      setMsg(msg, "Rebooting…");
+      setMsg(msg, t("Rebooting…"));
       postJSON("/api/restart", {}).catch(function () { /* the box may drop the socket first */ });
       setTimeout(function () {
-        setMsg(msg, "Reboot requested — reload this page in a few seconds.", "ok");
+        setMsg(msg, t("Reboot requested — reload this page in a few seconds."), "ok");
         b.disabled = false;
       }, 1500);
     });
@@ -6337,18 +6619,18 @@ function buildDiagnostics() {
 
   var p = el("div", "panel");
   var h = el("div", "panel-head");
-  add(h, el("h2", null, "Diagnostics"));
+  add(h, el("h2", null, t("Diagnostics")));
   add(h, el("p", null,
-    "This page exists because “it does not work” has at least five different causes on an " +
+    t("This page exists because “it does not work” has at least five different causes on an " +
     "RF box: a dead SPI bus, a mis-tuned radio, a noisy band, an unrecognised protocol, or a " +
-    "transmit that never keyed the carrier. Each one shows up differently below."));
+    "transmit that never keyed the carrier. Each one shows up differently below.")));
   add(p, h);
   diagEls.verdict = el("div");
   add(p, diagEls.verdict);
   add(root, p);
 
   var p2 = el("div", "panel");
-  add(p2, el("h2", null, "Capture counters"));
+  add(p2, el("h2", null, t("Capture counters")));
   diagEls.counters = el("div", "counters");
   add(p2, diagEls.counters);
   add(root, p2);
@@ -6359,25 +6641,25 @@ function buildDiagnostics() {
      make the reader hunt for the follow-up to a number they are already
      staring at. */
   var pr = el("div", "panel");
-  add(pr, el("h2", null, "Listen for a button"));
+  add(pr, el("h2", null, t("Listen for a button")));
   add(pr, el("p", "hint",
-    "Those counters can tell you that bursts were rejected, but not what they looked "
+    t("Those counters can tell you that bursts were rejected, but not what they looked "
     + "like. A listening session records everything the radio hears for a fixed time, "
     + "with the minimum frame length, the frame boundary and the signal-strength squelch "
     + "all turned down — then ranks what it heard, most likely first, and lets you look at "
     + "any of it, trim it, send it back out and keep it as a signal. Nothing is admitted or "
     + "rejected on how it looks, nothing is written to flash, and your node graph is "
-    + "untouched."));
+    + "untouched.")));
   diagEls.raw = el("div");
   add(pr, diagEls.raw);
   add(root, pr);
   renderRawPanel();
 
   var p3 = el("div", "panel");
-  add(p3, el("h2", null, "States"));
+  add(p3, el("h2", null, t("States")));
   add(p3, el("p", "hint",
-    "Every layer of the firmware reports into this one list, so the serial log, the API and " +
-    "this page can never drift apart. A state that has never fired is greyed out."));
+    t("Every layer of the firmware reports into this one list, so the serial log, the API and " +
+    "this page can never drift apart. A state that has never fired is greyed out.")));
   diagEls.states = el("div", "diag");
   add(p3, diagEls.states);
   add(root, p3);
@@ -6391,29 +6673,34 @@ function renderRawPanel() {
   if (!diagEls.raw) return;
   var wrap = clear(diagEls.raw);
   if (!S.has.raw) {
-    add(wrap, el("div", "note", "This firmware does not have listening sessions. Update "
-      + "it under Settings → Firmware to get the feature."));
+    add(wrap, el("div", "note", t("This firmware does not have listening sessions. Update "
+      + "it under Settings → Firmware to get the feature.")));
     return;
   }
   var st = S.raw;
   if (st && st.running) {
-    add(wrap, el("div", "note warn", "A session is listening right now — "
-      + numOr(st.count, 0) + " of " + numOr(st.capacity, 32) + " slots used, "
-      + numOr(st.remaining_s, 0) + " s left."));
+    add(wrap, el("div", "note warn", t("A session is listening right now — {used} of "
+      + "{total} slots used, {left} s left.", { used: numOr(st.count, 0),
+      total: numOr(st.capacity, 32), left: numOr(st.remaining_s, 0) })));
   } else if (st && st.held) {
     var cands = ((st.candidates) || []).length;
-    add(wrap, el("div", "note", "A finished session is still in memory: "
-      + numOr(st.count, 0) + " frame" + (numOr(st.count, 0) === 1 ? "" : "s")
-      + (cands ? ", " + cands + " ranked candidate" + (cands === 1 ? "" : "s") : "")
-      + " you can still open, trim and save."));
+    add(wrap, el("div", "note", t("A finished session is still in memory: {frames}{cands}"
+      + " you can still open, trim and save.", {
+      frames: numOr(st.count, 0) === 1
+        ? t("{n} frame", { n: numOr(st.count, 0) })
+        : t("{n} frames", { n: numOr(st.count, 0) }),
+      cands: cands ? (cands === 1
+        ? t(", {c} ranked candidate", { c: cands })
+        : t(", {c} ranked candidates", { c: cands })) : ""
+    })));
     var fr = st.fragmentation;
     if (fr && fr.detected) {
-      add(wrap, el("div", "note warn", numOr(fr.runs, 0)
-        + " transmission(s) in that session were cut into pieces by the frame boundary."));
+      add(wrap, el("div", "note warn", t("{n} transmission(s) in that session were cut "
+        + "into pieces by the frame boundary.", { n: numOr(fr.runs, 0) })));
     }
   }
   var row = el("div", "row");
-  add(row, listenButton("\u{1F3A7} Listen for a button", function (sig) {
+  add(row, listenButton(t("\u{1F3A7} Listen for a button"), function (sig) {
     if (sig) { loadSignals(); if (S.graph) loadGraph(); }
     renderRawPanel();
   }));
@@ -6427,8 +6714,8 @@ function renderDiagnostics(err) {
   if (err || !S.diag) {
     add(v, el("div", "note " + (S.has.diagnostics ? "warn" : "bad"),
       S.has.diagnostics
-        ? ("Diagnostics are momentarily unavailable" + (err ? ": " + err.message : "") + ".")
-        : "This firmware does not expose /api/diagnostics."));
+        ? t("Diagnostics are momentarily unavailable{detail}.", { detail: err ? ": " + err.message : "" })
+        : t("This firmware does not expose /api/diagnostics.")));
     return;
   }
 
@@ -6440,19 +6727,19 @@ function renderDiagnostics(err) {
   var verdict, kind;
   if (fired("CC1101_NOT_DETECTED") || fired("SPI_ERROR")) {
     kind = "bad";
-    verdict = "The radio module is not answering. Nothing can be received or transmitted until that is fixed — start with the wiring.";
+    verdict = t("The radio module is not answering. Nothing can be received or transmitted until that is fixed — start with the wiring.");
   } else if (!fired("CC1101_OK")) {
     kind = "warn";
-    verdict = "The radio has not reported a successful probe yet. If the box only just booted, give it a moment.";
+    verdict = t("The radio has not reported a successful probe yet. If the box only just booted, give it a moment.");
   } else if (!fired("PULSES_CAPTURED")) {
     kind = "warn";
-    verdict = "The radio is alive but has not captured a single frame yet. Press a 433 MHz remote within a few metres and watch this page.";
+    verdict = t("The radio is alive but has not captured a single frame yet. Press a 433 MHz remote within a few metres and watch this page.");
   } else if (fired("PROTOCOL_DECODED")) {
     kind = "ok";
-    verdict = "Receiving and decoding normally.";
+    verdict = t("Receiving and decoding normally.");
   } else {
     kind = "ok";
-    verdict = "Receiving raw frames. No decoder has claimed one yet, which is fine — undecoded signals are still stored and replayable.";
+    verdict = t("Receiving raw frames. No decoder has claimed one yet, which is fine — undecoded signals are still stored and replayable.");
   }
   add(v, el("div", "note " + kind, verdict));
 
@@ -6463,7 +6750,7 @@ function renderDiagnostics(err) {
     var box = el("div", "counter");
     add(box, el("div", "c-num", String(numOr(cap[k], 0))));
     add(box, el("div", "c-lbl", k.replace(/_/g, " ")));
-    add(box, el("div", "c-help", CAPTURE_HELP[k] || ""));
+    add(box, el("div", "c-help", CAPTURE_HELP[k] ? t(CAPTURE_HELP[k]) : ""));
     add(c, box);
   });
 
@@ -6478,17 +6765,17 @@ function renderDiagnostics(err) {
     var head = el("div", "d-head");
     add(head, el("span", "d-name", st.name));
     add(head, el("span", "chip" + (count ? (sev === "ok" ? " ok" : sev === "bad" ? " bad" : " warn") : ""),
-      count === 0 ? "never" : count + "x"));
+      count === 0 ? t("never") : count + "x"));
     if (count > 0 && typeof st.last_us === "number" && st.last_us > 0 && up !== null) {
-      add(head, el("span", "chip mono", shortDur(up - st.last_us / 1e6) + " ago"));
+      add(head, el("span", "chip mono", t("{d} ago", { d: shortDur(up - st.last_us / 1e6) })));
     }
     add(item, head);
     add(item, el("div", "d-help", st.help || ""));
-    if (count > 0 && meta.act) add(item, el("div", "d-help muted", meta.act));
+    if (count > 0 && meta.act) add(item, el("div", "d-help muted", t(meta.act)));
     if (st.detail) add(item, el("div", "d-detail", st.detail));
     add(list, item);
   });
-  if (!states.length) add(list, el("div", "empty", "The firmware reported no diagnostic states."));
+  if (!states.length) add(list, el("div", "empty", t("The firmware reported no diagnostic states.")));
 }
 
 /* ======================================================================
@@ -6549,13 +6836,13 @@ function hbNote(text, cls) { return el("div", "note" + (cls ? " " + cls : ""), t
 
 /* A run of short paragraphs, which is what most of this page is. */
 function hbPs(parent, list) {
-  list.forEach(function (t) { add(parent, hbP(t)); });
+  list.forEach(function (p) { add(parent, hbP(p)); });
   return parent;
 }
 
 function hbList(items, ordered) {
   var l = el(ordered ? "ol" : "ul", "hb-list");
-  items.forEach(function (t) { add(l, el("li", null, t)); });
+  items.forEach(function (item) { add(l, el("li", null, item)); });
   return l;
 }
 
@@ -6727,36 +7014,36 @@ var PORT_TEXT = {
 };
 
 function hbNodeReference(body) {
-  add(body, hbP(
+  add(body, hbP(t(
     "Every node this box offers, generated from the palette itself so it cannot fall behind the " +
     "firmware. A node's group decides its ports, with no exceptions: sources start chains, sinks " +
-    "end them, logic sits in between."));
+    "end them, logic sits in between.")));
 
   NODE_TYPES.forEach(function (ty) {
     var doc = NODE_DOC[ty.t] || {};
     var d = el("details", "hb-node");
     var sum = el("summary", "hb-nodesum");
     add(sum, el("span", "hb-nodeico", ty.ico));
-    var t = el("span", "hb-nodetext");
-    add(t, el("span", "hb-nodename", ty.label));
-    add(t, el("span", "hb-nodetype", ty.t));
-    add(sum, t);
+    var txt = el("span", "hb-nodetext");
+    add(txt, el("span", "hb-nodename", t(ty.label)));
+    add(txt, el("span", "hb-nodetype", ty.t));
+    add(sum, txt);
     add(d, sum);
 
-    add(d, hbP(doc.what || ty.help));
-    add(d, el("div", "hb-ports", PORT_TEXT[ty.g] || ""));
+    add(d, hbP(t(doc.what || ty.help)));
+    add(d, el("div", "hb-ports", t(PORT_TEXT[ty.g] || "")));
     if (doc.settings) {
-      add(d, hbH("Settings"));
-      add(d, hbKV(doc.settings));
+      add(d, hbH(t("Settings")));
+      add(d, hbKV(doc.settings.map(function (kv) { return [t(kv[0]), t(kv[1]), kv[2]]; })));
     }
-    (doc.notes || []).forEach(function (n) { add(d, hbP(n)); });
+    (doc.notes || []).forEach(function (n) { add(d, hbP(t(n))); });
     add(body, d);
   });
 
-  add(body, hbNote(
+  add(body, hbNote(t(
     "Limits, so a graph does not fail in a way you have to guess at: 24 nodes, a chain at most 8 " +
     "nodes deep, node names up to 32 characters, MQTT topic suffixes up to 47, and any time " +
-    "window between 1 and 6000 seconds."));
+    "window between 1 and 6000 seconds.")));
 }
 
 /* ------------------------------------------------------------- recipes --
@@ -6849,166 +7136,166 @@ function buildHandbook() {
 
   var intro = el("div", "panel");
   var ih = el("div", "panel-head");
-  add(ih, el("h2", null, "Handbook"));
-  add(ih, el("p", null,
+  add(ih, el("h2", null, t("Handbook")));
+  add(ih, el("p", null, t(
     "The manual, flashed into the box. It works with no internet — which matters, because the " +
     "first time you set this thing up your phone is joined to its access point and has none. " +
-    "Tap a heading to open it."));
+    "Tap a heading to open it.")));
   add(intro, ih);
   add(root, intro);
 
   /* ------------------------------------------------------ 1. how it works */
-  var s1 = hbSection("how", "How it works",
-    "Three ideas, and everything else follows from them.");
+  var s1 = hbSection("how", t("How it works"),
+    t("Three ideas, and everything else follows from them."));
   hbPs(s1.bodyEl, [
-    "The receiver is always listening. It has to be: a button you have already registered must " +
+    t("The receiver is always listening. It has to be: a button you have already registered must " +
     "ring the moment it is pressed, so there is no “receive mode” to switch on and nothing to " +
-    "remember to turn off.",
-    "A signal is a stored waveform, not a decoded code. When something recognises the protocol " +
+    "remember to turn off."),
+    t("A signal is a stored waveform, not a decoded code. When something recognises the protocol " +
     "you get a readable identity as a bonus, but an undecodable capture is a first-class " +
     "citizen — the raw pulse timings are what is stored, matched and replayed, so a remote no " +
-    "decoder has ever seen still works completely.",
-    "Nodes route those events. A press arrives at a source, optional logic decides whether it " +
+    "decoder has ever seen still works completely."),
+    t("Nodes route those events. A press arrives at a source, optional logic decides whether it " +
     "passes, and a sink acts on it — transmits a code, publishes to MQTT, lights a monitor. " +
-    "Left to right, one direction, and the map on the Dashboard is the whole of it."
+    "Left to right, one direction, and the map on the Dashboard is the whole of it.")
   ]);
-  add(s1.bodyEl, hbNote(
+  add(s1.bodyEl, hbNote(t(
     "The radio ignores what the box itself has just transmitted for about a second afterwards, " +
-    "so a sender never feeds its own receiver and goes round in a loop."));
+    "so a sender never feeds its own receiver and goes round in a loop.")));
 
   /* Off the old Dashboard intro. It is the one thing about this graph that is
      genuinely non-obvious, and it was three paragraphs above the map. */
-  add(s1.bodyEl, hbH("One code, two nodes"));
+  add(s1.bodyEl, hbH(t("One code, two nodes")));
   hbPs(s1.bodyEl, [
-    "A 433 MHz code gets one node per direction. A Signal receiver fires when that code is " +
+    t("A 433 MHz code gets one node per direction. A Signal receiver fires when that code is " +
     "heard on air; a Signal sender puts a code on air when something triggers it. They draw " +
     "from the same stored codes, so a doorbell that rings a chime is simply a receiver wired " +
-    "to a sender — and every wire on the map then runs the one way events actually travel.",
-    "Two more are worth knowing early: Any RF signal is a wildcard that fires on every burst " +
-    "on the band, and a Group lets several buttons drive one action."
+    "to a sender — and every wire on the map then runs the one way events actually travel."),
+    t("Two more are worth knowing early: Any RF signal is a wildcard that fires on every burst " +
+    "on the band, and a Group lets several buttons drive one action.")
   ]);
 
   /* Off the top of the canvas, where it was a nine-line legend permanently
      covering the picture it described. */
-  add(s1.bodyEl, hbH("Reading the map"));
+  add(s1.bodyEl, hbH(t("Reading the map")));
   hbPs(s1.bodyEl, [
-    "Drag a node to rearrange it; tap it to edit. Nodes are linked by tapping, never by " +
-    "dragging a wire.",
-    "A wire drawn broken and faded carries nothing: the node at one of its ends is switched " +
+    t("Drag a node to rearrange it; tap it to edit. Nodes are linked by tapping, never by " +
+    "dragging a wire."),
+    t("A wire drawn broken and faded carries nothing: the node at one of its ends is switched " +
     "off. Everything on the map can also be done from the list view, which is the only view " +
-    "below 900 px."
+    "below 900 px.")
   ]);
-  add(s1.bodyEl, hbH("The badges on a node"));
+  add(s1.bodyEl, hbH(t("The badges on a node")));
   add(s1.bodyEl, hbKV([
-    ["✕", "Deletes the node, after a confirmation."],
-    ["▶", "Does that node's own thing, now. What that MEANS differs by type and they are " +
+    ["✕", t("Deletes the node, after a confirmation.")],
+    ["▶", t("Does that node's own thing, now. What that MEANS differs by type and they are " +
           "opposite directions, so each ▶ says which in its tooltip: a Virtual trigger fires, " +
           "a Signal receiver pretends its code was just heard, and a Signal sender actually " +
-          "TRANSMITS its code over the air."],
-    ["💡", "A Monitor's lamp. It lights whenever the chain reaches it."],
-    ["I / O", "Flips a Switch node between conducting and not."]
+          "TRANSMITS its code over the air.")],
+    ["💡", t("A Monitor's lamp. It lights whenever the chain reaches it.")],
+    ["I / O", t("Flips a Switch node between conducting and not.")]
   ]));
   add(root, s1);
 
   /* --------------------------------------------------- 2. node reference */
-  var s2 = hbSection("nodes", "Node reference",
-    "Every type, what it does, its ports and its settings.");
+  var s2 = hbSection("nodes", t("Node reference"),
+    t("Every type, what it does, its ports and its settings."));
   hbNodeReference(s2.bodyEl);
   add(root, s2);
 
   /* ------------------------------------------------------------ 3. recipes */
-  var s3 = hbSection("recipes", "Recipes",
-    "Patterns that need no special node type — just links.");
+  var s3 = hbSection("recipes", t("Recipes"),
+    t("Patterns that need no special node type — just links."));
   HB_RECIPES.forEach(function (r) {
     var b = el("div", "hb-recipe");
-    add(b, el("div", "hb-recipe-t", r[0]));
-    add(b, el("div", "hint mono", r[1]));
+    add(b, el("div", "hb-recipe-t", t(r[0])));
+    add(b, el("div", "hint mono", t(r[1])));
     add(s3.bodyEl, b);
   });
   add(root, s3);
 
   /* ------------------------------- 4. listening and virtual signals */
-  var s4 = hbSection("learn", "Listening and virtual signals",
-    "Registering a real remote, and inventing a code of your own.");
+  var s4 = hbSection("learn", t("Listening and virtual signals"),
+    t("Registering a real remote, and inventing a code of your own."));
   var b4 = s4.bodyEl;
-  add(b4, hbH("What a listening session actually does"));
+  add(b4, hbH(t("What a listening session actually does")));
   hbPs(b4, [
-    "The receiver is ALWAYS listening — it has to be, or a button you already registered could " +
+    t("The receiver is ALWAYS listening — it has to be, or a button you already registered could " +
     "not ring the instant it is pressed. A listening session changes exactly one thing: the fate " +
     "of a signal the box does NOT recognise. Normally such a burst is dropped with one line in " +
     "Activity. During a session it is kept. Signals you already know behave identically either " +
-    "way.",
-    "Nothing is admitted or rejected on the basis of what it looks like. Every frame the radio " +
+    "way."),
+    t("Nothing is admitted or rejected on the basis of what it looks like. Every frame the radio " +
     "hands up becomes a candidate, and the box RANKS them instead of filtering them. The ranking " +
     "runs on evidence that needs no knowledge of any protocol: a real remote repeats itself and " +
-    "band noise does not, so the number of times a waveform was heard dominates the order.",
-    "A recognised protocol and a clean timing estimate push a candidate further up, but only " +
+    "band noise does not, so the number of times a waveform was heard dominates the order."),
+    t("A recognised protocol and a clean timing estimate push a candidate further up, but only " +
     "ever as a tie-break. An undecoded candidate is a first-class citizen — it can sit at the " +
     "top of the list, it saves, it replays, it matches. The exact timings are what get stored; " +
-    "only the human-readable name is missing.",
-    "A session always stops on its own — after its countdown, or as soon as its 32 slots are " +
-    "full — so the box is never left recording behind your back."
+    "only the human-readable name is missing."),
+    t("A session always stops on its own — after its countdown, or as soon as its 32 slots are " +
+    "full — so the box is never left recording behind your back.")
   ]);
-  add(b4, hbNote(
+  add(b4, hbNote(t(
     "This is the part that changed. There used to be a separate “learn mode” which would only " +
     "offer a candidate that repeated twice AND decoded at 65 % confidence. Both numbers were " +
     "measured on 1527-family remotes, which quietly made it a mode for one protocol: anything " +
     "else produced no candidate at all and no explanation either. Ranking replaced the gate, and " +
-    "the two flows became one."));
-  add(b4, hbH("Registering a button"));
+    "the two flows became one.")));
+  add(b4, hbH(t("Registering a button")));
   add(b4, hbList([
-    "Add a Signal receiver node, or open one you already have, and choose to listen for a signal.",
-    "The box starts listening and counts down. Press the button on your remote several times, " +
+    t("Add a Signal receiver node, or open one you already have, and choose to listen for a signal."),
+    t("The box starts listening and counts down. Press the button on your remote several times, " +
     "within a few metres. Pressing repeatedly is not politeness — repetition is the evidence the " +
-    "ranking runs on.",
-    "Candidates appear, most likely first, each saying why it is where it is: “seen 5 times, " +
-    "decoded ev1527, 92 % confidence”. Tap the top one.",
-    "Transmit it while standing at the bell. That is the only test that means anything — the box " +
+    "ranking runs on."),
+    t("Candidates appear, most likely first, each saying why it is where it is: “seen 5 times, " +
+    "decoded ev1527, 92 % confidence”. Tap the top one."),
+    t("Transmit it while standing at the bell. That is the only test that means anything — the box " +
     "can confirm the pulses left the radio, never that a receiver reacted. If it does not ring, " +
-    "close it and try the next candidate.",
-    "Trim it if it carries something either side of the transmission, then give it a name and " +
-    "save. It becomes an ordinary stored signal and the node is wired to it."
+    "close it and try the next candidate."),
+    t("Trim it if it carries something either side of the transmission, then give it a name and " +
+    "save. It becomes an ordinary stored signal and the node is wired to it.")
   ], true));
-  add(b4, hbH("When one press turns into several rows"));
+  add(b4, hbH(t("When one press turns into several rows")));
   hbPs(b4, [
-    "A recording ends after a fixed silence — the frame boundary. If a remote pauses for longer " +
+    t("A recording ends after a fixed silence — the frame boundary. If a remote pauses for longer " +
     "than that in the middle of its own transmission, the boundary fires early and one press " +
-    "arrives as several dissimilar pieces, none of which rings anything on its own.",
-    "The box detects that shape and says so, because otherwise the only way through it is to " +
+    "arrives as several dissimilar pieces, none of which rings anything on its own."),
+    t("The box detects that shape and says so, because otherwise the only way through it is to " +
     "transmit each scrap in turn and hope. Where the pieces fit back together it also offers the " +
     "rejoined whole as a candidate of its own, marked 🧩 — stitched using the silence actually " +
     "measured between the pieces, not a plausible-looking guess, because a wrong gap produces a " +
-    "waveform that looks perfectly reasonable and rings nothing."
+    "waveform that looks perfectly reasonable and rings nothing.")
   ]);
-  add(b4, hbNote(
+  add(b4, hbNote(t(
     "There is also a one-tap “try again with a longer gap”, which raises the frame boundary past " +
-    "the widest cut that was measured. That is the real fix; the rejoin is the shortcut."));
+    "the widest cut that was measured. That is the real fix; the rejoin is the shortcut.")));
 
-  add(b4, hbH("Virtual signals"));
+  add(b4, hbH(t("Virtual signals")));
   hbPs(b4, [
-    "A virtual signal is a brand-new EV1527 code that no remote in the world is using yet. It " +
-    "exists so you can pair YOUR OWN receivers to this box: a plug-in chime, a relay, a socket.",
-    "A hand-made code does nothing on its own. Nothing on the band answers to an address that was " +
+    t("A virtual signal is a brand-new EV1527 code that no remote in the world is using yet. It " +
+    "exists so you can pair YOUR OWN receivers to this box: a plug-in chime, a relay, a socket."),
+    t("A hand-made code does nothing on its own. Nothing on the band answers to an address that was " +
     "invented ten seconds ago — a Signal receiver carrying it stays silent because that code is " +
     "never heard, and a Signal sender carrying it transmits into a world where nothing is " +
-    "listening. That is expected, and it is not a fault."
+    "listening. That is expected, and it is not a fault.")
   ]);
-  add(b4, hbNote(
+  add(b4, hbNote(t(
     "This is the single most reported “the virtual signal is broken”. It is not broken. It has " +
-    "not been paired yet.", "warn"));
-  add(b4, hbH("Pairing one to a chime"));
-  add(b4, hbP("The order is the whole trick, and almost everyone tries it the other way round."));
+    "not been paired yet."), "warn"));
+  add(b4, hbH(t("Pairing one to a chime")));
+  add(b4, hbP(t("The order is the whole trick, and almost everyone tries it the other way round.")));
   add(b4, hbList([
-    "Put your receiver into its learning mode — usually hold its button until it beeps or its " +
-    "LED blinks.",
-    "Within a few seconds, tap “Pair now” on the signal here in the UI. It sends the code 20 " +
+    t("Put your receiver into its learning mode — usually hold its button until it beeps or its " +
+    "LED blinks."),
+    t("Within a few seconds, tap “Pair now” on the signal here in the UI. It sends the code 20 " +
     "times in about three quarters of a second, which no receiver that has just entered " +
-    "learning mode can miss.",
-    "The receiver stores the code and rings for it from then on. Test it with Transmit."
+    "learning mode can miss."),
+    t("The receiver stores the code and rings for it from then on. Test it with Transmit.")
   ], true));
-  add(b4, hbP(
+  add(b4, hbP(t(
     "If nothing happened, the receiver almost certainly was not in learning mode when the code " +
-    "went out. Put it back and tap Pair now again — sending it twice is harmless."));
+    "went out. Put it back and tap Pair now again — sending it twice is harmless.")));
   add(root, s4);
 
   /* ------------------------------------ 4b. When the box will not hear it
@@ -7016,359 +7303,362 @@ function buildHandbook() {
      for it is a decision ("the defaults are not going to work for this
      remote"), and a decision needs a heading you can find from the table of
      contents. */
-  var s4b = hbSection("raw", "When the box will not hear your remote",
-    "The filters that can hide a transmitter, and how to look behind them.");
+  var s4b = hbSection("raw", t("When the box will not hear your remote"),
+    t("The filters that can hide a transmitter, and how to look behind them."));
   var b4b = s4b.bodyEl;
 
-  add(b4b, hbH("The problem it solves"));
+  add(b4b, hbH(t("The problem it solves")));
   hbPs(b4b, [
-    "The box's founding promise is that a signal NOBODY can decode is still recorded and still " +
+    t("The box's founding promise is that a signal NOBODY can decode is still recorded and still " +
     "replayable. The ordinary receiver does not quite keep that promise on its own, because four " +
     "filters sit in front of it — and every one of them is a correct guess about the cheap " +
-    "1527-family remotes this box was built around, and a possible lie about anything else.",
-    "A transmitter that breaks one of those guesses is not merely mis-decoded. It is invisible: " +
+    "1527-family remotes this box was built around, and a possible lie about anything else."),
+    t("A transmitter that breaks one of those guesses is not merely mis-decoded. It is invisible: " +
     "nothing in Activity, nothing anywhere. A listening session turns three of those filters " +
     "into numbers you control and reports honestly on the fourth, so you can see what actually " +
-    "arrived."
+    "arrived.")
   ]);
   add(b4b, hbKV([
-    ["Signal-strength squelch",
-      "Bursts quieter than −75 dBm are discarded as amplifier noise. A distant or weak " +
-      "transmitter is thrown away with them."],
-    ["Minimum frame length",
-      "Anything shorter than 32 pulses is discarded as noise. A protocol with a short frame never " +
-      "appears at all."],
-    ["Frame boundary",
-      "8 ms of silence is what ends one recording. Too short for a protocol with long gaps and it " +
+    [t("Signal-strength squelch"),
+      t("Bursts quieter than −75 dBm are discarded as amplifier noise. A distant or weak " +
+      "transmitter is thrown away with them.")],
+    [t("Minimum frame length"),
+      t("Anything shorter than 32 pulses is discarded as noise. A protocol with a short frame never " +
+      "appears at all.")],
+    [t("Frame boundary"),
+      t("8 ms of silence is what ends one recording. Too short for a protocol with long gaps and it " +
       "is chopped into fragments; too long and several repeats are glued into one frame — and " +
-      "anything over 512 pulses is thrown away whole."],
-    ["Repeat merging",
-      "Near-identical frames within 250 ms are folded into a single event. A remote whose repeats " +
-      "differ from each other confuses this."]
+      "anything over 512 pulses is thrown away whole.")],
+    [t("Repeat merging"),
+      t("Near-identical frames within 250 ms are folded into a single event. A remote whose repeats " +
+      "differ from each other confuses this.")]
   ]));
 
-  add(b4b, hbH("The worked example: a remote whose protocol we do not decode"));
+  add(b4b, hbH(t("The worked example: a remote whose protocol we do not decode")));
   hbPs(b4b, [
-    "The case this was built for, and it is worth stating precisely because the shape of it is " +
+    t("The case this was built for, and it is worth stating precisely because the shape of it is " +
     "the diagnosis. One wireless bell button registered first time. A second button — a " +
     "different make, on the same chime — would not register at all, even though the chime itself " +
-    "rings for both. So the second button certainly transmits, and certainly works.",
-    "That combination is the signature of a FILTER, not a fault. If the radio were mis-tuned or " +
+    "rings for both. So the second button certainly transmits, and certainly works."),
+    t("That combination is the signature of a FILTER, not a fault. If the radio were mis-tuned or " +
     "the antenna were off, the first button would fail too. So something about the second " +
     "button's waveform is being thrown away before anyone sees it, and the only way to find out " +
-    "which of the four is doing it is to look at what arrives with the filters turned down.",
-    "Nothing here depends on what the protocol is or where the remote was made. The interesting " +
+    "which of the four is doing it is to look at what arrives with the filters turned down."),
+    t("Nothing here depends on what the protocol is or where the remote was made. The interesting " +
     "property is simply that no decoder on this box claims it — and that has never been a reason " +
-    "for a signal not to work."
+    "for a signal not to work.")
   ]);
   add(b4b, hbList([
-    "Open a listening session — from a Signal node, from Settings → Stored signals, or from " +
-    "Diagnostics.",
-    "Leave the settings alone for the first run. The squelch floor is already pre-set a few dB " +
+    t("Open a listening session — from a Signal node, from Settings → Stored signals, or from " +
+    "Diagnostics."),
+    t("Leave the settings alone for the first run. The squelch floor is already pre-set a few dB " +
     "above whatever the band is doing right now, which is the only value that is right in both " +
-    "a quiet room and a busy one.",
-    "Press the button four or five times within a couple of metres of the box.",
-    "Read the top of the list. Repetition is what puts a candidate there, so the thing you just " +
-    "pressed five times should be at or near the top whether or not anything decoded it.",
-    "If the list is empty, read the verdict line. It never says “no results”: it says whether " +
+    "a quiet room and a busy one."),
+    t("Press the button four or five times within a couple of metres of the box."),
+    t("Read the top of the list. Repetition is what puts a candidate there, so the thing you just " +
+    "pressed five times should be at or near the top whether or not anything decoded it."),
+    t("If the list is empty, read the verdict line. It never says “no results”: it says whether " +
     "the radio heard nothing at all, or heard something and threw it away, and which threshold " +
-    "did the throwing."
+    "did the throwing.")
   ], true));
-  add(b4b, hbNote(
+  add(b4b, hbNote(t(
     "That distinction is the whole point. “Nothing was received” means the radio, the antenna or " +
     "the frequency — no threshold here can help. “Something was received but did not fit” means " +
-    "a number on this screen, and it is fixable in one attempt.", "warn"));
+    "a number on this screen, and it is fixable in one attempt."), "warn"));
 
-  add(b4b, hbH("Reading what comes back"));
+  add(b4b, hbH(t("Reading what comes back")));
   add(b4b, hbKV([
-    ["A candidate seen several times, at the top",
-      "That is your remote. Tap it, transmit it at the bell, trim if needed, save. Whether " +
-      "anything decoded it makes no difference to any of that."],
-    ["Everything seen once, nothing repeated",
-      "Either you pressed once, or each press is arriving slightly differently. Press several " +
-      "more times in one session — repetition is what the ranking runs on."],
-    ["“N transmissions were cut into pieces”",
-      "The frame boundary is too SHORT: one press is being chopped up. Take the offered “try " +
+    [t("A candidate seen several times, at the top"),
+      t("That is your remote. Tap it, transmit it at the bell, trim if needed, save. Whether " +
+      "anything decoded it makes no difference to any of that.")],
+    [t("Everything seen once, nothing repeated"),
+      t("Either you pressed once, or each press is arriving slightly differently. Press several " +
+      "more times in one session — repetition is what the ranking runs on.")],
+    [t("“N transmissions were cut into pieces”"),
+      t("The frame boundary is too SHORT: one press is being chopped up. Take the offered “try " +
       "again with a longer gap”, or use the 🧩 rejoined candidate, which is the pieces put back " +
-      "together with the measured silence between them."],
-    ["One enormous frame, or “too long”",
-      "The frame boundary is too LONG: repeats are being glued together, and past 512 pulses the " +
-      "whole thing is discarded. Lower it toward 4000 µs."],
-    ["All 32 slots fill in a couple of seconds, everything quiet",
-      "That is the receiver's own amplifier noise, not your remote. Take the offered “try again " +
-      "at …” button, which raises the squelch floor above the measured band."],
-    ["Nothing at all, and no carrier either",
-      "Check the antenna is fitted, then Settings → Radio: frequency (433.92 MHz for almost " +
-      "everything, but 868 MHz exists) and modulation."]
+      "together with the measured silence between them.")],
+    [t("One enormous frame, or “too long”"),
+      t("The frame boundary is too LONG: repeats are being glued together, and past 512 pulses the " +
+      "whole thing is discarded. Lower it toward 4000 µs.")],
+    [t("All 32 slots fill in a couple of seconds, everything quiet"),
+      t("That is the receiver's own amplifier noise, not your remote. Take the offered “try again " +
+      "at …” button, which raises the squelch floor above the measured band.")],
+    [t("Nothing at all, and no carrier either"),
+      t("Check the antenna is fitted, then Settings → Radio: frequency (433.92 MHz for almost " +
+      "everything, but 868 MHz exists) and modulation.")]
   ]));
 
-  add(b4b, hbH("Trimming, and why it matters"));
+  add(b4b, hbH(t("Trimming, and why it matters")));
   hbPs(b4b, [
-    "Because the frame boundary is relaxed, a recording sometimes contains more than the one " +
+    t("Because the frame boundary is relaxed, a recording sometimes contains more than the one " +
     "transmission you want — a tail of noise, or two presses in a row. Tap a candidate and you " +
     "get its waveform with a start and an end handle: drag them, or type exact pulse numbers, " +
-    "and the shaded part is exactly what will be sent and exactly what will be saved.",
-    "Transmit the selection first, standing next to the bell. That loop — send, listen, adjust, " +
+    "and the shaded part is exactly what will be sent and exactly what will be saved."),
+    t("Transmit the selection first, standing next to the bell. That loop — send, listen, adjust, " +
     "send — is far faster than saving a signal for every attempt, and nothing is stored until " +
-    "you decide it works.",
-    "Once it rings, Save as signal. It becomes an ordinary stored signal: bind it to a Signal " +
+    "you decide it works."),
+    t("Once it rings, Save as signal. It becomes an ordinary stored signal: bind it to a Signal " +
     "receiver node to make that button ring your chime, or to a Signal sender node to have the " +
-    "box press the button itself. Being undecoded costs it nothing."
+    "box press the button itself. Being undecoded costs it nothing.")
   ]);
   add(b4b, hbNote(
-    "A session keeps 32 frames in RAM and stops on its own — after its countdown, or as soon as " +
+    t("A session keeps 32 frames in RAM and stops on its own — after its countdown, or as soon as " +
     "the slots are full. Nothing is written to flash, and your node graph is untouched: while a " +
     "session runs, only signals that would have passed the NORMAL filters are still routed, so " +
-    "recorded noise can never ring anything."));
+    "recorded noise can never ring anything.")));
   add(root, s4b);
 
   /* ------------------------------------------ 5. MQTT and Home Assistant */
   var s5 = hbSection("mqtt", "MQTT & Home Assistant",
-    "The topic map, and what discovery puts in your dashboard.");
+    t("The topic map, and what discovery puts in your dashboard."));
   var b5 = s5.bodyEl;
   hbPs(b5, [
-    "MQTT is off until you turn it on under Settings. There is no TLS: this is a trusted-LAN " +
-    "appliance, and it talks to a broker on your own network."
+    t("MQTT is off until you turn it on under Settings. There is no TLS: this is a trusted-LAN " +
+    "appliance, and it talks to a broker on your own network.")
   ]);
   add(b5, hbP(
-    "Every topic below starts with the base topic, which on this box is currently:"));
+    t("Every topic below starts with the base topic, which on this box is currently:")));
   add(b5, hbCode(base));
-  add(b5, hbP("Written “<base>” from here on. The examples use this box's real value."));
+  add(b5, hbP(t("Written “<base>” from here on. The examples use this box's real value.")));
 
-  add(b5, hbH("What the box publishes"));
+  add(b5, hbH(t("What the box publishes")));
   add(b5, hbKV([
-    [base + "/status", "online or offline. Retained, and also the Last Will — it flips to offline " +
+    [base + "/status", t("online or offline. Retained, and also the Last Will — it flips to offline " +
      "by itself if the box drops off the network without saying goodbye. Every discovered entity " +
-     "uses it to decide whether it is available."],
-    [base + "/button/<name>/state", "One recognised press. The name is a slug of the signal's " +
-     "name: “Front door” becomes front_door."],
-    [base + "/unknown/state", "A burst matching no stored signal."],
-    [base + "/unknown", "Retained: the last unregistered burst, so you can go and look up the code " +
-     "of the remote you are about to learn."],
-    [base + "/event", "Every node firing, plus system events."],
-    [base + "/radio", "Retained radio telemetry — noise floor, whether a CC1101 is present, the " +
-     "last press. Refreshed every 10 seconds."],
-    [base + "/<topic>", "Whatever an MQTT publish node has been given as its topic."]
+     "uses it to decide whether it is available.")],
+    [base + "/button/<name>/state", t("One recognised press. The name is a slug of the signal's " +
+     "name: “Front door” becomes front_door.")],
+    [base + "/unknown/state", t("A burst matching no stored signal.")],
+    [base + "/unknown", t("Retained: the last unregistered burst, so you can go and look up the code " +
+     "of the remote you are about to learn.")],
+    [base + "/event", t("Every node firing, plus system events.")],
+    [base + "/radio", t("Retained radio telemetry — noise floor, whether a CC1101 is present, the " +
+     "last press. Refreshed every 10 seconds.")],
+    [base + "/<topic>", t("Whatever an MQTT publish node has been given as its topic.")]
   ]));
   add(b5, hbNote(
-    "Presses are never retained, on purpose. A press is a moment, not a condition — a retained " +
-    "press payload would ring every chime in the house each time Home Assistant restarts."));
+    t("Presses are never retained, on purpose. A press is a moment, not a condition — a retained " +
+    "press payload would ring every chime in the house each time Home Assistant restarts.")));
 
-  add(b5, hbH("What the box listens to"));
+  add(b5, hbH(t("What the box listens to")));
   add(b5, hbKV([
-    [base + "/button/<name>/press", "Any message transmits that stored signal."],
-    [base + "/trigger/<topic>", "Any message fires the Virtual trigger node carrying that topic. " +
-     "The payload is ignored entirely."],
-    [base + "/switch/<topic>/set", "Moves every Switch node on that topic. Accepts ON, OFF, 1, 0, " +
-     "true, false, open, close in any case, or a JSON object."]
+    [base + "/button/<name>/press", t("Any message transmits that stored signal.")],
+    [base + "/trigger/<topic>", t("Any message fires the Virtual trigger node carrying that topic. " +
+     "The payload is ignored entirely.")],
+    [base + "/switch/<topic>/set", t("Moves every Switch node on that topic. Accepts ON, OFF, 1, 0, " +
+     "true, false, open, close in any case, or a JSON object.")]
   ]));
-  add(b5, hbP("A Switch reports back, retained, on:"));
+  add(b5, hbP(t("A Switch reports back, retained, on:")));
   add(b5, hbCode(base + "/switch/<topic>/state    ->  ON | OFF"));
   add(b5, hbP(
-    "It is republished when the switch moves, on every reconnect and after a reboot, so Home " +
-    "Assistant never shows a stale position."));
+    t("It is republished when the switch moves, on every reconnect and after a reboot, so Home " +
+    "Assistant never shows a stale position.")));
 
-  add(b5, hbH("From the command line"));
+  add(b5, hbH(t("From the command line")));
   add(b5, hbCode("mosquitto_sub -h <broker> -t '" + base + "/#' -v"));
   add(b5, hbCode("mosquitto_pub -h <broker> -t '" + base + "/trigger/chime' -m ''"));
   add(b5, hbCode("mosquitto_pub -h <broker> -t '" + base + "/switch/outside_bell/set' -m OFF"));
 
-  add(b5, hbH("Home Assistant discovery"));
+  add(b5, hbH(t("Home Assistant discovery")));
   add(b5, hbP(
-    "With discovery on, everything below arrives by itself as ONE device — identified by the " +
+    t("With discovery on, everything below arrives by itself as ONE device — identified by the " +
     "box's MAC address rather than its hostname, so renaming the box does not orphan your " +
-    "automations."));
+    "automations.")));
   add(b5, hbKV([
-    ["Per stored signal", "TWO things: a device trigger that fires on each press (for receiving) " +
-     "and a button entity that replays it (for transmitting)."],
-    ["Per Virtual trigger with a topic", "A button entity, so you can fire the chain from a " +
-     "dashboard."],
-    ["Per Switch topic", "A real switch entity — one per topic, not one per node, named after the " +
-     "first node on it."],
-    ["Unregistered presses", "A device trigger that fires on any burst matching no stored signal."],
-    ["Last unknown code", "A diagnostic sensor holding the fingerprint of the last unknown burst."],
-    ["Radio RSSI", "A diagnostic sensor: the live noise floor, in dBm."],
-    ["Radio", "A diagnostic binary sensor: is a CC1101 actually there."]
+    [t("Per stored signal"), t("TWO things: a device trigger that fires on each press (for receiving) " +
+     "and a button entity that replays it (for transmitting).")],
+    [t("Per Virtual trigger with a topic"), t("A button entity, so you can fire the chain from a " +
+     "dashboard.")],
+    [t("Per Switch topic"), t("A real switch entity — one per topic, not one per node, named after the " +
+     "first node on it.")],
+    [t("Unregistered presses"), t("A device trigger that fires on any burst matching no stored signal.")],
+    [t("Last unknown code"), t("A diagnostic sensor holding the fingerprint of the last unknown burst.")],
+    [t("Radio RSSI"), t("A diagnostic sensor: the live noise floor, in dBm.")],
+    [t("Radio"), t("A diagnostic binary sensor: is a CC1101 actually there.")]
   ]));
   add(b5, hbP(
-    "Presses are deliberately NOT binary sensors. A binary sensor has to be reset, the reset can " +
+    t("Presses are deliberately NOT binary sensors. A binary sensor has to be reset, the reset can " +
     "be lost, and the entity then sits “on” forever with nothing to clear it. A trigger cannot " +
-    "get stuck."));
+    "get stuck.")));
   add(b5, hbP(
-    "Deleting a signal tells Home Assistant to forget its entities. Renaming one changes its " +
-    "topic but not its entity, because entities are keyed on the signal's number."));
+    t("Deleting a signal tells Home Assistant to forget its entities. Renaming one changes its " +
+    "topic but not its entity, because entities are keyed on the signal's number.")));
 
-  add(b5, hbH("Keeping one node off MQTT"));
+  add(b5, hbH(t("Keeping one node off MQTT")));
   add(b5, hbP(
-    "Every Virtual trigger, Switch and MQTT publish node has an “Expose to Home Assistant / " +
+    t("Every Virtual trigger, Switch and MQTT publish node has an “Expose to Home Assistant / " +
     "MQTT” checkbox in its editor, ticked by default. Clear it and that one node becomes " +
     "invisible to the broker: nothing is subscribed for it, nothing is published for it, and " +
-    "it gets no Home Assistant entity."));
+    "it gets no Home Assistant entity.")));
   add(b5, hbKV([
-    ["Virtual trigger", "Loses its " + base + "/trigger/<topic> subscription and its HA button."],
-    ["Switch", "Loses its " + base + "/switch/<topic>/set subscription, its HA toggle and its " +
-     "retained position. An MQTT command no longer moves it."],
-    ["MQTT publish", "Publishes nothing at all — not on its own topic, and not into " +
-     base + "/event either."]
+    [t("Virtual trigger"), t("Loses its {topic} subscription and its HA button.",
+     { topic: base + "/trigger/<topic>" })],
+    ["Switch", t("Loses its {topic} subscription, its HA toggle and its " +
+     "retained position. An MQTT command no longer moves it.", { topic: base + "/switch/<topic>/set" })],
+    [t("MQTT publish"), t("Publishes nothing at all — not on its own topic, and not into " +
+     "{topic} either.", { topic: base + "/event" })]
   ]));
   add(b5, hbP(
-    "What it had already announced is CLEARED rather than abandoned: the box publishes an empty " +
+    t("What it had already announced is CLEARED rather than abandoned: the box publishes an empty " +
     "retained payload over the entity's config, and over a switch topic's retained state when no " +
     "exposed node carries that topic any more. Home Assistant removes the entity instead of " +
-    "showing it unavailable for ever — exactly what deleting the node would have done."));
+    "showing it unavailable for ever — exactly what deleting the node would have done.")));
   add(b5, hbP(
-    "Nothing inside the graph changes. A Switch still gates its wire, a Virtual trigger still " +
+    t("Nothing inside the graph changes. A Switch still gates its wire, a Virtual trigger still " +
     "fires from its ▶ button and from the API, and an MQTT publish node is still reached by the " +
-    "chain. The checkbox answers one question only: can anything outside the box see it."));
+    "chain. The checkbox answers one question only: can anything outside the box see it.")));
   add(b5, hbNote(
-    "It exists because a blank topic on a Switch stopped meaning “no MQTT” — it follows the " +
+    t("It exists because a blank topic on a Switch stopped meaning “no MQTT” — it follows the " +
     "node's name instead, so a Switch called “Outside bell” answers on outside_bell whether you " +
     "asked for a topic or not. A magic topic value was considered and rejected: “-” is a " +
     "perfectly legal MQTT topic level, so any sentinel would collide with a topic somebody could " +
-    "legitimately want."));
+    "legitimately want.")));
 
-  add(b5, hbH("What makes a topic valid"));
+  add(b5, hbH(t("What makes a topic valid")));
   add(b5, hbP(
-    "Every topic you can type — a node's, the base topic and the discovery prefix under Settings " +
+    t("Every topic you can type — a node's, the base topic and the discovery prefix under Settings " +
     "— is checked by the same rule, as you type and again on the box. A rejected topic is never " +
-    "stored and never quietly repaired; the message names the field and the character."));
+    "stored and never quietly repaired; the message names the field and the character.")));
   add(b5, hbKV([
-    ["# and +", "MQTT wildcards. Publishing to a topic containing one is illegal — the broker " +
+    [t("# and +"), t("MQTT wildcards. Publishing to a topic containing one is illegal — the broker " +
      "refuses the message or drops the connection. In the base topic that takes the whole bridge " +
-     "down rather than one entity."],
-    ["Control characters", "Anything unprintable, which is usually a newline pasted out of a " +
-     "config file. A topic you cannot see is a topic you cannot debug."],
-    ["A leading or trailing /", "Legal MQTT, but it means an empty first or last level and here " +
-     "it is always a mistake. The box puts the separators in itself."],
-    ["An empty level (a//b)", "Same reasoning — refused rather than silently making a topic " +
-     "nobody can read."],
-    ["Over 47 characters", "The field holds 47. Checked before the value is cut short, so you " +
-     "are told rather than quietly given a different topic."]
+     "down rather than one entity.")],
+    [t("Control characters"), t("Anything unprintable, which is usually a newline pasted out of a " +
+     "config file. A topic you cannot see is a topic you cannot debug.")],
+    [t("A leading or trailing /"), t("Legal MQTT, but it means an empty first or last level and here " +
+     "it is always a mistake. The box puts the separators in itself.")],
+    [t("An empty level (a//b)"), t("Same reasoning — refused rather than silently making a topic " +
+     "nobody can read.")],
+    [t("Over 47 characters"), t("The field holds 47. Checked before the value is cut short, so you " +
+     "are told rather than quietly given a different topic.")]
   ]));
   add(b5, hbP(
-    "Leaving a topic EMPTY is always fine. On a node it means “no topic”; under Settings it " +
-    "means “use the default”."));
+    t("Leaving a topic EMPTY is always fine. On a node it means “no topic”; under Settings it " +
+    "means “use the default”.")));
   add(root, s5);
 
   /* -------------------------------------------------------- 6. wired button */
-  var s6 = hbSection("wired", "Wired button",
-    "A physical button on a pin, for when there is no radio in the loop at all.");
+  var s6 = hbSection("wired", t("Wired button"),
+    t("A physical button on a pin, for when there is no radio in the loop at all."));
   var b6 = s6.bodyEl;
   hbPs(b6, [
-    "Any free GPIO will do, and the pin is chosen here in the UI rather than compiled in — no " +
+    t("Any free GPIO will do, and the pin is chosen here in the UI rather than compiled in — no " +
     "rebuild, no reflash. Add a Wired button node and its picker lists what is available on this " +
-    "board; the six pins the radio uses are never offered."
+    "board; the six pins the radio uses are never offered.")
   ]);
-  add(b6, hbP("The wiring is one wire and a button:"));
+  add(b6, hbP(t("The wiring is one wire and a button:")));
+  /* The only hbCode block that is not a command. GPIO/GND are pin names and stay,
+     but the two annotations are prose and are translated with the rest. */
   add(b6, hbCode(
-    "GPIO  ---+--- button --- GND\n" +
-    "         |\n" +
-    "         +--- internal pull-up, enabled by the firmware"));
+    t("GPIO  ---+--- button --- GND\n" +
+      "         |\n" +
+      "         +--- internal pull-up, enabled by the firmware")));
   hbPs(b6, [
-    "That is all of it. The pull-up is internal, so there is no resistor to add, and an " +
+    t("That is all of it. The pull-up is internal, so there is no resistor to add, and an " +
     "unpressed — or entirely unconnected — pin reads as “not pressed” rather than floating and " +
-    "firing at random.",
-    "A 50 ms debounce is applied by default. Without it a single press fires the chain several " +
-    "times, because a mechanical contact bounces."
+    "firing at random."),
+    t("A 50 ms debounce is applied by default. Without it a single press fires the chain several " +
+    "times, because a mechanical contact bounces.")
   ]);
   add(root, s6);
 
   /* --------------------------------------------- 7. when it does not work */
-  var s7 = hbSection("trouble", "When something does not work",
-    "Start at Diagnostics. It tells the five causes apart.");
+  var s7 = hbSection("trouble", t("When something does not work"),
+    t("Start at Diagnostics. It tells the five causes apart."));
   var b7 = s7.bodyEl;
   hbPs(b7, [
-    "“It does not work” has at least five different causes on an RF box: a dead SPI bus, a " +
+    t("“It does not work” has at least five different causes on an RF box: a dead SPI bus, a " +
     "mis-tuned radio, a noisy band, an unrecognised protocol, or a transmit that never keyed the " +
     "carrier. The Diagnostics tab shows which one you have, because every layer of the firmware " +
     "reports into the same list of named states — the serial log, the API and that page can never " +
-    "drift apart.",
-    "A state that has never fired is greyed out. The named states mean:"
+    "drift apart."),
+    t("A state that has never fired is greyed out. The named states mean:")
   ]);
-  add(b7, hbKV(DIAG_PLAIN));
-  add(b7, hbH("Two more things worth checking first"));
+  add(b7, hbKV(DIAG_PLAIN.map(function (kv) { return [kv[0], t(kv[1]), kv[2]]; })));
+  add(b7, hbH(t("Two more things worth checking first")));
   add(b7, hbList([
-    "No antenna. Sensitivity collapses without one — a 17.3 cm piece of wire is a quarter wave " +
-    "at 433 MHz and is enough to judge by.",
-    "A weak USB supply. A transmitting CC1101 draws tens of milliamps in bursts, so a marginal " +
+    t("No antenna. Sensitivity collapses without one — a 17.3 cm piece of wire is a quarter wave " +
+    "at 433 MHz and is enough to judge by."),
+    t("A weak USB supply. A transmitting CC1101 draws tens of milliamps in bursts, so a marginal " +
     "supply browns out during transmit and not during receive. If captures work but replays " +
-    "fail, suspect the power before the wiring."
+    "fail, suspect the power before the wiring.")
   ]));
   add(b7, hbP(
-    "If the chime rings twice for one press, look for an Any RF signal node and a Signal receiver " +
+    t("If the chime rings twice for one press, look for an Any RF signal node and a Signal receiver " +
     "both reaching the same sink. Both are firing, both are correct, and one of them is one too " +
-    "many."));
+    "many.")));
   add(b7, hbP(
-    "And if ONE remote will not register while others do — nothing in Activity, however often " +
+    t("And if ONE remote will not register while others do — nothing in Activity, however often " +
     "you press it — that is not a fault, it is a filter. Open a listening session and read the " +
     "verdict line: it says which of the four thresholds threw your remote away. The section " +
-    "above walks through it."));
+    "above walks through it.")));
   add(root, s7);
 
   /* ------------------------------------------------- 8. moving to a new box */
-  var s8 = hbSection("backup", "Moving a box's configuration",
-    "Backup, restore, and replacing a box without teaching it everything again.");
+  var s8 = hbSection("backup", t("Moving a box's configuration"),
+    t("Backup, restore, and replacing a box without teaching it everything again."));
   var b8 = s8.bodyEl;
   hbPs(b8, [
-    "Settings › Backup writes one file that holds everything this box has LEARNED: every " +
+    t("Settings › Backup writes one file that holds everything this box has LEARNED: every " +
     "stored waveform, and the whole node graph with its wiring. Restore it here to undo a bad " +
-    "afternoon, or on a second Klingelbox to move a working setup across.",
-    "The file holds no passwords. Not the Wi-Fi passphrase, not the hotspot password, not the " +
+    "afternoon, or on a second Klingelbox to move a working setup across."),
+    t("The file holds no passwords. Not the Wi-Fi passphrase, not the hotspot password, not the " +
     "MQTT credentials — not even hashes of them. A backup is a thing you email to yourself and " +
     "leave in a cloud folder, so it carries what the doorbell KNOWS and never what it can LOG " +
-    "IN TO. Network and broker settings are typed in again on the new box, once."
+    "IN TO. Network and broker settings are typed in again on the new box, once.")
   ]);
 
-  add(b8, hbH("Moving to a new box, in order"));
+  add(b8, hbH(t("Moving to a new box, in order")));
   add(b8, hbList([
-    "On the old box: Settings › Backup › Export backup file. It downloads as " +
-    "klingelbox-<name>-<date>.json.",
-    "Flash and set up the new box far enough that you can reach its web UI — Wi-Fi, and a " +
-    "hostname if you want one.",
-    "On the new box: Settings › Backup › Restore, choose the file, and read what it says the " +
-    "file contains.",
-    "Choose Replace on a fresh box (it has nothing to lose), or Merge to add this backup " +
-    "alongside what is already there.",
-    "Set up MQTT again if you use it, and re-pair any of your own chimes that were paired to a " +
-    "synthesized code — the code itself moved, but the chime is still listening for the old box."
+    t("On the old box: Settings › Backup › Export backup file. It downloads as " +
+    "klingelbox-<name>-<date>.json."),
+    t("Flash and set up the new box far enough that you can reach its web UI — Wi-Fi, and a " +
+    "hostname if you want one."),
+    t("On the new box: Settings › Backup › Restore, choose the file, and read what it says the " +
+    "file contains."),
+    t("Choose Replace on a fresh box (it has nothing to lose), or Merge to add this backup " +
+    "alongside what is already there."),
+    t("Set up MQTT again if you use it, and re-pair any of your own chimes that were paired to a " +
+    "synthesized code — the code itself moved, but the chime is still listening for the old box.")
   ], true));
 
-  add(b8, hbH("Merge or Replace"));
+  add(b8, hbH(t("Merge or Replace")));
   add(b8, hbKV([
-    ["Merge", "Adds the backup to what is already here. Nothing is deleted. Signals you " +
+    [t("Merge"), t("Adds the backup to what is already here. Nothing is deleted. Signals you " +
               "already have come in a second time — a merge cannot tell a re-import from a " +
-              "second doorbell."],
-    ["Replace", "Deletes every stored signal and every node on this box first, then imports. " +
-                "It cannot be undone, and it asks first, naming exactly what goes."]
+              "second doorbell.")],
+    [t("Replace"), t("Deletes every stored signal and every node on this box first, then imports. " +
+                "It cannot be undone, and it asks first, naming exactly what goes.")]
   ]));
   add(b8, hbNote(
-    "Whether it will FIT is checked before anything is deleted. A box holds 32 signals, 24 " +
+    t("Whether it will FIT is checked before anything is deleted. A box holds 32 signals, 24 " +
     "nodes and 48 links; if the arithmetic does not work the import is refused with the numbers " +
-    "and your box is left exactly as it was."));
+    "and your box is left exactly as it was.")));
 
-  add(b8, hbH("Numbers change, and that is handled"));
+  add(b8, hbH(t("Numbers change, and that is handled")));
   hbPs(b8, [
-    "Signals and nodes are numbered by whichever box they live on, so a graph carried over " +
+    t("Signals and nodes are numbered by whichever box they live on, so a graph carried over " +
     "from another box would point at the wrong things — or at nothing. The restore renumbers " +
     "as it goes: signals first, then nodes pointed at their new signal numbers, then links " +
-    "pointed at their new node numbers.",
-    "If a signal could not be imported, the nodes that used it are still created — unbound and " +
+    "pointed at their new node numbers."),
+    t("If a signal could not be imported, the nodes that used it are still created — unbound and " +
     "switched off, and listed in the summary. Their wiring is the laborious part to rebuild by " +
     "hand, and a node you can see and re-point is far better than one silently bound to " +
-    "whatever else happened to have that number here."
+    "whatever else happened to have that number here.")
   ]);
   add(b8, hbNote(
-    "A restore is not one single operation — it cannot be, on a box with this little memory, " +
+    t("A restore is not one single operation — it cannot be, on a box with this little memory, " +
     "because the whole file never fits in it at once. So it reports as it runs and tells you " +
     "the truth at the end: how many signals, nodes and links went in, and what was skipped and " +
-    "why. If it stops half way, what got in stays in.", "warn"));
+    "why. If it stops half way, what got in stays in."), "warn"));
 
-  add(b8, hbH("Radio settings"));
+  add(b8, hbH(t("Radio settings")));
   add(b8, hbP(
-    "Frequency, bandwidth, transmit power and repeat counts travel in the file too, but they " +
+    t("Frequency, bandwidth, transmit power and repeat counts travel in the file too, but they " +
     "are OFF by default when you restore. They describe how a particular box behaves, with a " +
     "particular antenna, and the new one may not be the same build. Tick the box only if you " +
-    "meant to copy them."));
+    "meant to copy them.")));
   add(root, s8);
 }
 
@@ -7391,20 +7681,21 @@ function buildRecovery(sys) {
   var root = clear($("#tab-recovery"));
   var panel = el("div", "panel");
   var h = el("div", "panel-head");
-  add(h, el("h2", null, "Set up Wi-Fi"));
+  add(h, el("h2", null, t("Set up Wi-Fi")));
   add(h, el("p", null,
-    "Welcome to your Klingelbox. It has no home network yet, so it opened its own hotspot " +
-    "(" + ((sys && sys.ap_ssid) || "Klingelbox-XXXX") + ") and you are connected to it now. " +
-    "Pick your home Wi-Fi, enter its password, and the box reboots onto your network."));
+    t("Welcome to your Klingelbox. It has no home network yet, so it opened its own hotspot " +
+    "({ssid}) and you are connected to it now. " +
+    "Pick your home Wi-Fi, enter its password, and the box reboots onto your network.",
+    { ssid: (sys && sys.ap_ssid) || "Klingelbox-XXXX" })));
   add(panel, h);
 
   /* step 1 -- scan */
   var s1 = el("div", "wizstep");
   var t1 = el("h3");
-  add(t1, el("span", "stepnum", "1"), document.createTextNode("Pick your network"));
+  add(t1, el("span", "stepnum", "1"), document.createTextNode(t("Pick your network")));
   add(s1, t1);
   var scanRow = el("div", "btnrow");
-  var scanBtn = el("button", "btn", "Scan again");
+  var scanBtn = el("button", "btn", t("Scan again"));
   scanBtn.type = "button";
   add(scanRow, scanBtn);
   add(s1, scanRow);
@@ -7417,34 +7708,34 @@ function buildRecovery(sys) {
   /* step 2 -- credentials */
   var s2 = el("div", "wizstep hidden");
   var t2 = el("h3");
-  add(t2, el("span", "stepnum", "2"), document.createTextNode("Enter the password"));
+  add(t2, el("span", "stepnum", "2"), document.createTextNode(t("Enter the password")));
   add(s2, t2);
-  var ssidIn = inputEl("text", "", { maxlength: "32", placeholder: "Network name" });
-  add(s2, field("Network (SSID)", ssidIn, "Picked from the list above, or typed in for a hidden network."));
-  var passField = field("Password", inputEl("password", "", { maxlength: "63" }));
+  var ssidIn = inputEl("text", "", { maxlength: "32", placeholder: t("Network name") });
+  add(s2, field(t("Network (SSID)"), ssidIn, t("Picked from the list above, or typed in for a hidden network.")));
+  var passField = field(t("Password"), inputEl("password", "", { maxlength: "63" }));
   var passIn = $("input", passField);
   passIn.autocomplete = "current-password";
-  var showPass = checkField("Show password", false);
+  var showPass = checkField(t("Show password"), false);
   showPass.input.addEventListener("change", function () {
     passIn.type = showPass.input.checked ? "text" : "password";
   });
   add(s2, passField, showPass);
   var slotSel = selectEl([
-    { value: 0, label: "Slot 1 (tried first)" },
+    { value: 0, label: t("Slot 1 (tried first)") },
     { value: 1, label: "Slot 2" },
     { value: 2, label: "Slot 3" }
   ], 0);
-  add(s2, field("Save into", slotSel, "The box tries its three saved networks in order."));
+  add(s2, field(t("Save into"), slotSel, t("The box tries its three saved networks in order.")));
   var saveMsg = el("div", "formmsg");
   var saveFoot = el("div", "formfoot");
-  var saveBtn = el("button", "btn primary block", "Save and connect");
+  var saveBtn = el("button", "btn primary block", t("Save and connect"));
   saveBtn.type = "button";
   add(saveFoot, saveBtn, saveMsg);
   add(s2, saveFoot);
   add(panel, s2);
 
   add(panel, el("div", "note",
-    "Nothing here leaves the box: the passphrase is written straight into its own flash."));
+    t("Nothing here leaves the box: the passphrase is written straight into its own flash.")));
   add(root, panel);
 
   var selectedAuth = null;
@@ -7467,17 +7758,17 @@ function buildRecovery(sys) {
 
   function doScan() {
     scanBtn.disabled = true;
-    setMsg(scanMsg, "Scanning…");
+    setMsg(scanMsg, t("Scanning…"));
     clear(list);
     api("/api/wifi/scan").then(function (res) {
       scanBtn.disabled = false;
       var nets = dedupeNetworks(res.networks || []);
       if (!nets.length) {
-        setMsg(scanMsg, "No networks found. Move the box closer to your router and scan again — or type the name in below.", "err");
+        setMsg(scanMsg, t("No networks found. Move the box closer to your router and scan again — or type the name in below."), "err");
         showStep2("", null);
         return;
       }
-      setMsg(scanMsg, nets.length + " network(s) found. Tap yours.", "ok");
+      setMsg(scanMsg, t("{n} network(s) found. Tap yours.", { n: nets.length }), "ok");
       nets.forEach(function (nw) {
         var li = el("li");
         var b = el("button", "listitem");
@@ -7486,9 +7777,9 @@ function buildRecovery(sys) {
         var main = el("div", "li-main");
         add(main, el("div", "li-title", nw.ssid));
         add(main, el("div", "li-sub",
-          (nw.known ? "already saved on this box  ·  " : "") +
-          (nw.auth === 0 ? "open network" : "password protected") +
-          (typeof nw.channel === "number" ? "  ·  ch " + nw.channel : "")));
+          (nw.known ? t("already saved on this box") + "  ·  " : "") +
+          (nw.auth === 0 ? t("open network") : t("password protected")) +
+          (typeof nw.channel === "number" ? "  ·  " + t("ch {ch}", { ch: nw.channel }) : "")));
         add(b, main);
         add(b, el("div", "li-meta", signalBars(nw.rssi) + " " + numOr(nw.rssi, -100) + " dBm"));
         b.addEventListener("click", function () {
@@ -7505,15 +7796,15 @@ function buildRecovery(sys) {
       mb.type = "button";
       add(mb, el("span", "li-ico", "✎"));
       var m2 = el("div", "li-main");
-      add(m2, el("div", "li-title", "Type the name myself"));
-      add(m2, el("div", "li-sub", "For a hidden network."));
+      add(m2, el("div", "li-title", t("Type the name myself")));
+      add(m2, el("div", "li-sub", t("For a hidden network.")));
       add(mb, m2);
       mb.addEventListener("click", function () { showStep2("", null); ssidIn.focus(); });
       add(li2, mb);
       add(list, li2);
     }).catch(function (e) {
       scanBtn.disabled = false;
-      setMsg(scanMsg, "Scan failed: " + e.message, "err");
+      setMsg(scanMsg, t("Scan failed: {msg}", { msg: e.message }), "err");
       showStep2("", null);
     });
   }
@@ -7523,9 +7814,9 @@ function buildRecovery(sys) {
 
   saveBtn.addEventListener("click", function () {
     var ssid = trimOf(ssidIn);
-    if (!ssid) { setMsg(saveMsg, "Pick a network, or type its name.", "err"); ssidIn.focus(); return; }
+    if (!ssid) { setMsg(saveMsg, t("Pick a network, or type its name."), "err"); ssidIn.focus(); return; }
     saveBtn.disabled = true;
-    setMsg(saveMsg, "Saving…");
+    setMsg(saveMsg, t("Saving…"));
     postJSON("/api/wifi", {
       slot: intOf(slotSel, 0),
       ssid: ssid,
@@ -7552,45 +7843,46 @@ function showRebooting(root, ssid, hostname) {
   var panel = el("div", "panel");
   var done = el("div", "done-big");
   add(done, el("div", "db-ico", "📶"));
-  add(done, el("h3", null, "Saved — the box is restarting"));
+  add(done, el("h3", null, t("Saved — the box is restarting")));
   add(done, el("p", "muted",
-    "It is joining “" + ssid + "” now. This hotspot disappears in a moment, which is " +
-    "exactly what should happen."));
+    t("It is joining “{ssid}” now. This hotspot disappears in a moment, which is " +
+    "exactly what should happen.", { ssid: ssid })));
   add(panel, done);
   var pr = el("div", "progress indet");
   add(pr, el("i"));
   add(panel, pr);
 
   var steps = el("div", "wizstep");
-  add(steps, el("h3", null, "What to do next"));
+  add(steps, el("h3", null, t("What to do next")));
   var ol = el("ol");
   ol.style.paddingLeft = "1.2rem";
   ol.style.fontSize = ".9rem";
   [
-    "Reconnect this phone to your home Wi-Fi — it may do that by itself.",
-    "Open http://" + hostname + ".local in your browser.",
-    "If that name does not resolve, look up the box's address in your router's device list."
-  ].forEach(function (t) { add(ol, el("li", null, t)); });
+    t("Reconnect this phone to your home Wi-Fi — it may do that by itself."),
+    t("Open http://{host}.local in your browser.", { host: hostname }),
+    t("If that name does not resolve, look up the box's address in your router's device list.")
+  ].forEach(function (line) { add(ol, el("li", null, line)); });
   add(steps, ol);
   add(steps, el("div", "note",
-    "If it does not appear, the password was probably wrong. The box notices, reopens this " +
-    "setup hotspot at its next boot, and you can try again."));
+    t("If it does not appear, the password was probably wrong. The box notices, reopens this " +
+    "setup hotspot at its next boot, and you can try again.")));
   add(panel, steps);
   add(root, panel);
 
   /* Keep watching: on a box that stays reachable we can confirm success. */
   var tries = 0;
-  var t = setInterval(function () {
+  var timer = setInterval(function () {
     tries++;
-    if (tries > 40) { clearInterval(t); return; }
+    if (tries > 40) { clearInterval(timer); return; }
     api("/api/system").then(function (s) {
       if (s && s.sta_connected) {
-        clearInterval(t);
+        clearInterval(timer);
         pr.classList.add("hidden");
         add(panel, el("div", "note ok",
-          "Connected to “" + (s.sta_ssid || ssid) + "” at " + (s.sta_ip || "?") +
+          t("Connected to “{ssid}” at {ip}" +
           ". Reconnect this phone to your home Wi-Fi and open http://" +
-          (s.hostname || hostname) + ".local"));
+          "{host}.local", { ssid: s.sta_ssid || ssid, ip: s.sta_ip || "?",
+            host: s.hostname || hostname })));
       }
     }).catch(function () { /* the hotspot dropping is the expected outcome */ });
   }, 3000);

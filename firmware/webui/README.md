@@ -30,17 +30,25 @@ working out what a Group node does. So the documentation ships inside the image.
 Its node reference is **generated from `NODE_TYPES`**, so a node added to the
 palette can be under-documented but never missing.
 
-Three files, no build step, no dependencies:
+Four files, no bundler, no dependencies:
 
 | File | Purpose |
 |---|---|
 | `index.html` | The shell: header, the two navigations, one empty `<section>` per screen. |
 | `style.css` | Design tokens (light/dark) plus the whole mobile-first layout. |
 | `app.js` | Everything else — every screen is built from live API data. |
+| `lang-de.js` | The German dictionary. Data only, no logic. See **Language** below. |
 
 They are flashed as a SPIFFS image on the `storage` partition, so the UI can be
-replaced without recompiling the firmware. The product name is German; **the
-interface is English on purpose**.
+replaced without recompiling the firmware.
+
+**They are gzipped on the way into the image, and only the `.gz` is shipped.**
+That is the one build step, it is three lines of CMake plus
+`firmware/tools/gzip_webui.py`, and it never touches these files — see **Size**
+below for why it exists and what the server does with a client that does not
+ask for gzip.
+
+The product name is German, and now so is one of the two interface languages.
 
 ---
 
@@ -83,7 +91,8 @@ The reference target is a 360 px portrait phone.
 Concretely:
 
 * **Touch targets** are at least 44 px (`--tap: 2.75rem`): buttons, list rows,
-  link chips, nav cells, the theme toggle.
+  link chips, nav cells, and both header toggles — theme *and* language, which
+  share the `.theme-toggle` box exactly.
 * **Inputs are 16 px** (`font-size: 1rem`). Anything smaller makes iOS Safari
   zoom the page on focus, which reads as the layout jumping about.
 * **No hover-only affordances.** Every `:hover` rule lives inside a
@@ -589,19 +598,146 @@ something.
 
 ---
 
+## Language
+
+**English and German.** The toggle sits beside the theme toggle in the header,
+wears the same 44 px square, and shows **the language you would get** — `DE`
+while you are reading English — because a button showing the language you
+already have makes the tap a guess.
+
+### The mechanism: the English string *is* the key
+
+```js
+el("button", "btn primary", t("Add node"))     // -> "Node hinzufügen"
+```
+
+`t()` looks the English sentence up in the active dictionary and returns the
+English itself when there is no entry. **There are deliberately no
+`nav.add_node` identifiers, and please do not "improve" it into them.** The
+reasoning, so it does not have to be rediscovered:
+
+* This was retrofitted onto a finished 350 KB `app.js`. Opaque ids would mean a
+  second dictionary (id → English) to keep in sync forever; English-as-key means
+  there is exactly one dictionary per language and it is the only file a
+  translator opens.
+* A missing or misspelt key degrades to **correct English**. With opaque ids it
+  degrades to `nav.add_node` leaking into the interface — much the worse failure
+  on a device whose UI ships in flash and cannot be hot-fixed from a server.
+* The source stays readable: `t("Add node")` says what appears on screen.
+
+The cost is real and accepted: editing an English string orphans its German
+entry (it visibly falls back to the new English), and two identical English
+strings cannot take different German. Neither has hurt yet.
+
+### Interpolation
+
+Never concatenate a translated fragment with a value — German word order
+differs. One key, with `{placeholders}` that `t()` substitutes:
+
+```js
+t("Signal {id} is still used by {n} nodes", { id: sig.id, n: users.length })
+```
+
+### What is never translated
+
+Node type wire names (`logic.switch`), MQTT topics, API paths and field names,
+GPIO numbers, shell commands, version strings — and every `{"error": "..."}`
+sentence the firmware returns, which is authored in C and is closer to log
+output than to interface copy.
+
+Top-level tables (`NODE_TYPES`, `EVENT_KINDS`, `DIAG_META`, `CAPTURE_HELP`,
+`NODE_DOC`, `PORT_TEXT`, `HB_RECIPES`, `DIAG_PLAIN`) keep their **English**
+literals, because those literals are the keys and the tables are evaluated once
+at load. Translation happens at the point of use — `nodeType()` does it for the
+palette centrally, which is what makes a language switch redraw the node cards.
+
+### Measured, in German, on the device
+
+At **360 px** nothing overflows: the document is 360 px wide on all five tabs,
+the widest element is a 336 px panel, and bottom sheets stay at 360 px. The
+header still fits with the second toggle in it — "Klingelbox" is not ellipsised
+(82 px needed, 82 px given) and the status chips keep their 121 px.
+
+The header tab strip is where German costs the most: **426 px against English's
+403 px**, driven almost entirely by *Einstellungen* (103 px vs *Settings*'
+69 px). That strip is a horizontal scroller by design and it already scrolled in
+English between 720 and 900 px; German widens that window to 720–1100 px. Below
+720 px the strip is hidden and the bottom bar takes over, so the phone layout
+never sees it.
+
+### Choosing, and switching
+
+`localStorage["klingelbox-lang"]` holds the choice. With nothing stored the
+primary subtag of `navigator.language` decides, so a browser set to German opens
+in German. Switching sets `<html lang>` (screen-reader voice, hyphenation),
+re-labels the static chrome, drops `S.built` and re-enters the current tab —
+**no page reload**. Open sheets are left alone on purpose (a listening session
+has the radio armed; tearing it down to relabel it would be the worse bug),
+polling timers go through the same stop/restart a tab switch performs, and the
+graph redraws from the data already in `S` with no refetch.
+
+### Adding a language
+
+1. Copy `lang-de.js` to `lang-<code>.js` and translate the values. Keys stay
+   English, byte-for-byte, `{placeholders}` included.
+2. Add the global to `LANG_DICTS` and the endonym to `LANG_NAMES` in `app.js`.
+3. Add a `<script src="/lang-<code>.js">` to `index.html`, before `app.js`.
+4. Past two languages the header control has to stop being a toggle — make it a
+   picker; `apply()` already takes an arbitrary code.
+
+Every language costs its own gzipped file on flash. German is 188 KB raw and
+**63 KB compressed** — a fifth of the gzipped image, and comfortably inside the
+budget the compression bought back (see **Size**).
+
+---
+
 ## Size
 
-Roughly **306 KB** raw across the three flashed files — `app.js` ≈ 247 KB,
-`style.css` ≈ 52 KB, `index.html` ≈ 6.3 KB. The Handbook is about 25 KB of that
-and is the price of a manual that works with no internet, which is the situation
-this box is most often in.
+**607 KB raw** across the four flashed files — `app.js` 362 KB, `lang-de.js`
+184 KB, `style.css` 54 KB, `index.html` 7.4 KB. The Handbook is a large share of
+both `app.js` and the dictionary, and is the price of a manual that works with
+no internet, which is the situation this box is most often in.
 
-That is over the ~250 KB guideline this file used to quote, and it was already
-over it (≈ 257 KB) before the Handbook existed — the figure above had simply
-drifted. The real ceiling is the **1 MB `storage` partition**, and the SPIFFS
-image is nowhere near it. Nothing is minified on purpose: the comments explain
-*why* each non-obvious decision was made, and a future maintainer reading this
-off a microcontroller has no source map.
+**Which is why the image is gzipped.** The 4 MB board's `storage` partition is
+`0x80000` = 512 KB, of which about 470 KB is usable after SPIFFS' own overhead.
+Measured with `spiffsgen.py`, the *uncompressed* UI needed **94.5 %** of that
+partition before German existed — there was no room for a second language, and
+CI builds the 4 MB variant, so it would simply have gone red.
+
+Text compresses about 3.2:1:
+
+| File | raw | gzip |
+|---|---|---|
+| `app.js` | 370162 | 117129 (32 %) |
+| `lang-de.js` | 187941 | 64784 (34 %) |
+| `style.css` | 55788 | 16398 (29 %) |
+| `index.html` | 7576 | 2764 (36 %) |
+
+Measured with `spiffsgen.py`, English-only and uncompressed needed **94.5 %** of
+the partition. English **and** German, gzipped, need **43.0 %** — the second
+language is affordable only because of the compression, which is why the two
+changes landed together.
+
+`firmware/tools/gzip_webui.py` mirrors this directory into
+`build/webui-gz/` as `<name>.gz` and *that* is what
+`spiffs_create_partition_image` images. This directory is never touched: it must
+stay plain, editable, reviewable text. `README.md` is skipped — 35 KB of design
+notes that no browser ever fetches has no business on the flash chip. Output is
+deterministic (mtime 0), so an unchanged UI produces a byte-identical
+`storage.bin`.
+
+**Only the `.gz` is shipped.** Shipping an uncompressed twin would undo the
+whole point, so `open_asset()` in `http_api.c` falls back to the `.gz` even for
+a client that never sent `Accept-Encoding: gzip`, and labels it honestly with
+`Content-Encoding: gzip`. Every browser has understood gzip for two decades and
+this is a LAN appliance; a plain `curl` therefore gets correct, correctly
+labelled bytes rather than a 404 — read them with `curl --compressed` or a pipe
+through `gunzip`.
+
+Nothing is minified, on purpose: the comments explain *why* each non-obvious
+decision was made, and a future maintainer reading this off a microcontroller
+has no source map. Gzip makes minification unnecessary — comments compress
+extremely well.
 
 ---
 
@@ -618,7 +754,8 @@ the setup hotspot with no internet on the box.
 
 ## Working on it
 
-There is no build step. Edit the files and reflash the storage partition:
+Edit the files and reflash the storage partition. The gzip staging runs as part
+of the build, on every build, so there is nothing to remember:
 
 ```sh
 idf.py build
@@ -633,5 +770,5 @@ optional chaining, no arrow functions) beyond `Promise` and `fetch`, which every
 target browser has. Check it before flashing:
 
 ```sh
-node --check app.js
+node --check app.js && node --check lang-de.js
 ```

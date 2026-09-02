@@ -58,6 +58,17 @@ idf_component_register(
 # If webui/ has no index.html (a fresh CI checkout, or before the UI lands) we
 # fall back to the minimal placeholder in main/www/, so the build always succeeds
 # and the device always serves something.
+#
+# THE IMAGE IS GZIPPED. The UI is ~440 KB of plain text and the 4 MB board's
+# `storage` partition is 512 KB — about 470 KB usable — so the uncompressed UI
+# sat at ~94 % full with no room for a second language. tools/gzip_webui.py
+# mirrors webui/ into ${WEBUI_STAGE} as "<name>.gz" and *that* is what gets
+# imaged; webui/ itself stays plain, editable, reviewable text. Only .gz goes in
+# — see open_asset() in http_api.c for how a non-gzip client is handled.
+#
+# The staging step is a target rather than a configure-time execute_process
+# because CMake does not re-configure when a .js file changes; as an ALL target
+# it re-runs on every build, exactly like spiffsgen itself does.
 # ---------------------------------------------------------------------------
 set(WEBUI_SRC "${CMAKE_CURRENT_LIST_DIR}/../webui")
 set(WEBUI_FALLBACK "${CMAKE_CURRENT_LIST_DIR}/www")
@@ -69,4 +80,15 @@ else()
     message(STATUS "Klingelbox: firmware/webui/ not found — using placeholder (main/www/)")
 endif()
 
-spiffs_create_partition_image(storage "${WEBUI_DIR}" FLASH_IN_PROJECT)
+set(WEBUI_STAGE "${CMAKE_BINARY_DIR}/webui-gz")
+idf_build_get_property(webui_python PYTHON)
+add_custom_target(webui_gzip ALL
+    COMMAND ${webui_python}
+            "${CMAKE_CURRENT_LIST_DIR}/../tools/gzip_webui.py"
+            "${WEBUI_DIR}" "${WEBUI_STAGE}"
+    COMMENT "Compressing web UI into ${WEBUI_STAGE}"
+    VERBATIM)
+
+spiffs_create_partition_image(storage "${WEBUI_STAGE}" FLASH_IN_PROJECT)
+# spiffsgen must not run before the staging directory has been (re)filled.
+add_dependencies(spiffs_storage_bin webui_gzip)

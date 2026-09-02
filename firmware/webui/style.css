@@ -194,6 +194,14 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   display: inline-flex; align-items: center; justify-content: center;
   font-size: 1.05rem; cursor: pointer;
 }
+/* The language toggle IS a .theme-toggle — same 44 px square, same border, same
+   place in the row — because it is the same kind of control. It only differs in
+   carrying two letters instead of a glyph, so the type is stepped down and
+   tightened to sit optically level with the emoji beside it. */
+.lang-toggle {
+  font-size: .78rem; font-weight: 700; letter-spacing: .04em;
+  font-variant-numeric: tabular-nums;
+}
 /* Hidden at the base width. It and the brand dot say the SAME three things —
    ready / AP only / no radio — and at 360 px the badge is ~61 px that decides
    whether "Klingelbox" itself gets ellipsised next to the status chips. The dot
@@ -297,6 +305,48 @@ main {
   /* clear the fixed bottom bar plus the home indicator */
   padding-bottom: calc(4.75rem + env(safe-area-inset-bottom));
 }
+
+/* ---------------------------------------------------------- bottom nav ----
+   The phone's primary navigation. `main` already reserves 4.75rem for it, and
+   the >=720px block hides it -- but the bar itself had NO base rules at all, so
+   below 720px it rendered as five default buttons in normal flow, wrapping to
+   three lines. Mobile is the primary target here, so this is the layout that
+   matters most.
+
+   Fixed rather than sticky: it must not move while a long Handbook section
+   scrolls under it. Five equal cells, because a sixth would drop each below the
+   44px that makes a tap reliable. */
+.bottomnav {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+  display: flex;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  /* the home indicator on a notched phone sits inside the bar's box */
+  padding-bottom: env(safe-area-inset-bottom);
+  box-shadow: 0 -1px 8px rgba(0, 0, 0, .18);
+}
+.navbtn {
+  flex: 1 1 0; min-width: 0;            /* equal cells; labels may ellipsise */
+  appearance: none; border: 0; background: transparent; color: var(--muted);
+  font: inherit; cursor: pointer;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: .1rem;
+  min-height: 3.25rem;                  /* comfortably past the 44px minimum */
+  padding: .35rem .15rem;
+}
+.navbtn .ico { font-size: 1.15rem; line-height: 1; }
+/* German labels run 20-30% longer than English; ellipsise rather than wrap,
+   so the bar can never become two rows tall. */
+.navbtn .lbl {
+  font-size: .68rem; font-weight: 600; line-height: 1.1;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.navbtn.active { color: var(--accent); }
+.navbtn.active .ico { transform: translateY(-1px); }
+@media (hover: hover) and (pointer: fine) {
+  .navbtn:hover { color: var(--text); }
+}
+
 .tabpane { display: none; }
 .tabpane.active { display: block; }
 .stack { display: flex; flex-direction: column; gap: .75rem; }
