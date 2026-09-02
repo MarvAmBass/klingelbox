@@ -1044,6 +1044,41 @@ function signalBlock(sig, opts) {
   if (!txAvailable()) txb.title = S.txBlock;
   txb.addEventListener("click", function () { transmit(sig.id, txb, msg); });
 
+  /* Export just this one signal.
+     Deliberately the SAME bundle shape as a full backup, with one signal and an
+     empty graph -- so it imports through the identical path with no special
+     case. A one-signal file is simply a small backup, which is also why it can
+     be merged into a box that already has automations without touching them. */
+  var exp = el("button", "btn", "\u2b07 Export");
+  exp.type = "button";
+  exp.title = "Download this one signal as a .json you can import on another Klingelbox";
+  exp.addEventListener("click", function () {
+    exp.disabled = true;
+    setMsg(msg, "Reading the waveform\u2026");
+    Promise.all([api("/api/system"), api("/api/signals/" + sig.id)])
+      .then(function (r) {
+        var sysm = r[0], full = r[1];
+        var bundle = {
+          kind: BACKUP_KIND,
+          version: BACKUP_VERSION,
+          exported_at: Math.floor(Date.now() / 1000),
+          device: { hostname: sysm.hostname || "", version: sysm.version || "", idf: sysm.idf || "" },
+          signals: [{
+            id: full.id, name: full.name, origin: full.origin,
+            first_level: full.first_level, durations_us: full.durations_us || []
+          }],
+          graph: { nodes: [], links: [] }
+        };
+        var slug = String(full.name || ("signal-" + full.id))
+                     .toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, "");
+        var bytes = downloadBundle(bundle, "klingelbox-signal-" + (slug || full.id) + ".json");
+        exp.disabled = false;
+        setMsg(msg, "Exported " + (full.durations_us || []).length + " pulses (" +
+                    Math.round(bytes / 1024) + " KB). Import it on another box from Settings \u2192 Backup.", "ok");
+      })
+      .catch(function (e) { exp.disabled = false; setMsg(msg, e.message, "err"); });
+  });
+
   var save = el("button", "btn", "Save name");
   save.type = "button";
   save.addEventListener("click", function () {
@@ -1061,7 +1096,7 @@ function signalBlock(sig, opts) {
     }).catch(function (e) { save.disabled = false; setMsg(msg, e.message, "err"); });
   });
 
-  add(foot, txb, save, msg);
+  add(foot, txb, save, exp, msg);
   add(box, foot);
 
   /* Suppressed in Settings -> Stored signals, where the note would point at the
@@ -4790,6 +4825,19 @@ function sectionSignals() {
     openVirtualFlow({ mode: "sink" }).then(function (sig) { if (sig) loadSignals(); });
   });
   add(mkRow, bMake);
+
+  /* Import exactly ONE signal.
+     Separate from Settings -> Backup on purpose: this is "someone sent me a
+     doorbell code", not "move a whole box". It therefore REFUSES a full bundle
+     rather than quietly importing the first signal out of it and dropping the
+     rest -- a partial restore that reports success is the failure mode worth
+     designing out. The file format is identical either way, so the same export
+     works in both places; only the acceptance rule differs. */
+  var bImp = el("button", "btn", "\u2b06 Import a signal");
+  bImp.type = "button";
+  bImp.addEventListener("click", function () { openImportSignal(); });
+  add(mkRow, bImp);
+
   add(s.bodyEl, mkRow);
   add(s.bodyEl, el("div", "hint",
     "A signal created here belongs to no node yet. Wire it up later from the "
@@ -5253,6 +5301,119 @@ function sectionFirmware() {
    folders. It carries what the doorbell KNOWS -- waveforms and wiring -- and
    never what it can LOG IN TO: no Wi-Fi SSID or passphrase, no AP password, no
    MQTT host or credentials, not even hashes. */
+
+/* ----------------------------------------------------------- import one signal
+   Accepts a bundle carrying exactly one signal and no graph -- i.e. what the
+   per-signal Export produces. A full backup is refused WITH ITS CONTENTS NAMED
+   and a pointer to Settings -> Backup, because "wrong file" is not a useful
+   thing to tell someone holding a file that is perfectly valid elsewhere. */
+function openImportSignal() {
+  var sh = openSheet("Import a signal", "");
+  var body = sh.bodyEl;
+
+  add(body, el("p", "muted",
+    "Choose a .json exported from a signal's Export button \u2014 on this box or another one. " +
+    "The waveform is re-analysed here, so the imported signal behaves exactly like one you learned yourself."));
+
+  var file = el("input");
+  file.type = "file";
+  file.accept = ".json,application/json";
+  file.style.fontSize = "1rem";
+  file.style.padding = ".55rem 0";
+  add(body, field("Signal file", file, "Nothing is written until you choose Import below."));
+
+  var nameIn = inputEl("text", "", { maxlength: "31", placeholder: "leave empty to keep the exported name" });
+  add(body, field("Name on this box", nameIn, "Optional \u2014 useful when you already have a signal with the same name."));
+
+  var info = el("div", "note hidden");
+  add(body, info);
+
+  var msg = el("div", "formmsg");
+  var foot = el("div", "formfoot");
+  var go = el("button", "btn primary", "Import");
+  go.type = "button";
+  go.disabled = true;
+  var cancel = el("button", "btn ghost", "Cancel");
+  cancel.type = "button";
+  cancel.addEventListener("click", function () { sh.close(); });
+  add(foot, go, cancel, msg);
+  add(body, foot);
+
+  var pending = null;
+
+  file.addEventListener("change", function () {
+    pending = null; go.disabled = true;
+    info.classList.add("hidden");
+    setMsg(msg, "");
+    var f = file.files && file.files[0];
+    if (!f) return;
+    var rd = new FileReader();
+    rd.onload = function () {
+      var b;
+      try { b = JSON.parse(String(rd.result)); }
+      catch (e) { setMsg(msg, "That file is not valid JSON.", "err"); return; }
+
+      if (!b || b.kind !== BACKUP_KIND) {
+        setMsg(msg, "That is not a Klingelbox export.", "err"); return;
+      }
+      if (numOr(b.version, 0) > BACKUP_VERSION) {
+        setMsg(msg, "That file was written by a newer Klingelbox (format v" + b.version +
+                    "). Update this box first.", "err"); return;
+      }
+      var sigs = isArr(b.signals) ? b.signals : [];
+      var nodes = (b.graph && isArr(b.graph.nodes)) ? b.graph.nodes : [];
+      var links = (b.graph && isArr(b.graph.links)) ? b.graph.links : [];
+
+      if (sigs.length !== 1 || nodes.length || links.length) {
+        /* Name what it actually is, and where it DOES work. */
+        setMsg(msg, "This looks like a full backup (" + sigs.length + " signal" +
+                    (sigs.length === 1 ? "" : "s") +
+                    (nodes.length ? ", " + nodes.length + " node" + (nodes.length === 1 ? "" : "s") : "") +
+                    "). Import it from Settings \u2192 Backup instead \u2014 this button takes a single " +
+                    "exported signal.", "err");
+        return;
+      }
+      var sig = sigs[0];
+      if (!isArr(sig.durations_us) || !sig.durations_us.length) {
+        setMsg(msg, "That signal carries no waveform, so there is nothing to import.", "err"); return;
+      }
+      pending = sig;
+      info.classList.remove("hidden");
+      clear(info);
+      add(info, el("div", null, "\u201c" + (sig.name || "unnamed") + "\u201d \u2014 " +
+                                sig.durations_us.length + " pulses, origin " + (sig.origin || "captured")));
+      if (b.device && b.device.hostname)
+        add(info, el("div", "hint", "Exported from " + b.device.hostname));
+      if (!trimOf(nameIn)) nameIn.value = sig.name || "";
+      go.disabled = false;
+      setMsg(msg, "");
+    };
+    rd.onerror = function () { setMsg(msg, "Could not read that file.", "err"); };
+    rd.readAsText(f);
+  });
+
+  go.addEventListener("click", function () {
+    if (!pending) return;
+    go.disabled = true;
+    setMsg(msg, "Importing\u2026");
+    postJSON("/api/signals/import", {
+      name: trimOf(nameIn) || pending.name || "Imported signal",
+      first_level: numOr(pending.first_level, 0),
+      durations_us: pending.durations_us,
+      origin: "imported"
+    }).then(function (created) {
+      loadSignals();
+      sh.close();
+      alertSheet("Signal imported",
+        "\u201c" + (created.name || "") + "\u201d is stored as id " + created.id + ". " +
+        (created.decoded ? "It decodes as " + created.decoded.text + ". " : "No decoder recognised it, which is fine \u2014 it can still be transmitted. ") +
+        "Wire it up from the Dashboard, or open it here to test it.");
+    }).catch(function (e) {
+      go.disabled = false;
+      setMsg(msg, e.message, "err");
+    });
+  });
+}
 
 var BACKUP_KIND = "klingelbox-backup";
 var BACKUP_VERSION = 1;
