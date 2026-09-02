@@ -19,12 +19,13 @@ another chime, Home Assistant, or both. Nothing leaves your network.
 [Hardware](hardware.html){: .btn .mr-2 }
 [View on GitHub](https://github.com/MarvAmBass/klingelbox){: .btn }
 
-![The Klingelbox dashboard: the node graph, with a switch blocking one path](assets/dashboard.png)
+![The Klingelbox dashboard: two doorbell buttons routed through rate limits to MQTT, a switch and a second chime](assets/dashboard.png)
 
-The whole box is one flow. Above: two doorbell buttons publish to MQTT; a **Switch**
-— toggleable from Home Assistant — is currently **off**, so the paths it gates are
-drawn broken and the chime behind it stays silent; a **Monitor** lights up whenever
-the signal beside it fires.
+The whole box is one flow. Above: two doorbell buttons each pass through a
+**Rate limit** — so leaning on the button still rings once — and on to MQTT, a
+**Switch** you can toggle from Home Assistant, and a second chime. **Monitor**
+nodes light up as a chain fires, so you can watch it work instead of reading a
+log.
 
 ---
 

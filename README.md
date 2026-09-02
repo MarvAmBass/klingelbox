@@ -11,12 +11,13 @@ own chimes to, and wire it all together in a node graph: *this button rings thos
 chimes, these three all ring the upstairs one, and Home Assistant sees every
 press.*
 
-![The Klingelbox dashboard: the node graph, with a switch blocking one path](docs/assets/dashboard.png)
+![The Klingelbox dashboard: two doorbell buttons routed through rate limits to MQTT, a switch and a second chime](docs/assets/dashboard.png)
 
-The whole box is one flow. Above: two doorbell buttons publish to MQTT; a
-**Switch** — toggleable from Home Assistant — is currently **off**, so the paths
-it gates are drawn broken and the chime behind it stays silent; a **Monitor**
-lights up whenever the signal beside it fires.
+The whole box is one flow. Above: two doorbell buttons each pass through a
+**Rate limit** — so leaning on the button still rings once — and on to MQTT, a
+**Switch** you can toggle from Home Assistant, and a second chime. **Monitor**
+nodes light up as a chain fires, so you can watch it work instead of reading a
+log.
 
 > **Status:** validated on real hardware. A live unit captures a doorbell,
 > decodes it, replays it so the original chime rings, and has been running the

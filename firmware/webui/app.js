@@ -4185,6 +4185,37 @@ function renderCanvas() {
     return c;
   }
 
+  /* A widened badge carrying a short VALUE rather than a glyph.
+     Rate limit and Repeat are configured entirely by two numbers, and on the map
+     those numbers are the only thing distinguishing one from another — a row of
+     identical "Rate limit" boxes tells you nothing about which is 10 s and which
+     is 10 minutes. It shares the badge shape, sits in the same slot the lamp and
+     ▶ use, and is right-aligned to that slot's edge so it grows leftwards into
+     empty space instead of towards the ✕. It is a readout: no hit disc. */
+  function pill(g, xEnd, cy, cls, text) {
+    var w = Math.max(2 * BADGE_R, text.length * 6 + 10);
+    var x = xEnd - w;
+    var r = svgEl("rect", "nbadge npill " + cls);
+    r.setAttribute("x", x); r.setAttribute("y", cy - BADGE_R);
+    r.setAttribute("width", w); r.setAttribute("height", BADGE_R * 2);
+    r.setAttribute("rx", BADGE_R);
+    add(g, r);
+    var t = svgEl("text", "nbadge-gl npill " + cls);
+    t.setAttribute("x", x + w / 2); t.setAttribute("y", cy + 3.5);
+    t.setAttribute("text-anchor", "middle");
+    t.textContent = text;
+    add(g, t);
+    return r;
+  }
+
+  /* Seconds, compact enough for a 168-unit box: 90 -> "90s", 600 -> "10m". */
+  function shortSecs(v) {
+    var n = Math.max(0, Math.round(numOr(v, 0)));
+    if (n < 60 || n % 60) return n + "s";
+    var m = n / 60;
+    return (m < 60 || m % 60) ? m + "m" : (m / 60) + "h";
+  }
+
   function hitDisc(g, cx, cy, r, label, onFire) {
     var d = svgEl("circle", "nhit");
     d.setAttribute("cx", cx); d.setAttribute("cy", cy); d.setAttribute("r", r);
@@ -4296,6 +4327,22 @@ function renderCanvas() {
     if (mon) {
       var lamp = badge(g, BADGE_X_ACT, BADGE_Y, "nlamp", null);
       lamp.setAttribute("data-monlamp", n.id);
+    }
+
+    /* The logic types' settings, in the slot the lamp and ▶ occupy on other
+       types. These nodes have no action to offer, so the space is free — and
+       what you want from them at a glance is their VALUE, not their name. */
+    if (n.type === "logic.throttle") {
+      pill(g, BADGE_X_ACT + BADGE_R, BADGE_Y, "nval",
+           shortSecs(numOr(n.window_s, 10)));
+    } else if (n.type === "logic.repeat") {
+      /* "3x5s" — the two numbers that define it, in the order they happen. */
+      pill(g, BADGE_X_ACT + BADGE_R, BADGE_Y, "nval",
+           numOr(n.repeats, 3) + "\u00d7" + shortSecs(numOr(n.window_s, 5)));
+    } else if (n.type === "logic.group") {
+      /* ANY ignores the window entirely, so showing one would be a lie. */
+      pill(g, BADGE_X_ACT + BADGE_R, BADGE_Y, "nval",
+           n.group_mode === "all" ? ("ALL " + shortSecs(numOr(n.window_s, 1))) : "ANY");
     }
 
     if (hasIn(ty)) {

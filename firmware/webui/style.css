@@ -759,6 +759,11 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
    unmistakably destructive under the pointer. Colour only: pointer-events never
    change, so nothing depends on hovering first on a touch laptop. */
 .canvas .nbadge-gl.ndel { fill: var(--muted); }
+
+/* A value readout, not a control: quieter than ▶ and with no hover state, so it
+   never invites a click that would do nothing. */
+.canvas .nbadge.npill { fill: var(--chip); stroke: var(--line); }
+.canvas .nbadge-gl.npill { fill: var(--muted); font-weight: 650; }
 .canvas g.node:hover .nbadge.ndel { fill: var(--bad-bg); stroke: var(--bad); }
 .canvas g.node:hover .nbadge-gl.ndel { fill: var(--bad); }
 
