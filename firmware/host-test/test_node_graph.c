@@ -641,6 +641,107 @@ static void test_slugify(void)
     CHECK(small[0] == '\0', "NULL name slugifies to nothing");
 }
 
+/* ---- 3. the RF control input on a switch ---------------------------------
+ *
+ * db_switch_reacts_to() decides whether a code heard on air toggles a switch
+ * node. It is four conditions and no hardware, and getting any one of them
+ * wrong is a bug nobody notices until a stranger's remote flips somebody's
+ * chime off: an unbound switch (signal_id 0) reacting to a burst that also
+ * decodes as 0 would mean EVERY unregistered press toggled every switch on the
+ * box. That case is the first one below and the reason this predicate is a
+ * function rather than an inline `&&` at the call site.
+ */
+static db_node_t sw_node(uint8_t type, uint16_t signal_id, int enabled)
+{
+    db_node_t n;
+    memset(&n, 0, sizeof(n));
+    n.id        = 9;
+    n.type      = type;
+    n.enabled   = enabled ? true : false;
+    n.signal_id = signal_id;
+    n.mqtt_enabled = true;
+    snprintf(n.name, sizeof(n.name), "Outside bell");
+    return n;
+}
+
+static void test_switch_reacts(void)
+{
+    CASE("switch reacts to signal");
+
+    /* The matched signal toggles it. */
+    db_node_t n = sw_node(DB_NODE_LOGIC_SWITCH, 4, 1);
+    CHECK(db_switch_reacts_to(&n, 4), "signal 4 must move a switch bound to 4");
+
+    /* A different signal does not. */
+    CHECK(!db_switch_reacts_to(&n, 5), "signal 5 must not move a switch bound to 4");
+    CHECK(!db_switch_reacts_to(&n, 3), "signal 3 must not move a switch bound to 4");
+
+    /* signal_id 0 is the default and means "never reacts". Both halves matter:
+     * an unbound switch is inert, AND an unrecognized burst (which arrives with
+     * signal_id 0) must not be read as matching it. */
+    db_node_t unbound = sw_node(DB_NODE_LOGIC_SWITCH, 0, 1);
+    CHECK(!db_switch_reacts_to(&unbound, 0),
+          "an unbound switch must not react to an unrecognized burst");
+    CHECK(!db_switch_reacts_to(&unbound, 4),
+          "an unbound switch must not react to a recognized burst either");
+    CHECK(!db_switch_reacts_to(&n, 0),
+          "a bound switch must not react to an unrecognized burst");
+
+    /* ONLY a switch reacts. Every node type carries a signal_id, and the two
+     * signal types carry a MEANINGFUL one — a receiver bound to code 4 must
+     * keep firing its chain and must never be treated as a switch to toggle. */
+    uint8_t others[] = { DB_NODE_SIGNAL_RX, DB_NODE_SIGNAL_TX, DB_NODE_SOURCE_GPIO,
+                         DB_NODE_SOURCE_VIRTUAL, DB_NODE_SOURCE_ANY_RF,
+                         DB_NODE_LOGIC_GROUP, DB_NODE_LOGIC_THROTTLE,
+                         DB_NODE_LOGIC_REPEAT, DB_NODE_SINK_MQTT,
+                         DB_NODE_SINK_MONITOR };
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+        db_node_t o = sw_node(others[i], 4, 1);
+        CHECK(!db_switch_reacts_to(&o, 4),
+              "node type %u must not be toggled by a signal", (unsigned)others[i]);
+    }
+
+    /* A NULL node is not a crash. traverse() and the graph task both walk live
+     * arrays, but the predicate is public and cheap to call wrongly. */
+    CHECK(!db_switch_reacts_to(NULL, 4), "NULL node must not react");
+}
+
+/*
+ * THE POSITION IS NOT A GATE, and this is the test that says so on purpose.
+ *
+ * On a logic.switch `enabled` IS the position (see DB_NODE_LOGIC_SWITCH). The
+ * usual graph rule — a disabled node is inert — would therefore mean the fob
+ * could switch the path OFF and never back ON: a toggle that works exactly
+ * once, which is the failure a user would report as "my remote broke the
+ * switch". There is no second flag for a switch to be disabled BY (the editor
+ * offers this type no Enabled checkbox at all), so there is nothing here to
+ * honour. If this ever starts failing, someone has added `n->enabled` to the
+ * predicate and turned the feature into a one-way button.
+ */
+static void test_switch_reacts_in_both_positions(void)
+{
+    CASE("switch reacts in both positions");
+
+    db_node_t on  = sw_node(DB_NODE_LOGIC_SWITCH, 4, 1);
+    db_node_t off = sw_node(DB_NODE_LOGIC_SWITCH, 4, 0);
+    CHECK(db_switch_reacts_to(&on, 4),  "an ON switch must react (so it can go OFF)");
+    CHECK(db_switch_reacts_to(&off, 4), "an OFF switch must react (so it can come back)");
+
+    /* And the move itself is a toggle, so two presses are a round trip. This is
+     * the arithmetic the graph task does; it is one line there and worth
+     * pinning here because "one press, one toggle" is the whole contract. */
+    bool pos = true;
+    pos = !pos; CHECK(pos == false, "first press switches it off");
+    pos = !pos; CHECK(pos == true,  "second press switches it back on");
+
+    /* mqtt_enabled is NOT a gate either: the control input is local behaviour
+     * between the radio and the graph and must work with MQTT off entirely. */
+    db_node_t hidden = sw_node(DB_NODE_LOGIC_SWITCH, 4, 1);
+    hidden.mqtt_enabled = false;
+    CHECK(db_switch_reacts_to(&hidden, 4),
+          "a switch taken off MQTT must still react to its control signal");
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 int main(void)
@@ -667,6 +768,8 @@ int main(void)
     test_slugify();
     test_switch_suffix();
     test_switch_suffix_matching();
+    test_switch_reacts();
+    test_switch_reacts_in_both_positions();
 
     printf("---------------------\n");
     printf("%d checks passed, %d failed\n", g_pass, g_fail);

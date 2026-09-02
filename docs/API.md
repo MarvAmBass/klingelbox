@@ -483,6 +483,10 @@ the node that heard it has no send side to reach.
 `repeats` and `gap_us` are read on `signal.tx` alone; they are still present on
 an `rx` node's JSON (every field is, see below) and ignored there.
 
+A third type reads `signal_id` from the same pool: on `logic.switch` it is an
+optional **control** signal that toggles the switch when it is heard — see
+`logic.switch` below.
+
 **Stored graphs migrate automatically** (nodes blob v2 → v3). `signal.rx` keeps
 the enum slot the old two-ported `signal` type had, so a stored node is already
 an `rx` node, and the migration only decides which ones were being used as
@@ -590,6 +594,58 @@ automated. The cost is bounded staleness — a power cut seconds after a toggle
 comes back in the previous position — and the box always republishes its
 **actual** position retained on connect, so no subscriber is left believing a
 switch it cannot see.
+
+**`signal_id` on a `logic.switch` is a CONTROL input.** Optional, `0` by default,
+and nothing to do with the switch's input port — the port is a *data* input,
+carrying events that pass *through* the switch while it is on. Set `signal_id` to
+a stored signal and **every time that code is recognised on air, the switch
+toggles**. One button on a fob becomes a physical on/off for a path: press it by
+the door and the outside chime stops ringing; press it again and it rings.
+
+```
+POST /api/graph/nodes/9   {"signal_id": 4}    → this switch now toggles on signal 4
+POST /api/graph/nodes/9   {"signal_id": 0}    → back to MQTT/UI/REST only
+```
+
+| | |
+|---|---|
+| `signal_id: 0` | unchanged behaviour: only MQTT, the UI and REST move it |
+| `signal_id: N` | that code, heard on air, **toggles** the switch |
+
+It is a **toggle**, not a set — one button, both directions. Forcing a specific
+position from two different buttons would need a mode field and there is no free
+one; see the note at the end of this section.
+
+Six things follow from it being a control action rather than a traversal:
+
+* **Toggling injects nothing into the switch's outputs.** The wire changes state;
+  no event travels down it. A remote that both flipped a switch and rang through
+  it would be indistinguishable from a broken switch.
+* **The move goes through the same path as every other switch move**, so the
+  retained `<base>/switch/<topic>/state` is republished immediately and Home
+  Assistant follows — and the deferred write applies, so a fob hammered by a
+  child costs no more flash than an automation flapping the switch does.
+* **One press is one toggle.** A remote repeats its frame several times per
+  press; `rf_service.c` coalesces those into a single burst before the graph sees
+  anything, so a press arrives once (with `repeats` counting the copies).
+* **If the same signal also drives a `signal.rx` node, both happen** — the rx
+  node fires its chain *and* the switch flips. That is correct, and it is the
+  same thing `source.any_rf` already does alongside a matching `signal.rx`. In
+  the log it looks like double-firing and is not.
+* **`POST /api/graph/nodes/{id}/fire` on a `signal.rx` node also toggles it.**
+  Firing a receiver means "pretend this code was just heard", so it means the
+  whole of it. This is how the feature is tested with no transmitter. Firing any
+  other node type moves no switch.
+* **It works with MQTT off.** Neither `mqtt_enabled` nor the global MQTT setting
+  gates it — it is local behaviour between the radio and the graph.
+
+The switch's own position is **not** a gate: a switch that is OFF still reacts,
+which is what makes it a toggle rather than a one-way off button. (On this type
+`enabled` *is* the position, so there is no separate "disabled" state to honour —
+the UI offers a `logic.switch` no Enabled checkbox at all.)
+
+No new field was added for this: `signal_id` exists on every node and was unused
+on this type. Stored graphs are unaffected and no blob version changed.
 
 **`topic` serves three node types.** On `sink.mqtt` it is published to as
 `<base>/<topic>`. On `source.virtual` it is SUBSCRIBED to as

@@ -316,6 +316,11 @@ static bool              s_ready;
 
 static struct { db_sink_fn fn; void *ctx; } s_transmit, s_mqtt;
 
+/* Told when an RF control signal moved a switch, so the retained MQTT position
+ * can follow. NULL until the app registers one, and NULL forever on a box with
+ * MQTT compiled out — the toggle itself does not depend on it. */
+static db_graph_notify_fn s_switch_notify;
+
 /* One staging buffer for both blobs; the node blob is the larger. */
 static uint8_t s_blob[sizeof(grf_hdr_t) + DB_NODE_MAX * sizeof(db_node_t)];
 
@@ -1039,6 +1044,29 @@ static void switch_save_service(int64_t now)
     }
 }
 
+/*
+ * Move one switch, by array index. Caller holds the lock. Returns whether the
+ * position actually changed.
+ *
+ * Split out of db_graph_switch_set() so the RF control path below can reuse it
+ * from INSIDE the lock it already holds — s_lock is a plain mutex, not a
+ * recursive one, so calling the public function there would deadlock the graph
+ * task on itself. Reusing this rather than writing `enabled` directly is what
+ * keeps the deferred-write logic on every path that moves a switch: a fob
+ * hammered by a child must be no worse for the flash than a Home Assistant
+ * automation is.
+ */
+static bool switch_set_locked(int i, bool on)
+{
+    if (s_nodes[i].enabled == on)
+        return false;
+    s_nodes[i].enabled = on;
+    switch_mark_dirty();
+    ESP_LOGI(TAG, "switch '%s' (node %u) is now %s",
+             s_nodes[i].name, (unsigned)s_nodes[i].id, on ? "ON" : "OFF");
+    return true;
+}
+
 esp_err_t db_graph_switch_set(uint16_t node_id, bool on)
 {
     lock();
@@ -1051,15 +1079,48 @@ esp_err_t db_graph_switch_set(uint16_t node_id, bool on)
         unlock();
         return ESP_ERR_INVALID_ARG;
     }
-    bool changed = (s_nodes[i].enabled != on);
-    if (changed) {
-        s_nodes[i].enabled = on;
-        switch_mark_dirty();
-        ESP_LOGI(TAG, "switch '%s' (node %u) is now %s",
-                 s_nodes[i].name, (unsigned)node_id, on ? "ON" : "OFF");
-    }
+    switch_set_locked(i, on);
     unlock();
     return ESP_OK;
+}
+
+void db_graph_set_switch_notify_handler(db_graph_notify_fn fn)
+{
+    s_switch_notify = fn;
+    ESP_LOGI(TAG, "switch notify handler %s", fn ? "registered" : "cleared");
+}
+
+/*
+ * A stored code was heard (or simulated). TOGGLE every switch node that names it
+ * as its control signal. Caller holds the lock; returns how many moved.
+ *
+ * A CONTROL ACTION, NOT A TRAVERSAL. Nothing is walked and nothing is injected
+ * into the switch's outputs: the point of the feature is to change whether the
+ * wire conducts, not to push an event down it. A remote that both flipped the
+ * switch and rang through it would be indistinguishable from a broken switch.
+ *
+ * BEFORE THE TRAVERSALS, on purpose. Within one burst the control action lands
+ * first, so a press never walks a switch it is in the middle of moving and the
+ * position the log reports is the position the same burst's chains saw.
+ */
+static int switch_control_on_signal(uint16_t heard_id)
+{
+    int moved = 0;
+    if (heard_id == 0)
+        return 0;
+    for (int i = 0; i < s_node_count; i++) {
+        if (!db_switch_reacts_to(&s_nodes[i], heard_id))
+            continue;
+        /* Toggle: one button, both directions. See db_switch_reacts_to() in
+         * node_graph.h for why the switch's own position is not a gate here. */
+        if (switch_set_locked(i, !s_nodes[i].enabled)) {
+            moved++;
+            db_events_push(DB_EV_SYSTEM, heard_id, s_nodes[i].id, 0, 0,
+                           "signal toggled switch \"%s\" %s", s_nodes[i].name,
+                           s_nodes[i].enabled ? "ON" : "OFF");
+        }
+    }
+    return moved;
 }
 
 void db_graph_switch_suffix(const db_node_t *n, char *out, size_t outsz)
@@ -1811,9 +1872,15 @@ static void graph_task(void *arg)
          * happened to precede it had crossed. */
         s_repeat_hops = 0;
 
+        /* Set by the two paths that can move a switch without an API caller
+         * behind them; the broker is told once, after the lock is dropped. */
+        bool switch_moved = false;
+
         switch (q.kind) {
         case TRIG_RF:
             lock();
+            /* Control before data — see switch_control_on_signal(). */
+            switch_moved = (switch_control_on_signal(q.trig.signal_id) > 0);
             for (int i = 0; i < s_node_count; i++) {
                 const db_node_t *n = &s_nodes[i];
                 if (!n->enabled)
@@ -1851,6 +1918,16 @@ static void graph_task(void *arg)
             lock();
             int idx = node_index(q.arg);
             if (idx >= 0) {
+                /* Firing a SIGNAL_RX means "pretend this code was just heard",
+                 * so it has to mean the whole of it — including the switches
+                 * that react to that code. Without this the ▶ on a receiver
+                 * would quietly simulate less than a real press does, and the
+                 * feature would be untestable without a transmitter. No other
+                 * type moves a switch: firing a tx node puts a code on the air
+                 * and our own echo is suppressed, and firing anything else has
+                 * no code behind it at all. */
+                if (s_nodes[idx].type == DB_NODE_SIGNAL_RX)
+                    switch_moved = (switch_control_on_signal(s_nodes[idx].signal_id) > 0);
                 db_trigger_t trig;
                 trigger_from_node(&trig, &s_nodes[idx]);
                 traverse(q.arg, &trig);
@@ -1878,6 +1955,11 @@ static void graph_task(void *arg)
         default:
             break;
         }
+
+        /* Outside the lock, because the handler hands work to another task and
+         * must never be run holding this one's mutex. */
+        if (switch_moved && s_switch_notify)
+            s_switch_notify();
 
         /* Handling that trigger may have taken a while (a transmit sink keys the
          * radio for a couple of hundred milliseconds), so an emission can have

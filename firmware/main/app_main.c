@@ -242,6 +242,11 @@ void app_main(void)
     db_graph_init();
     db_graph_set_transmit_handler(transmit_sink, NULL);
     db_graph_set_mqtt_handler(db_mqtt_sink, NULL);
+    /* An RF control signal can move a switch with no API caller behind it, so
+     * nobody else is left to publish the new retained position. Registered like
+     * the sinks above rather than called from the engine, which must not know
+     * the broker exists. A no-op when MQTT is disabled. */
+    db_graph_set_switch_notify_handler(db_mqtt_on_switch_changed);
 
     /* 5. dispatch + transmit tasks, created BEFORE the radio so no burst is
      * dropped between capture starting and the consumer existing. */

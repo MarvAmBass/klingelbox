@@ -156,6 +156,17 @@ typedef enum {
      * paths at once. Nothing here or in mqtt_bridge.c may assume topic
      * uniqueness.
      *
+     * `signal_id` IS REUSED TOO, AS A CONTROL INPUT — see
+     * db_switch_reacts_to() below for the rule and the reasoning. Non-zero
+     * means "whenever that stored code is heard on air, toggle me". NO NEW
+     * STRUCT FIELD WAS ADDED FOR IT, and none may be: the field already exists
+     * on every node, is unused on this type, and the obvious instinct — add a
+     * `control_signal_id` beside it — would change the on-flash layout of
+     * db_node_t and owe a fifth blob version. The last field that was added
+     * only fitted because it landed in what v3 used as padding, which is
+     * exactly why load_blob() decides on the version header rather than on
+     * sizeof(). Reuse the field.
+     *
      * Appended at the end of the enum (slot 7 stays the retired hole), so no
      * stored blob moves and no migration is owed.
      */
@@ -215,8 +226,11 @@ typedef struct {
 
     /* SIGNAL_RX: the stored signal this node listens for.
      * SIGNAL_TX: the stored signal this node sends.
-     * ONE POOL, TWO TYPES — the same signal_id may legitimately appear on an rx
-     * node, on a tx node, or on several of each. */
+     * LOGIC_SWITCH: OPTIONAL. The stored signal that TOGGLES this switch when it
+     *   is heard on air — a control input, not a data input. 0 (the default)
+     *   means the switch is only ever moved from MQTT, the UI or REST.
+     * ONE POOL, THREE TYPES — the same signal_id may legitimately appear on an
+     * rx node, on a tx node, on a switch, or on several of each. */
     uint16_t signal_id;
 
     /* SOURCE_GPIO — an OPTIONAL wired button, fully configured from the web UI.
@@ -447,14 +461,90 @@ int db_graph_switch_set_topic(const char *topic, bool on);
  */
 bool db_graph_switch_topic_state(const char *topic, bool *found_out);
 
+/*
+ * ---- the RF control input --------------------------------------------------
+ *
+ * DOES THIS NODE TOGGLE WHEN `heard_id` IS RECOGNIZED ON AIR?
+ *
+ * A remote becomes a physical on/off for a path: press the fob by the door and
+ * the outside chime stops ringing. Before this, a switch could only be moved
+ * from Home Assistant, this box's own web UI or REST — none of which are in
+ * your pocket on the doorstep.
+ *
+ * WHY IT IS A PROPERTY AND NOT A LINK. A switch's input PORT is a data input:
+ * events arriving there travel THROUGH it when it is on. What is wanted here is
+ * a CONTROL input, and the graph has no concept of one — a second port meaning
+ * something else entirely on one node type is the kind of node nobody can read
+ * off the screen (see the header comment on the retired two-ported signal node).
+ * So it is a field on the node, reusing the `signal_id` every node already
+ * carries and this type never used.
+ *
+ * IT IS A TOGGLE, NOT A SET. One button, both directions — which is the whole
+ * point of a fob with one button on it. Forcing a particular position needs a
+ * mode field, and there is no free one worth overloading for it.
+ *
+ * NOTE WHAT IS DELIBERATELY NOT TESTED HERE: `enabled`. On this type `enabled`
+ * IS the position (see DB_NODE_LOGIC_SWITCH), so "skip a disabled node" would
+ * mean the fob could only ever switch it OFF and never back on — a toggle that
+ * works once. There is no second flag to be disabled by, and the web UI offers
+ * a switch no Enabled checkbox for exactly that reason. `mqtt_enabled` is not
+ * tested either: this is local behaviour between the radio and the graph, and it
+ * must work with MQTT switched off entirely.
+ *
+ * Written as an inline predicate rather than as engine code because it is pure
+ * routing logic with no hardware in it, and can therefore be pinned down by
+ * host-test/test_node_graph.c instead of by flashing a box and pressing a
+ * button. It touches nothing but db_node_t fields, so the header stays
+ * compilable against the two stubs there.
+ */
+static inline bool db_switch_reacts_to(const db_node_t *n, uint16_t heard_id)
+{
+    return n != NULL &&
+           n->type == (uint8_t)DB_NODE_LOGIC_SWITCH &&
+           n->signal_id != 0 &&
+           n->signal_id == heard_id;
+}
+
+/*
+ * A switch was moved by the ENGINE itself — an RF control signal arrived, not an
+ * API call. Registered by the app so the retained MQTT state can follow.
+ *
+ * WHY INJECTED RATHER THAN CALLED. Every other switch writer is reached FROM the
+ * outside (http_api.c and mqtt_bridge.c both publish the new position themselves
+ * once db_graph_switch_set* returns), so there was nobody to tell. This one has
+ * no caller to do it — the mover is the graph task. Calling db_mqtt_* from here
+ * would make the routing engine depend on the broker, which is the one thing
+ * this file's header promises it does not do; so the app registers a handler,
+ * exactly as it does for the transmit and MQTT sinks.
+ *
+ * Invoked from the graph task with no lock held, only when a position actually
+ * changed. The handler must not block.
+ */
+typedef void (*db_graph_notify_fn)(void);
+void db_graph_set_switch_notify_handler(db_graph_notify_fn fn);
+
 /* ---- entry points that start a traversal ---- */
 
 /*
- * An RF burst arrived. Fires:
+ * An RF burst arrived. First TOGGLES every LOGIC_SWITCH node that reacts to
+ * trig->signal_id (db_switch_reacts_to, above) — a control action, which is why
+ * it happens before anything is walked and does not itself start a traversal.
+ * Then fires:
  *   - every enabled DB_NODE_SIGNAL_RX node bound to trig->signal_id (when
  *     non-zero), and
  *   - every enabled SOURCE_ANY_RF node, ALWAYS — including for bursts that match
  *     no stored signal.
+ *
+ * ONE CODE MAY DO BOTH. A signal bound to a signal.rx node AND named as a
+ * switch's control signal makes both things happen from one press: the rx node
+ * runs its chain and the switch flips. That reads as double-firing in the log
+ * and is not — they are two different nodes reacting to the same code, the same
+ * way SOURCE_ANY_RF already fires alongside a matching rx node.
+ *
+ * ONE BURST IS ONE TOGGLE. A remote sends its frame several times per press;
+ * rf_service.c coalesces those repeats into a single burst (BURST_WINDOW_US)
+ * before anything reaches here, so a press that puts six copies on the air
+ * arrives as one call with repeats == 6, not as six calls.
  *
  * DB_NODE_SIGNAL_TX nodes are never started by a burst, whatever they are bound
  * to. That is the split doing its job: a heard code cannot re-send itself
@@ -479,7 +569,13 @@ void db_graph_on_wired(uint16_t node_id);
  * A traversal simply STARTS at the node; nothing about it is special-cased any
  * more, so what firing does is just what that node does. On a SIGNAL_RX that is
  * "pretend this code was heard" — its output fires and nothing goes on air. On
- * a SIGNAL_TX it is a transmit, exactly as an inbound link would have caused. */
+ * a SIGNAL_TX it is a transmit, exactly as an inbound link would have caused.
+ *
+ * "PRETEND THIS CODE WAS HEARD" IS TAKEN LITERALLY. Firing a SIGNAL_RX bound to
+ * a code therefore also toggles the switches that react to that code, exactly as
+ * a real burst would — otherwise the simulation would be a simulation of only
+ * half the box, and the ▶ on a receiver would silently mean something different
+ * from pressing the remote. Firing any other node type moves no switch. */
 esp_err_t db_graph_fire_node(uint16_t node_id);
 
 /* ---- wired inputs ----

@@ -3484,10 +3484,22 @@ function nodeSummary(n) {
         ? t("Passes through once (no repeat)")
         : t("Rings {times}x total, {s} s apart", { times: times, s: numOr(n.window_s, 5) });
     }
-    case "logic.switch":
-      return (switchOn(n) ? t("ON — events pass through") : t("OFF — everything past it is blocked")) +
-             (n.mqtt_enabled === false ? " · " + t("not on MQTT")
+    case "logic.switch": {
+      /* Position first, because that is what anyone scanning the list is
+         after. What MOVES it comes next, and the radio is named before the
+         broker: a code on air is the surprising one, and the summary is the
+         only place it shows without opening the node. */
+      var swSub = switchOn(n) ? t("ON — events pass through")
+                              : t("OFF — everything past it is blocked");
+      var csid = numOr(n.signal_id, 0);
+      if (csid) {
+        var csn = signalName(csid);
+        swSub += " · " + (csn ? t("toggled by “{name}”", { name: csn })
+                              : t("toggled by signal {id} (missing)", { id: csid }));
+      }
+      return swSub + (n.mqtt_enabled === false ? " · " + t("not on MQTT")
                : (n.topic ? (" · " + mqttSwitchTopic(n.topic, "set")) : " · " + t("no MQTT topic")));
+    }
     case "sink.mqtt":
       if (n.mqtt_enabled === false) return t("Not on MQTT — publishes nothing");
       return n.topic ? t("Publishes to {topic}", { topic: mqttPublishTopic(n.topic) }) : t("No topic set");
@@ -4077,6 +4089,16 @@ function openNodeEditor(n) {
     sh.body.insertBefore(swBtn, grid);
     sh.body.insertBefore(swMsg, grid);
 
+    /* The RF control input, directly under the position and above the MQTT
+       block: the two questions about a switch are "which way is it" and "what
+       moves it", in that order, and Home Assistant is only one of the answers
+       to the second. Applied the moment a signal is chosen -- like the binding
+       on a Signal node, and for the same reason: it is an action, not a form
+       field the user has to remember to Save. */
+    var swSig = el("div", "sigctl");
+    sh.body.insertBefore(swSig, grid);
+    renderSwitchControl(swSig, n);
+
     ctl.topic = inputEl("text", n.topic || "",
       { maxlength: String(TOPIC_MAX), placeholder: "outside_bell" });
     var swPreview = el("div", "hint mono");
@@ -4263,6 +4285,73 @@ function openNodeEditor(n) {
   cancel.addEventListener("click", sh.close);
   add(foot, save, cancel, delBtn, msg);
   add(sh.body, foot);
+}
+
+/* ------------------------------------------------- a switch's RF control --
+
+   "React to a signal" on a Switch node, rebuilt in place when it changes.
+
+   THIS IS NOT A WIRE, AND THAT IS THE WHOLE REASON IT IS A FIELD. A Switch's
+   input PORT is a data input: events arriving there travel THROUGH it while it
+   is on. What this offers is a CONTROL input -- a code that moves the switch
+   rather than passing through it -- and the map has no such thing to draw. So
+   it lives on the node, in the editor, and reuses the same signal picker every
+   other binding in this UI uses rather than being a second chooser to learn.
+
+   None is a real option and is the default, so it is spelled out as a button
+   rather than left as "clear the field somehow". */
+function renderSwitchControl(wrap, n) {
+  clear(wrap);
+  var sid = numOr(n.signal_id, 0);
+  var msg = el("div", "formmsg");
+
+  add(wrap, el("div", "lg-label", t("React to a signal")));
+  add(wrap, el("div", "hint",
+    t("Optional. Each press of that button flips this switch — on, off, on again. " +
+      "Nothing is transmitted and nothing travels down the wire; only the position changes.")));
+
+  if (!sid) {
+    add(wrap, el("div", "note",
+      t("None. This switch is moved from this page, the REST API and Home Assistant only — " +
+        "nothing on air touches it.")));
+  } else {
+    var nm = signalName(sid);
+    add(wrap, el("div", nm ? "note ok" : "note bad", nm
+      ? t("Every press of “{name}” toggles this switch.", { name: nm })
+      : t("Set to signal {id}, which is no longer in the store — nothing will ever toggle it. " +
+          "Pick another one, or set it back to None.", { id: sid })));
+  }
+
+  function apply(id, busy) {
+    setMsg(msg, busy);
+    return postJSON("/api/graph/nodes/" + n.id, { signal_id: id }).then(function () {
+      n.signal_id = id;
+      loadGraph();
+      renderSwitchControl(wrap, n);
+    }).catch(function (e) { setMsg(msg, e.message, "err"); });
+  }
+
+  var row = el("div", "btnrow");
+  row.style.marginTop = ".6rem";
+  var pick = el("button", "btn",
+    sid ? t("🔀 Use a different signal") : t("📻 Choose a signal"));
+  pick.type = "button";
+  pick.addEventListener("click", function () {
+    openSignalPicker({
+      title: t("Signal that toggles this switch"),
+      node: n,
+      onPick: function (sig) { if (sig) apply(sig.id, t("Linking…")); }
+    });
+  });
+  add(row, pick);
+
+  if (sid) {
+    var none = el("button", "btn", t("✕ None"));
+    none.type = "button";
+    none.addEventListener("click", function () { apply(0, t("Clearing…")); });
+    add(row, none);
+  }
+  add(wrap, row, msg);
 }
 
 /* The signal section of a node editor, rebuilt in place whenever the binding
@@ -4807,6 +4896,18 @@ function renderCanvas() {
     var t2 = svgEl("text", "ntype");
     t2.setAttribute("x", "12"); t2.setAttribute("y", "53");
     t2.textContent = ty.ico + " " + ty.label;
+    /* A Switch with an RF control signal says so ON THE TYPE LINE, not as a
+       third badge. The badge strip is deliberately two slots wide -- ✕ plus
+       whichever one control the type has -- and on a Switch the act slot is
+       already the I/O button, which is not giving it up: the position is the
+       thing you reach for. A radio marker on the subtitle costs no geometry,
+       cannot collide with the ports, and answers the question the map raises
+       ("why did that flip on its own?") without turning a 168-unit box into a
+       toolbar. The full sentence is one tap away in the editor. */
+    if (isSwitch(n) && numOr(n.signal_id, 0)) {
+      var cn = signalName(n.signal_id) || t("signal {id}", { id: n.signal_id });
+      t2.textContent = (t2.textContent + " · 📻 " + cn).slice(0, 26);
+    }
     add(g, t2);
 
     /* 💡 — the whole reason the Monitor node exists on the map: you can watch a
@@ -4898,11 +4999,18 @@ function renderCanvas() {
     if (isSwitch(n)) {
       var on = switchOn(n);
       var sbg = badge(g, BADGE_X_ACT, BADGE_Y, "nsw" + (on ? " on" : " off"), on ? "I" : "O");
+      var csid2 = numOr(n.signal_id, 0);
+      /* The tooltip carries the control signal too, so hovering the badge
+         explains the 📻 on the subtitle without a trip to the editor. */
+      var swTip = csid2
+        ? t("   Each press of “{name}” also flips it.",
+            { name: signalName(csid2) || t("signal {id}", { id: csid2 }) })
+        : "";
       hitDisc(g, BADGE_X_ACT, BADGE_Y, BADGE_HIT,
         (on ? t("Switch “{name}” OFF — blocks everything wired after it",
                 { name: n.name || ty.label })
             : t("Switch “{name}” ON — lets this path conduct again",
-                { name: n.name || ty.label })),
+                { name: n.name || ty.label })) + swTip,
         function () {
           if (sbg.classList) sbg.classList.add("fired");
           setSwitch(n, !on, null, canvasMsg);
@@ -6967,12 +7075,32 @@ var NODE_DOC = {
     settings: [
       ["Position", "ON or OFF. This IS the node's enabled flag — there is no second field, which " +
                    "is why a switched-off Switch draws its wire broken on the map."],
+      ["React to a signal", "Optional, none by default. Name a stored signal and every press of " +
+                "that button flips this switch — on, off, on again. It is a CONTROL input, not a " +
+                "wire: nothing is transmitted and nothing travels down the switch's own output, " +
+                "only the position changes."],
       ["Topic", "A suffix. With one set, Home Assistant gets a real switch entity for it. Left " +
                 "empty it does NOT mean “no MQTT” — it follows a slug of the node's name instead, " +
                 "so a switch called “Outside bell” answers on outside_bell either way."],
       ["Expose to MQTT", "On by default. Clear it and this node disappears from MQTT entirely \u2014 nothing subscribed, nothing published, and its Home Assistant entity removed rather than left behind unavailable. It keeps working inside the graph."]
     ],
-    notes: ["Three ways to move it: the ON/OFF button here, the REST API, or MQTT.",
+    notes: ["Four ways to move it: the ON/OFF button here, the REST API, MQTT, and — if you give " +
+            "it a signal to react to — a 433 MHz remote.",
+            "“React to a signal” is what makes a switch reachable from the doorstep: a fob in your " +
+            "pocket becomes the on/off for a path, with no phone and no Home Assistant in it. It " +
+            "toggles, so the press that silences the outside chime is the press that brings it " +
+            "back next time.",
+            "It is not the same as wiring a Signal receiver INTO the switch. A wire carries events " +
+            "THROUGH the switch while it is on; this MOVES the switch. That is why it is a field " +
+            "on the node and not a line on the map.",
+            "One press is one toggle, however many times the remote repeats its code — the box " +
+            "folds a press's repeats into a single burst before the graph ever sees it.",
+            "The same signal may also drive a Signal receiver. Both then happen from one press: " +
+            "the receiver runs its chain AND the switch flips. That is intended, and it looks " +
+            "like double-firing in Activity when it is two nodes reacting to one code.",
+            "A remote-driven move is published retained on MQTT straight away, so Home Assistant " +
+            "follows the fob as fast as it follows its own toggle. The reaction itself works with " +
+            "MQTT switched off entirely — it is between the radio and the graph.",
             "The topic it answers on is the one you typed, or a slug of its name if you did not " +
             "— “All Bells Switch” answers on all_bells_switch. The same answer decides the " +
             "subscription, the Home Assistant entity, the routing of a command and the reported " +

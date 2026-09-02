@@ -665,6 +665,24 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
   margin: .1rem 0 .8rem;
 }
 .sigsec > .empty { padding: 1rem .5rem; }
+
+/* "React to a signal" on a Switch node. Same indented, accent-ruled block as
+   .sigsec, because it is the same idea — a signal that belongs to the node you
+   are editing — even though what it holds is one line and two buttons rather
+   than a waveform. It carries its own heading, so unlike .sigsec the label sits
+   INSIDE the rule; scoped here rather than styling .lg-label globally, which
+   would restyle labels on screens this change has nothing to do with. */
+.sigctl {
+  border-left: 3px solid var(--accent);
+  background: var(--sunk);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  padding: .6rem .7rem;
+  margin: .1rem 0 .8rem;
+}
+.sigctl > .lg-label {
+  font-size: .7rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .03em; color: var(--muted); margin-bottom: .2rem;
+}
 .sigblock > .chiprow { margin-bottom: .4rem; }
 .sigblock .note { background: var(--panel); }
 
