@@ -1123,19 +1123,20 @@ static int switch_control_on_signal(uint16_t heard_id)
     return moved;
 }
 
-void db_graph_switch_suffix(const db_node_t *n, char *out, size_t outsz)
+/* Both addressable types resolve their suffix here — see node_graph.h. */
+void db_graph_node_suffix(const db_node_t *n, char *out, size_t outsz)
 {
     if (!out || outsz == 0)
         return;
     if (!n) { out[0] = '\0'; return; }
-    db_mqtt_switch_suffix(n->topic, n->name, out, outsz);
+    db_mqtt_node_suffix(n->topic, n->name, out, outsz);
 }
 
 /*
  * MATCHED BY RESOLVED SUFFIX, NOT BY THE RAW `topic` FIELD.
  *
  * This is the bug that started the whole feature's trouble. The bridge
- * subscribes on db_graph_switch_suffix() — explicit topic, else a slug of the
+ * subscribes on db_graph_node_suffix() — explicit topic, else a slug of the
  * name — but this function used to compare `s_nodes[i].topic` directly. A switch
  * called "All Bells Switch" with no topic typed therefore subscribed on
  * "all_bells_switch" and got a Home Assistant entity, while every command that
@@ -1144,7 +1145,7 @@ void db_graph_switch_suffix(const db_node_t *n, char *out, size_t outsz)
  * was never published, because db_graph_switch_topic_state() below had the same
  * flaw and reported "no such topic".
  *
- * Both now ask db_graph_switch_suffix(), which is the same function the bridge
+ * Both now ask db_graph_node_suffix(), which is the same function the bridge
  * asks. There is one rule and one implementation of it.
  */
 int db_graph_switch_set_topic(const char *topic, bool on)
@@ -1164,7 +1165,7 @@ int db_graph_switch_set_topic(const char *topic, bool on)
         if (!s_nodes[i].mqtt_enabled)
             continue;
         char sfx[DB_NODE_TOPIC_MAX];
-        db_graph_switch_suffix(&s_nodes[i], sfx, sizeof(sfx));
+        db_graph_node_suffix(&s_nodes[i], sfx, sizeof(sfx));
         if (strcmp(sfx, topic) != 0)
             continue;
         matched++;
@@ -1202,7 +1203,7 @@ bool db_graph_switch_topic_state(const char *topic, bool *found_out)
         if (!s_nodes[i].mqtt_enabled)
             continue;
         char sfx[DB_NODE_TOPIC_MAX];
-        db_graph_switch_suffix(&s_nodes[i], sfx, sizeof(sfx));
+        db_graph_node_suffix(&s_nodes[i], sfx, sizeof(sfx));
         if (strcmp(sfx, topic) != 0)
             continue;
         found = true;
@@ -2461,4 +2462,44 @@ esp_err_t db_graph_fire_node(uint16_t node_id)
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
+}
+
+/*
+ * MATCHED BY RESOLVED SUFFIX, exactly as db_graph_switch_set_topic() is — see
+ * node_graph.h for why every node on the topic fires rather than the first.
+ *
+ * The ids are collected under the lock and fired outside it: db_graph_fire_node()
+ * takes the same non-recursive mutex, and holding it across a queue send would
+ * be the graph task deadlocking on itself the moment the queue filled.
+ */
+int db_graph_fire_topic(const char *topic)
+{
+    if (!topic || !topic[0])
+        return 0;
+
+    uint16_t ids[DB_NODE_MAX];
+    int n = 0;
+
+    lock();
+    for (int i = 0; i < s_node_count && n < DB_NODE_MAX; i++) {
+        if (s_nodes[i].type != DB_NODE_SOURCE_VIRTUAL)
+            continue;
+        if (!s_nodes[i].enabled || !s_nodes[i].mqtt_enabled)
+            continue;
+        char sfx[DB_NODE_TOPIC_MAX];
+        db_graph_node_suffix(&s_nodes[i], sfx, sizeof(sfx));
+        if (strcmp(sfx, topic) != 0)
+            continue;
+        ids[n++] = s_nodes[i].id;
+    }
+    unlock();
+
+    int fired = 0;
+    for (int i = 0; i < n; i++)
+        if (db_graph_fire_node(ids[i]) == ESP_OK)
+            fired++;
+
+    if (n)
+        ESP_LOGI(TAG, "trigger topic '%s' -> %d node(s), %d fired", topic, n, fired);
+    return fired;
 }

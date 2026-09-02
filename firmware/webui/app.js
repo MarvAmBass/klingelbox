@@ -2457,8 +2457,14 @@ var NODE_TYPES = [
           "sends anything." },
   { t: "source.gpio", g: "source", label: "Wired button", ico: "🔌",
     help: "Fires when a button wired to a GPIO pin is pressed. Optional." },
-  { t: "source.virtual", g: "source", label: "Virtual trigger", ico: "✨",
-    help: "Fires from this page, from the REST API, or from an MQTT topic." },
+  /* "Virtual trigger" until 0.5, which is why it is still `source.virtual` on
+     the wire and on flash. Nobody searching for "a button Home Assistant can
+     press" ever found it under that name — the node existed the whole time and
+     got asked for as a missing feature. The LABEL is what people read, so the
+     label says what it is for. */
+  { t: "source.virtual", g: "source", label: "MQTT button", ico: "✨",
+    help: "A button Home Assistant can press. Any message on its topic fires it — and so do " +
+          "the ▶ here, the REST API and any other MQTT client." },
   { t: "source.any_rf", g: "source", label: "Any RF signal", ico: "📻",
     help: "Wildcard: fires on EVERY burst the receiver hears, registered or not." },
   /* Two genuinely different jobs under one type, so the help describes them
@@ -2641,7 +2647,7 @@ function topicError(value, fieldName, maxLen) {
 
 /*
  * The "Expose to Home Assistant / MQTT" checkbox, shared by the three node types
- * the bridge actually looks at (Virtual trigger, Switch, MQTT publish).
+ * the bridge actually looks at (MQTT button, Switch, MQTT publish).
  *
  * CHECKED BY DEFAULT, and `mqtt_enabled !== false` rather than a truthy test on
  * purpose: a node saved by an older firmware has no such field at all, and the
@@ -2690,12 +2696,21 @@ function bindTopicCheck(input, errEl, field, after) {
   return run;
 }
 
-/* "outside_bell" -> "Outside bell". Mirrors what the firmware does when a
-   switch node still carries its default name: the topic becomes the label. */
+/* "outside_bell" -> "Outside bell". Mirrors what the firmware does when a node
+   still carries its default name: the topic becomes the label. */
 function prettyTopic(topic) {
   var s = String(topic || "").replace(/[_\-/]+/g, " ").trim();
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : t("Switch");
 }
+
+/* Names the palette gave a node, in both shipped languages plus the wire name
+   and the pre-0.5 label. A node still wearing one of these is named after its
+   TOPIC in Home Assistant instead — see name_is_default() in mqtt_bridge.c,
+   which holds the same list on the other side and is the authority. Only the
+   MQTT-button side needs the list; the Switch's own check is inline below and
+   its label is "Switch" in both languages. */
+var DEFAULT_TRIGGER_NAME =
+  /^(mqtt[ -]?button|mqtt[ -]?taster|virtual trigger|virtueller ausl\u00f6ser|source\.virtual)$/i;
 
 function isSwitch(n) { return !!n && n.type === "logic.switch"; }
 function switchOn(n) { return !!n && n.enabled !== false; }
@@ -3458,13 +3473,18 @@ function nodeSummary(n) {
       return (n.gpio_pin >= 0 ? "GPIO " + n.gpio_pin : t("No pin chosen")) +
         " · " + (n.gpio_active_low === false ? t("active high") : t("active low")) +
         " · " + t("{ms} ms debounce", { ms: numOr(n.gpio_debounce_ms, 50) });
-    case "source.virtual":
+    case "source.virtual": {
       /* No new badge and no extra line: the subtitle already had a slot for the
          topic, and naming a topic nothing is listening on would be a lie. */
-      if (n.mqtt_enabled === false) return t("Not on MQTT · fired from this page or the REST API");
-      return n.topic
-        ? t("MQTT trigger: {topic}", { topic: mqttTriggerTopic(n.topic) })
-        : t("Fired from this page or the REST API only");
+      if (n.mqtt_enabled === false) return t("Not on MQTT \u00b7 fired from this page or the REST API");
+      /* Blank follows the NAME, exactly as the firmware resolves it — the card
+         showed "fired from this page only" for a node Home Assistant could
+         press perfectly well. */
+      var vsfx = n.topic || topicSlug(n.name);
+      return vsfx
+        ? t("Home Assistant can press it \u00b7 {topic}", { topic: mqttTriggerTopic(vsfx) })
+        : t("No name and no topic \u2014 fired from this page or the REST API only");
+    }
     case "source.any_rf":
       return t("Fires on every received burst — registered buttons and strangers alike");
     /* The window is named only where it is used. Printing "window 1 s" beside
@@ -3581,7 +3601,7 @@ function nodeCard(n, links) {
      pretends one came IN. The card spends the glyph rather than a ▶ precisely
      because it has room for it — one press of 📡 can ring a chime in someone's
      house, and a button that says which way it goes is worth two characters. */
-  /* On a Virtual trigger this is not a debug affordance, it is the node's
+  /* On an MQTT button this is not a debug affordance, it is the node's
      entire purpose — being fired by hand is what the type is FOR — so it reads
      as the primary action of the card rather than a test button. */
   var virt = n.type === "source.virtual";
@@ -3948,19 +3968,44 @@ function openNodeEditor(n) {
       { maxlength: String(TOPIC_MAX), placeholder: "front_gate" });
     var topicPreview = el("div", "hint mono");
     var topicErr = el("div", "hint");
-    var tf = field(t("MQTT trigger topic (optional)"), ctl.topic, null, "full");
+    var tf = field(t("MQTT topic"), ctl.topic, null, "full");
 
+    /* THE SAME SHAPE AS THE SWITCH EDITOR, because it is now the same rule:
+       blank follows a slug of the node's NAME instead of meaning "no MQTT".
+       Leaving it blank used to make the node invisible to the broker with
+       nothing on screen saying so — a node that looked perfectly healthy and
+       could not be pressed from anywhere but this page. */
     function syncTopic() {
+      var typed = trimOf(ctl.topic);
+      var auto = topicSlug(trimOf(nameIn));
+      var topic = typed || auto;
+      clear(topicPreview);
+      ctl.topic.placeholder = auto || "front_gate";
       if (!ctl.mqttOn.input.checked) {
-        topicPreview.textContent =
+        add(topicPreview, el("div", null,
           t("Not exposed \u2014 nothing subscribes to this node and Home Assistant has no button " +
-            "for it. The topic is kept for when you switch it back on.");
+            "for it. The topic is kept for when you switch it back on.")));
         return;
       }
-      var topic = trimOf(ctl.topic);
-      topicPreview.textContent = topic
-        ? t("Full topic:  {topic}", { topic: mqttTriggerTopic(topic) })
-        : t("No topic — this node can only be fired from this page or the REST API.");
+      if (!topic) {
+        topicPreview.textContent =
+          t("Give this node a name (or a topic) and Home Assistant gets a button for it.");
+        return;
+      }
+      if (!typed)
+        add(topicPreview, el("div", "muted",
+          t("Following the node name. Type your own to pin it; clear it to follow again.")));
+      add(topicPreview, el("div", null,
+        t("Anything published here fires it:  {topic}", { topic: mqttTriggerTopic(topic) })));
+      /* What Home Assistant will actually CALL it. The switch had exactly this
+         defect — every box in the world showing one entity named "Klingelbox
+         Switch" — so a node still wearing its palette label is named after the
+         topic instead, and this is the only place that says so. */
+      var nm = trimOf(nameIn);
+      var generic = !nm || DEFAULT_TRIGGER_NAME.test(nm);
+      add(topicPreview, el("div", null,
+        t("Appears in Home Assistant as:  {name}", { name: generic ? prettyTopic(topic) : nm }) +
+        (generic ? t("   (from the topic — rename this node to change it)") : "")));
     }
     /* The topic and the checkbox must never look as though they disagree: with
        the node not exposed the field is disabled and dimmed, so it plainly does
@@ -3975,14 +4020,23 @@ function openNodeEditor(n) {
     ctl.mqttOn = exposeField(n, syncExposed);
     add(grid, ctl.mqttOn);
     ctl.topicCheck = bindTopicCheck(ctl.topic, topicErr, "topic", syncTopic);
+    if (nameIn) nameIn.addEventListener("input", syncTopic);
     add(tf, topicErr, topicPreview);
     add(grid, tf);
     syncExposed();
+    /* FOUR WAYS IN, SAID PLAINLY. The node was asked for as a missing feature
+       by someone who had it on the palette already, because nothing here said
+       "Home Assistant". So the list leads with Home Assistant and the ▶ is
+       described last — it is the one nobody has to be told about. */
     add(sh.body, el("div", "note",
-      t("Publishing ANY message to that topic fires this node — that is how a virtual input " +
-        "becomes reachable from Home Assistant, Node-RED or a shell one-liner, with no RF involved. " +
-        "Leave it empty and the node still works from the Trigger button below and from " +
-        "POST /api/graph/nodes/{id}/fire.", { id: n.id })));
+      t("Four things can press this button: a Home Assistant button entity (it appears there by " +
+        "itself, no YAML), any MQTT client publishing ANY message to the topic above, the ▶ " +
+        "above, and POST /api/graph/nodes/{id}/fire. The payload is never looked at — arriving " +
+        "IS the press.", { id: n.id })));
+    add(sh.body, el("div", "note",
+      t("Leave the topic empty and it follows the node's name, so a button called “Ring the " +
+        "chime” answers on ring_the_chime without you typing anything. Two nodes that end up " +
+        "on the same topic share one Home Assistant button, and pressing it fires both.")));
     if (S.has.config && !mqttEnabled()) {
       add(sh.body, el("div", "note warn",
         t("MQTT is currently disabled, so the topic is stored but nothing subscribes to it yet. " +
@@ -4958,7 +5012,7 @@ function renderCanvas() {
       add(g, grab);
     }
 
-    /* ▶ — do this node's own thing, now. On a Virtual trigger and a Signal
+    /* ▶ — do this node's own thing, now. On an MQTT button and a Signal
        receiver that is firing its output and nothing more; on a Signal sender
        it is transmitting the code OVER THE AIR, which is audible in someone's
        house. Same glyph, opposite directions, so every one of them names what
@@ -4967,7 +5021,7 @@ function renderCanvas() {
        and the user asked for a button, not a dialog.
 
        With a Monitor downstream this is also the whole verification loop for a
-       Virtual trigger: click ▶, watch 💡 light, see the mark land on the
+       MQTT button: click ▶, watch 💡 light, see the mark land on the
        timeline — no transmitter, no doorbell press, nothing audible. */
     if (play) {
       var off = play.why ? " off" : "";
@@ -7018,15 +7072,24 @@ var NODE_DOC = {
             "all — the palette is built from what the box answers, not from this manual."]
   },
   "source.virtual": {
-    what: "Fires on demand: from the ▶ button on its own card, from the REST API, or from an MQTT " +
-          "topic. This is how Home Assistant, a script or your own finger starts a chain.",
+    what: "A button Home Assistant can press. It appears in your dashboard by itself \u2014 no YAML, " +
+          "no automation \u2014 and pressing it starts whatever is wired after it. The same button is " +
+          "reachable from any MQTT client, from the \u25b6 here, and from the REST API.",
     settings: [
-      ["Topic", "A suffix. The box subscribes to <base>/trigger/<suffix>; any message on it fires " +
-                "the node, whatever the payload says. Leave it empty and the node still works from " +
-                "the ▶ button and the API — it simply gets no topic and no Home Assistant entity."],
+      ["Topic", "A suffix. The box subscribes to <base>/trigger/<suffix>; ANY message on it fires " +
+                "the node, whatever the payload says. Left empty it does NOT mean \u201cno MQTT\u201d \u2014 it " +
+                "follows a slug of the node's name, so a button called \u201cRing the chime\u201d answers on " +
+                "ring_the_chime either way."],
       ["Expose to MQTT", "On by default. Clear it and this node disappears from MQTT entirely \u2014 nothing subscribed, nothing published, and its Home Assistant entity removed rather than left behind unavailable. It keeps working inside the graph."]
     ],
-    notes: ["A virtual node with a topic appears in Home Assistant as a button entity."]
+    notes: ["Four things fire it: a Home Assistant button entity, any MQTT client publishing to its " +
+            "topic, the \u25b6 on its card or on the map, and POST /api/graph/nodes/{id}/fire. The payload " +
+            "is never inspected \u2014 arriving IS the press.",
+            "It is called source.virtual on the wire and in the API, which is what it was named " +
+            "before anybody noticed that nobody could find it under that name.",
+            "Two of these on the same topic share ONE Home Assistant button, and pressing it fires " +
+            "both chains \u2014 which is how you get a single \u201cring everything\u201d button with no special " +
+            "node type."]
   },
   "source.any_rf": {
     what: "A wildcard. It fires on every burst the receiver hears, registered or not — including " +
@@ -7181,6 +7244,11 @@ var HB_RECIPES = [
   ["Repeat a doorbell to a second chime",
    "Signal receiver (Front door) → Signal sender (Virtual chime 1). Two nodes, one each way: " +
    "the receiver fires when the doorbell is heard, the sender puts the chime's code on air."],
+  ["Press a button in Home Assistant, ring the chime",
+   "MQTT button (name it “Ring the chime”) → Signal sender (chime). That is the whole recipe: " +
+   "the button appears in Home Assistant by itself, with no YAML and no automation, and " +
+   "pressing it puts the code on air. The topic follows the node's name unless you type one, " +
+   "so nothing else has to be filled in."],
   ["Several buttons, one chime",
    "Signal receiver (Front) + Signal receiver (Back) → Group (mode: ANY) → Signal sender " +
    "(Virtual chime 1). ANY is a merge point — it passes on whatever reaches it — so this is " +
@@ -7194,9 +7262,6 @@ var HB_RECIPES = [
    "Press again mid-run and the count starts over."],
   ["Stop a stuck button ringing forever",
    "Signal receiver (Front door) → Rate limit (10 s cooldown) → Signal sender (chime)."],
-  ["Ring the chime from Home Assistant",
-   "Virtual trigger (topic: front_gate) → Signal sender (chime). Publish anything to the " +
-   "trigger topic and the code goes out."],
   ["Relay a code you hear as a different code",
    "Signal receiver (neighbour's remote) → Signal sender (your chime). Two nodes, so the map " +
    "reads left to right and you can put a Rate limit or a Switch between them. The same code " +
@@ -7217,7 +7282,7 @@ var HB_RECIPES = [
    "Any RF signal → MQTT publish. Every press within range reaches HA, including buttons you " +
    "never registered. Add a Rate limit in the middle if the band is busy."],
   ["Test any chain without ringing anything",
-   "Virtual trigger (▶) → Monitor (💡). Tap ▶ on the trigger — on its card or straight on the " +
+   "MQTT button (▶) → Monitor (💡). Tap ▶ on the button — on its card or straight on the " +
    "map — and watch the monitor's lamp light and a mark land on its timeline. No transmitter, " +
    "no doorbell press, nothing audible."],
   ["Check a chain fires without hearing the chime",
@@ -7317,7 +7382,7 @@ function buildHandbook() {
   add(s1.bodyEl, hbKV([
     ["✕", t("Deletes the node, after a confirmation.")],
     ["▶", t("Does that node's own thing, now. What that MEANS differs by type and they are " +
-          "opposite directions, so each ▶ says which in its tooltip: a Virtual trigger fires, " +
+          "opposite directions, so each ▶ says which in its tooltip: an MQTT button fires, " +
           "a Signal receiver pretends its code was just heard, and a Signal sender actually " +
           "TRANSMITS its code over the air.")],
     ["💡", t("A Monitor's lamp. It lights whenever the chain reaches it.")],
@@ -7572,8 +7637,8 @@ function buildHandbook() {
   add(b5, hbH(t("What the box listens to")));
   add(b5, hbKV([
     [base + "/button/<name>/press", t("Any message transmits that stored signal.")],
-    [base + "/trigger/<topic>", t("Any message fires the Virtual trigger node carrying that topic. " +
-     "The payload is ignored entirely.")],
+    [base + "/trigger/<topic>", t("Any message fires every MQTT button node on that topic. " +
+     "The payload is ignored entirely \u2014 arriving IS the press.")],
     [base + "/switch/<topic>/set", t("Moves every Switch node on that topic. Accepts ON, OFF, 1, 0, " +
      "true, false, open, close in any case, or a JSON object.")]
   ]));
@@ -7596,8 +7661,8 @@ function buildHandbook() {
   add(b5, hbKV([
     [t("Per stored signal"), t("TWO things: a device trigger that fires on each press (for receiving) " +
      "and a button entity that replays it (for transmitting).")],
-    [t("Per Virtual trigger with a topic"), t("A button entity, so you can fire the chain from a " +
-     "dashboard.")],
+    [t("Per MQTT button topic"), t("A button entity, so a press in a Home Assistant dashboard " +
+     "starts the chain \u2014 one per topic, not one per node.")],
     [t("Per Switch topic"), t("A real switch entity — one per topic, not one per node, named after the " +
      "first node on it.")],
     [t("Unregistered presses"), t("A device trigger that fires on any burst matching no stored signal.")],
@@ -7615,12 +7680,12 @@ function buildHandbook() {
 
   add(b5, hbH(t("Keeping one node off MQTT")));
   add(b5, hbP(
-    t("Every Virtual trigger, Switch and MQTT publish node has an “Expose to Home Assistant / " +
+    t("Every MQTT button, Switch and MQTT publish node has an \u201cExpose to Home Assistant / " +
     "MQTT” checkbox in its editor, ticked by default. Clear it and that one node becomes " +
     "invisible to the broker: nothing is subscribed for it, nothing is published for it, and " +
     "it gets no Home Assistant entity.")));
   add(b5, hbKV([
-    [t("Virtual trigger"), t("Loses its {topic} subscription and its HA button.",
+    [t("MQTT button"), t("Loses its {topic} subscription and its HA button.",
      { topic: base + "/trigger/<topic>" })],
     ["Switch", t("Loses its {topic} subscription, its HA toggle and its " +
      "retained position. An MQTT command no longer moves it.", { topic: base + "/switch/<topic>/set" })],
@@ -7633,15 +7698,15 @@ function buildHandbook() {
     "exposed node carries that topic any more. Home Assistant removes the entity instead of " +
     "showing it unavailable for ever — exactly what deleting the node would have done.")));
   add(b5, hbP(
-    t("Nothing inside the graph changes. A Switch still gates its wire, a Virtual trigger still " +
+    t("Nothing inside the graph changes. A Switch still gates its wire, an MQTT button still " +
     "fires from its ▶ button and from the API, and an MQTT publish node is still reached by the " +
     "chain. The checkbox answers one question only: can anything outside the box see it.")));
   add(b5, hbNote(
-    t("It exists because a blank topic on a Switch stopped meaning “no MQTT” — it follows the " +
-    "node's name instead, so a Switch called “Outside bell” answers on outside_bell whether you " +
-    "asked for a topic or not. A magic topic value was considered and rejected: “-” is a " +
-    "perfectly legal MQTT topic level, so any sentinel would collide with a topic somebody could " +
-    "legitimately want.")));
+    t("It exists because a blank topic stopped meaning “no MQTT” on a Switch and on an MQTT " +
+    "button alike — both follow the node's name instead, so one called “Outside bell” answers on " +
+    "outside_bell whether you asked for a topic or not. A magic topic value was considered and " +
+    "rejected: “-” is a perfectly legal MQTT topic level, so any sentinel would collide with a " +
+    "topic somebody could legitimately want.")));
 
   add(b5, hbH(t("What makes a topic valid")));
   add(b5, hbP(

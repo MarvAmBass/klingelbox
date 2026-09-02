@@ -6,8 +6,9 @@
  *   <base>/status                      "online"/"offline", RETAINED, and the LWT
  *   <base>/button/<slug>/state         one recognized press, JSON, NOT retained
  *   <base>/button/<slug>/press         SUBSCRIBED: any message transmits <slug>
- *   <base>/trigger/<suffix>            SUBSCRIBED: fires the SOURCE_VIRTUAL node
- *                                      whose topic suffix this is
+ *   <base>/trigger/<suffix>            SUBSCRIBED: any message fires the
+ *                                      SOURCE_VIRTUAL node(s) carrying this
+ *                                      suffix — the MQTT button
  *   <base>/switch/<suffix>/set         SUBSCRIBED: ON/OFF/1/0/true/false (or
  *                                      {"state":"ON"}) moves the LOGIC_SWITCH
  *                                      node(s) carrying this suffix
@@ -37,13 +38,20 @@
  * thing here a user can be actively wrong about ("I turned the inside bell off"),
  * and a stale toggle in a dashboard is exactly that kind of wrong.
  *
- * ONE SWITCH ENTITY PER TOPIC, NOT PER NODE. Several logic.switch nodes may carry
- * the same topic suffix on purpose — that is how one Home Assistant toggle gates
- * the outside bell's chain and the garden light's chain together. Announcing an
- * entity per NODE would put two toggles in the dashboard that always move as one
- * and command each other, which reads as a bug. So the topic is the unit of
- * identity here: the state published is ON if ANY node on that topic conducts,
- * and a set command moves every one of them.
+ * ONE ENTITY PER TOPIC, NOT PER NODE — for switches AND for virtual triggers.
+ * Several logic.switch nodes may carry the same topic suffix on purpose: that is
+ * how one Home Assistant toggle gates the outside bell's chain and the garden
+ * light's chain together. Announcing an entity per NODE would put two toggles in
+ * the dashboard that always move as one and command each other, which reads as a
+ * bug. So the topic is the unit of identity here: the state published is ON if
+ * ANY node on that topic conducts, and a set command moves every one of them.
+ *
+ * The same holds for source.virtual, where it is if anything more useful: two
+ * MQTT-button nodes sharing a topic are one Home Assistant button that starts
+ * both chains, so "ring everything" needs no node type of its own. And on BOTH
+ * types the suffix is RESOLVED, never read raw — explicit topic, else a slug of
+ * the node's name (db_graph_node_suffix). A blank topic has stopped meaning
+ * "invisible to MQTT" on either of them; mqtt_enabled is how you say that.
  *
  * WHY DEVICE TRIGGERS. HA's MQTT integration offers two plausible shapes for a
  * button: a binary_sensor that goes on and must be reset, or a device trigger.
@@ -176,10 +184,27 @@ static uint16_t s_ann_id[DB_SIGNAL_MAX];
 static char     s_ann_slug[DB_SIGNAL_MAX][DB_MQTT_SLUG_MAX];
 static int      s_ann_count;
 
-/* Live <base>/trigger/<suffix> subscriptions, one per enabled SOURCE_VIRTUAL
- * node with a topic. Routing is by suffix; node_id is what actually fires. */
+/*
+ * Live <base>/trigger/<suffix> subscriptions — one per DISTINCT suffix across
+ * the enabled SOURCE_VIRTUAL nodes, never one per node. Exactly the shape of
+ * the switch table below, and for the same reason: the topic is the unit of
+ * identity, so two virtual nodes sharing a suffix are one Home Assistant button
+ * that starts both their chains.
+ *
+ * THE SUFFIX IS RESOLVED, NOT READ. db_graph_node_suffix() — explicit topic
+ * else a slug of the node's name. This table used to be built from the raw
+ * `topic` field with a `continue` on the empty case, so a virtual trigger
+ * created without typing a topic subscribed to nothing, announced nothing and
+ * looked perfectly healthy on the canvas. That was the switch's old bug wearing
+ * a different hat.
+ *
+ * `node_id` is only the first node found on the suffix, used to key the Home
+ * Assistant entity; `count` is how many share it. Neither routes: a message is
+ * dispatched to every matching node by db_graph_fire_topic().
+ */
 typedef struct {
     uint16_t node_id;
+    uint8_t  count;
     char     suffix[DB_NODE_TOPIC_MAX];
 } db_mqtt_sub_t;
 static db_mqtt_sub_t s_subs[DB_NODE_MAX];
@@ -503,26 +528,89 @@ static void announce_tx_button(const db_signal_meta_t *m, const char *slug)
     pub_json(dt, d, 1, 1);
 }
 
-/* A `button` entity for an MQTT-triggerable SOURCE_VIRTUAL node, so a virtual
- * input is pressable straight from the HA dashboard and not only from an
- * automation that publishes to the raw topic. */
-static void announce_virtual_button(const db_node_t *n)
+/*
+ * True when a node still carries the name the palette gave it — the UI's label
+ * in either shipped language, or the wire name.
+ *
+ * WHY IT MATTERS. A name is what Home Assistant calls the entity, and a node
+ * nobody renamed lands as "Klingelbox Switch" or "Klingelbox MQTT button" on
+ * every box ever built, with the topic the user actually chose — the one thing
+ * that identifies it — nowhere in sight. A still-default name is therefore
+ * treated as no name at all and the topic wins.
+ *
+ * DELIBERATELY NARROW: anything the user typed themselves, including "switch
+ * upstairs", is a real name and must be respected. The German labels are listed
+ * because the palette is translated and createNode() stores the LABEL — a
+ * German user's new node arrives named "Virtueller Auslöser", which is just as
+ * default as "MQTT button" and just as useless as an entity name.
+ *
+ * "Virtual trigger" / "Virtueller Auslöser" are the pre-0.5 labels for what is
+ * now the MQTT button, kept here because nodes created under them are on flash
+ * in people's boxes.
+ */
+static bool name_is_default(const char *name)
 {
+    static const char *const DEFAULTS[] = {
+        "Switch", "logic.switch",
+        "MQTT button", "MQTT-Taster",
+        "Virtual trigger", "Virtueller Auslöser", "source.virtual",
+    };
+    if (!name) return false;
+    for (size_t i = 0; i < sizeof(DEFAULTS) / sizeof(DEFAULTS[0]); i++)
+        if (strcasecmp(name, DEFAULTS[i]) == 0)
+            return true;
+    return false;
+}
+
+/*
+ * A `button` entity for an MQTT-triggerable SOURCE_VIRTUAL topic, so the node is
+ * pressable straight from the HA dashboard and not only from an automation that
+ * publishes to the raw topic.
+ *
+ * KEYED ON THE NODE, NAMED AFTER THE TOPIC. unique_id and object_id stay on the
+ * owning node's id, because that is what boxes already in the field have
+ * published: re-keying them on the suffix would leave every existing
+ * button/node<id>/config retained on the broker with nobody left to clear it,
+ * i.e. a permanent ghost entity per upgrade. The NAME follows the switch's rule
+ * instead — the node's own name, or the topic when the node still wears its
+ * palette label.
+ */
+static void announce_virtual_button(const db_mqtt_sub_t *sub)
+{
+    const db_node_t *n = db_graph_node(sub->node_id);
+    if (!n) return;
+
     cJSON *d = cJSON_CreateObject();
     if (!d) return;
-    cJSON_AddStringToObject(d, "name", n->name[0] ? n->name : "Virtual input");
+
+    /* Same precision dance as announce_switch(): `base` may be a 48-byte topic
+     * suffix rather than a 32-byte node name, and without the explicit width
+     * gcc cannot prove the " (N nodes)" tail fits. */
+    char name[DB_NODE_NAME_MAX + 24];
+    char pretty[DB_NODE_TOPIC_MAX];
+    db_mqtt_pretty_name(sub->suffix, pretty, sizeof(pretty));
+    const char *base = (n->name[0] && !name_is_default(n->name))
+                           ? n->name : pretty;
+    if (sub->count > 1)
+        snprintf(name, sizeof(name), "%.40s (%u nodes)", base, (unsigned)sub->count);
+    else
+        snprintf(name, sizeof(name), "%.50s", base);
+    cJSON_AddStringToObject(d, "name", name);
 
     char buf[80];
     snprintf(buf, sizeof(buf), "%s_node%u", s_dev_uid, n->id);
     cJSON_AddStringToObject(d, "unique_id", buf);
     char nslug[DB_MQTT_SLUG_MAX];
-    db_mqtt_slugify(n->name[0] ? n->name : n->topic, nslug, sizeof(nslug));
+    db_mqtt_slugify(sub->suffix, nslug, sizeof(nslug));
     if (!nslug[0]) snprintf(nslug, sizeof(nslug), "node_%u", n->id);
     snprintf(buf, sizeof(buf), "%s_%s", s_dev_slug, nslug);
     cJSON_AddStringToObject(d, "object_id", buf);
 
+    /* The RESOLVED suffix, never n->topic: a node relying on the name fallback
+     * would otherwise be announced on <base>/trigger/ — a topic nothing is
+     * subscribed to, which is an HA button that does nothing when pressed. */
     char t[DB_MQTT_TOPIC_MAX];
-    snprintf(t, sizeof(t), "%s/trigger/%s", s_base, n->topic);
+    snprintf(t, sizeof(t), "%s/trigger/%s", s_base, sub->suffix);
     cJSON_AddStringToObject(d, "command_topic", t);
     cJSON_AddStringToObject(d, "payload_press", "PRESS");
     cJSON_AddStringToObject(d, "icon", "mdi:gesture-tap-button");
@@ -536,13 +624,9 @@ static void announce_virtual_button(const db_node_t *n)
     pub_json(dt, d, 1, 1);
 }
 
-/* True when a node still carries the name it was created with, in either the
- * UI's form ("Switch") or the wire form ("logic.switch"). Deliberately narrow:
- * anything the user typed themselves, including "switch upstairs", is a real
- * name and must be respected. */
 /*
- * The topic a switch answers on is resolved by db_graph_switch_suffix()
- * (node_graph.h), NOT by a copy of the rule kept here.
+ * The topic a switch OR a virtual trigger answers on is resolved by
+ * db_graph_node_suffix() (node_graph.h), NOT by a copy of the rule kept here.
  *
  * There used to be a copy here, and node_graph.c matched arriving commands
  * against the raw `topic` field instead. The two disagreed for exactly the
@@ -550,17 +634,14 @@ static void announce_virtual_button(const db_node_t *n)
  * to Home Assistant, and then no command ever reached them and no retained state
  * was ever published. The rule now has one home, on the other side of the
  * boundary from this file, so the side that ROUTES a command and the side that
- * SUBSCRIBES for it cannot drift apart again.
+ * SUBSCRIBES for it cannot drift apart again — and since the virtual trigger
+ * now resolves through the same function, the two node types cannot drift apart
+ * from each other either.
  *
  * Consequence worth knowing, unchanged: two switch nodes sharing a NAME share
- * one toggle, exactly as two sharing an explicit topic always have.
+ * one toggle, exactly as two sharing an explicit topic always have. Two virtual
+ * nodes sharing a name likewise share one HA button, which fires both.
  */
-
-static bool name_is_generic(const char *name)
-{
-    return name && (strcasecmp(name, "Switch") == 0 ||
-                    strcasecmp(name, "logic.switch") == 0);
-}
 
 /*
  * The object_id / unique_id fragment for a switch topic. Derived from the topic
@@ -604,9 +685,15 @@ static void announce_switch(const db_mqtt_switch_t *sw)
      * user actually chose -- the one thing that identifies this toggle -- never
      * appears. So a still-default name is treated as no name at all and the
      * topic wins. A node the user HAS named keeps that name, because a human
-     * label beats a slug. */
-    const char *base = (n && n->name[0] && !name_is_generic(n->name))
-                           ? n->name : sw->suffix;
+     * label beats a slug. See name_is_default().
+     *
+     * The topic is PRETTIFIED for the label ("outside_bell" -> "Outside bell"),
+     * which is the name the node editor has always promised the user; the raw
+     * slug went out instead, so the editor and the dashboard disagreed. */
+    char pretty[DB_NODE_TOPIC_MAX];
+    db_mqtt_pretty_name(sw->suffix, pretty, sizeof(pretty));
+    const char *base = (n && n->name[0] && !name_is_default(n->name))
+                           ? n->name : pretty;
     /* The explicit precision is not decoration: `base` may be a topic suffix
      * (48 bytes) rather than a node name (32), and without it gcc cannot prove
      * the " (N paths)" tail fits and -Werror=format-truncation trips — the same
@@ -1048,9 +1135,20 @@ static bool node_mqtt_exposed(const db_node_t *n)
     return n && n->mqtt_enabled;
 }
 
-/* Reconcile the <base>/trigger/<suffix> subscriptions against the graph. The
+/*
+ * Reconcile the <base>/trigger/<suffix> subscriptions against the graph. The
  * broker forgets subscriptions across a disconnect, so `resub` makes the pass
- * treat the table as empty and re-subscribe everything. */
+ * treat the table as empty and re-subscribe everything.
+ *
+ * IT COLLAPSES BY TOPIC, exactly as sync_switch_subs() does, and BOTH PASSES
+ * RESOLVE THE SUFFIX THE SAME WAY — through db_graph_node_suffix(). The drop
+ * pass used to compare against the raw `topic` field and the add pass skipped
+ * every node whose topic was blank, which is how a virtual trigger created
+ * without a topic typed became invisible to MQTT: nothing subscribed, no HA
+ * button, and a node that looked fine on the canvas. Blank now means a slug of
+ * the node's NAME, and mqtt_enabled is the way to say "keep this one off the
+ * broker" — the same two rules the switch already had.
+ */
 static void sync_trigger_subs(bool resub)
 {
     char t[DB_MQTT_TOPIC_MAX];
@@ -1060,17 +1158,19 @@ static void sync_trigger_subs(bool resub)
     if (resub)
         s_sub_count = 0;   /* the broker dropped them; nothing to unsubscribe */
 
-    /* Drop subscriptions whose node is gone, disabled, or no longer virtual. */
+    /* Drop subscriptions whose suffix no longer belongs to any live virtual
+     * node — deleted, disabled, renamed, retyped, or taken off MQTT. */
     for (int i = 0; i < s_sub_count;) {
-        uint16_t owner = 0;
-        for (int j = 0; j < n && nodes; j++) {
+        bool still = false;
+        for (int j = 0; j < n && nodes && !still; j++) {
             if (nodes[j].type != DB_NODE_SOURCE_VIRTUAL || !nodes[j].enabled) continue;
             if (!node_mqtt_exposed(&nodes[j])) continue;
-            if (!nodes[j].topic[0]) continue;
-            if (strcmp(nodes[j].topic, s_subs[i].suffix) == 0) { owner = nodes[j].id; break; }
+            char sfx[DB_NODE_TOPIC_MAX];
+            db_graph_node_suffix(&nodes[j], sfx, sizeof(sfx));
+            if (!sfx[0]) continue;
+            still = (strcmp(sfx, s_subs[i].suffix) == 0);
         }
-        if (owner) {
-            s_subs[i].node_id = owner;   /* the suffix may have moved nodes */
+        if (still) {
             i++;
         } else {
             snprintf(t, sizeof(t), "%s/trigger/%s", s_base, s_subs[i].suffix);
@@ -1080,24 +1180,38 @@ static void sync_trigger_subs(bool resub)
         }
     }
 
-    /* Subscribe to anything new. */
-    for (int j = 0; j < n && nodes && s_sub_count < DB_NODE_MAX; j++) {
+    /* Rebuild the naming/count metadata and subscribe to anything new. */
+    for (int i = 0; i < s_sub_count; i++) { s_subs[i].node_id = 0; s_subs[i].count = 0; }
+
+    for (int j = 0; j < n && nodes; j++) {
         if (nodes[j].type != DB_NODE_SOURCE_VIRTUAL || !nodes[j].enabled) continue;
         /* Not exposed: no subscription, and announce() clears whatever button
          * entity this node had already been given. It still fires from the UI
          * and from POST /api/graph/nodes/<id>/fire. */
         if (!node_mqtt_exposed(&nodes[j])) continue;
-        if (!nodes[j].topic[0]) continue;   /* UI/REST only, by the user's choice */
-        bool have = false;
+
+        char sfx[DB_NODE_TOPIC_MAX];
+        db_graph_node_suffix(&nodes[j], sfx, sizeof(sfx));
+        /* Only when BOTH the topic and the name are empty (or slugify to
+         * nothing, say "!!!") is there no addressable topic at all. */
+        if (!sfx[0]) continue;
+
+        int slot = -1;
         for (int i = 0; i < s_sub_count; i++)
-            if (strcmp(s_subs[i].suffix, nodes[j].topic) == 0) { have = true; break; }
-        if (have) continue;
-        strlcpy(s_subs[s_sub_count].suffix, nodes[j].topic, DB_NODE_TOPIC_MAX);
-        s_subs[s_sub_count].node_id = nodes[j].id;
-        s_sub_count++;
-        snprintf(t, sizeof(t), "%s/trigger/%s", s_base, nodes[j].topic);
-        esp_mqtt_client_subscribe(s_client, t, 0);
-        ESP_LOGI(TAG, "subscribed %s -> node %u", t, nodes[j].id);
+            if (strcmp(s_subs[i].suffix, sfx) == 0) { slot = i; break; }
+
+        if (slot < 0) {
+            if (s_sub_count >= DB_NODE_MAX) continue;
+            slot = s_sub_count++;
+            strlcpy(s_subs[slot].suffix, sfx, DB_NODE_TOPIC_MAX);
+            s_subs[slot].node_id = 0;
+            s_subs[slot].count   = 0;
+            snprintf(t, sizeof(t), "%s/trigger/%s", s_base, sfx);
+            esp_mqtt_client_subscribe(s_client, t, 0);
+            ESP_LOGI(TAG, "subscribed %s -> node %u", t, nodes[j].id);
+        }
+        if (!s_subs[slot].node_id) s_subs[slot].node_id = nodes[j].id;
+        if (s_subs[slot].count < 255) s_subs[slot].count++;
     }
 }
 
@@ -1118,7 +1232,8 @@ static void sync_trigger_subs(bool resub)
  * own UI and REST API; it simply stops being a Home Assistant entity, and the
  * one it used to be is cleared rather than left dangling.
  *
- * BOTH PASSES BELOW RESOLVE THE SUFFIX THE SAME WAY, through switch_suffix().
+ * BOTH PASSES BELOW RESOLVE THE SUFFIX THE SAME WAY, through
+ * db_graph_node_suffix() — the same resolver sync_trigger_subs() uses.
  * They used to disagree — the drop pass compared against the raw `topic` field
  * while the add pass fell back to the node's name — so every switch relying on
  * that fallback was unsubscribed and immediately re-subscribed on each announce.
@@ -1145,7 +1260,7 @@ static void sync_switch_subs(bool resub)
             if (nodes[j].type != DB_NODE_LOGIC_SWITCH) continue;
             if (!node_mqtt_exposed(&nodes[j])) continue;
             char sfx[DB_NODE_TOPIC_MAX];
-            db_graph_switch_suffix(&nodes[j], sfx, sizeof(sfx));
+            db_graph_node_suffix(&nodes[j], sfx, sizeof(sfx));
             if (!sfx[0]) continue;
             still = (strcmp(sfx, s_sw[i].suffix) == 0);
         }
@@ -1167,7 +1282,7 @@ static void sync_switch_subs(bool resub)
         if (!node_mqtt_exposed(&nodes[j])) continue;
 
         char sfx[DB_NODE_TOPIC_MAX];
-        db_graph_switch_suffix(&nodes[j], sfx, sizeof(sfx));
+        db_graph_node_suffix(&nodes[j], sfx, sizeof(sfx));
         /* Only when BOTH the topic and the name are empty (or slugify to
          * nothing) is there no addressable topic at all. */
         if (!sfx[0]) continue;
@@ -1280,10 +1395,9 @@ static void announce(void)
     s_ann_virt_count = 0;
     if (ha) {
         for (int j = 0; j < s_sub_count; j++) {
-            const db_node_t *n = db_graph_node(s_subs[j].node_id);
-            if (!n) continue;
-            announce_virtual_button(n);
-            s_ann_virt[s_ann_virt_count++] = n->id;
+            if (!db_graph_node(s_subs[j].node_id)) continue;
+            announce_virtual_button(&s_subs[j]);
+            s_ann_virt[s_ann_virt_count++] = s_subs[j].node_id;
         }
     }
 
@@ -1353,20 +1467,28 @@ static void handle_transmit(const char *slug, const char *payload)
                   err == ESP_OK ? "transmitted via MQTT" : db_err_text(err));
 }
 
+/*
+ * <base>/trigger/<suffix> arrived, with any payload at all — a press is a press.
+ *
+ * ROUTED BY THE GRAPH, not by this file's subscription table. db_graph_fire_topic()
+ * re-resolves the suffix per node, which is what lets several virtual nodes
+ * share one topic and all fire; the table here only knows the first of them,
+ * because its job is naming the entity, not dispatch. Same division of labour
+ * as handle_switch_set() and db_graph_switch_set_topic().
+ */
 static void handle_fire(const char *suffix)
 {
-    uint16_t node_id = 0;
-    for (int i = 0; i < s_sub_count; i++)
-        if (strcmp(s_subs[i].suffix, suffix) == 0) { node_id = s_subs[i].node_id; break; }
-    if (!node_id) {
+    /* Starts one graph traversal per matching node, which may end in a transmit
+     * — again, work that has no business running on the MQTT event task. */
+    int fired = db_graph_fire_topic(suffix);
+    if (!fired) {
         ESP_LOGW(TAG, "trigger for unknown topic '%s'", suffix);
         return;
     }
-    /* Starts a graph traversal, which may end in a transmit — again, work that
-     * has no business running on the MQTT event task. */
-    esp_err_t err = db_graph_fire_node(node_id);
-    ESP_LOGI(TAG, "MQTT trigger '%s' -> node %u: %s", suffix, node_id,
-             esp_err_to_name(err));
+    /* No event of its own: the traversal this starts logs a NODE_FIRED line per
+     * node it reaches, so a second "MQTT triggered it" line would double every
+     * press in the Activity feed. */
+    ESP_LOGI(TAG, "MQTT trigger '%s' -> %d node(s)", suffix, fired);
 }
 
 /*

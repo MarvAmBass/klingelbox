@@ -648,10 +648,10 @@ No new field was added for this: `signal_id` exists on every node and was unused
 on this type. Stored graphs are unaffected and no blob version changed.
 
 **`topic` serves three node types.** On `sink.mqtt` it is published to as
-`<base>/<topic>`. On `source.virtual` it is SUBSCRIBED to as
-`<base>/trigger/<topic>` — any message there fires the node, which is how a
-virtual input becomes reachable from Home Assistant or a shell one-liner with no
-RF involved. On `logic.switch` it names a pair of topics:
+`<base>/<topic>`. On `source.virtual` — the **MQTT button** — it is SUBSCRIBED
+to as `<base>/trigger/<topic>`; any message there fires the node, which is how a
+button in Home Assistant, a Node-RED flow or a shell one-liner rings the chime
+with no RF involved. On `logic.switch` it names a pair of topics:
 
 | topic | direction | payload |
 |---|---|---|
@@ -663,13 +663,20 @@ a reboot, so Home Assistant never shows a position the box is not in. With
 discovery enabled the topic also becomes a native HA **`switch`** entity on the
 shared Klingelbox device — a real toggle, not a template or a button pair.
 
-**The topic a switch answers on** is its `topic` if it has one, otherwise a slug
+**The topic a node answers on** is its `topic` if it has one, otherwise a slug
 of its `name` (`All Bells Switch` → `all_bells_switch`), otherwise nothing. One
 resolver decides this for the subscription, the Home Assistant entity, the
 routing of an arriving `set` and the reported state alike — they are the same
 question, and when the routing side asked it differently a switch relying on the
 name fallback got an entity that could not be commanded and never published a
 state.
+
+**The same resolver serves `source.virtual`.** It used to read the raw `topic`
+field and skip the node when it was blank, so an MQTT button created without a
+topic typed subscribed to nothing and got no Home Assistant entity, while looking
+perfectly healthy in `GET /api/graph`. A blank `topic` on either type now means
+"follow the name"; `mqtt_enabled: false` is the way to say "keep this node off
+the broker".
 
 **Several `logic.switch` nodes may share one `topic`**, and that is a feature:
 one Home Assistant toggle then gates several paths at once. Two nodes sharing a
@@ -681,10 +688,17 @@ still rang). Discovery announces one entity **per distinct topic**, not per node
 bug — named after the first node on the topic, with `(N paths)` appended when
 several share it.
 
-Empty on a `source.virtual` means UI/REST only: the node still works, nothing
-subscribes to it and no HA entity appears. Empty on a `logic.switch` does **not**
-mean that — it falls back to a slug of the node's `name`, so a blank topic still
-produces a topic and an entity. Use `mqtt_enabled` to keep a switch off MQTT.
+**Several `source.virtual` nodes may share one `topic` too**, and one message on
+`<base>/trigger/<topic>` fires **every** one of them — a single "ring
+everything" button with no special node type, and no dependence on the order the
+graph happens to be stored in. Discovery announces one `button` entity per
+distinct topic, keyed on the first node carrying it, with `(N nodes)` appended
+when several share it.
+
+Empty `topic` on `source.virtual` and on `logic.switch` alike falls back to a
+slug of the node's `name`, so a blank topic still produces a topic and an entity.
+Only `sink.mqtt` still needs one typed. Use `mqtt_enabled` to keep a node off
+MQTT.
 
 #### `mqtt_enabled` — is this node visible outside the box?
 
@@ -696,7 +710,7 @@ With it `false` the MQTT bridge behaves as though the node were not in the graph
 
 | node type | what stops |
 |---|---|
-| `source.virtual` | no `<base>/trigger/<topic>` subscription, no HA button entity |
+| `source.virtual` | no `<base>/trigger/<topic>` subscription, no HA button entity, and a message on a topic it shares with an exposed node no longer fires it |
 | `logic.switch` | no `<base>/switch/<topic>/set` subscription, no HA switch entity, no retained state, and a `set` command no longer moves it even when another node shares the topic |
 | `sink.mqtt` | publishes nothing — not on `<base>/<topic>`, and not into the `<base>/event` stream either |
 
@@ -712,7 +726,7 @@ gates its wire, a `source.virtual` still fires from
 traversal. The flag answers one question only: can the outside world see it.
 
 It exists because a blank `topic` stopped being a way to say "no MQTT" once
-`logic.switch` gained the name fallback. A sentinel topic value was considered
+`logic.switch` — and then `source.virtual` — gained the name fallback. A sentinel topic value was considered
 and rejected — `-` is a perfectly legal MQTT topic level, so any magic string
 collides with something a user could legitimately want.
 

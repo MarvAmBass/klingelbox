@@ -111,8 +111,8 @@ void db_mqtt_slugify(const char *name, char *out, size_t outsz)
     out[o] = '\0';
 }
 
-void db_mqtt_switch_suffix(const char *topic, const char *name,
-                           char *out, size_t outsz)
+void db_mqtt_node_suffix(const char *topic, const char *name,
+                         char *out, size_t outsz)
 {
     if (!out || outsz == 0)
         return;
@@ -126,4 +126,31 @@ void db_mqtt_switch_suffix(const char *topic, const char *name,
         return;
     }
     db_mqtt_slugify(name, out, outsz);
+}
+
+/* See mqtt_topic.h. Deliberately byte-for-byte the same rule as prettyTopic()
+ * in app.js, which is what the node editor shows the user before they save. */
+void db_mqtt_pretty_name(const char *suffix, char *out, size_t outsz)
+{
+    if (!out || outsz == 0)
+        return;
+    out[0] = '\0';
+    if (!suffix)
+        return;
+
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)suffix; *p && o + 1 < outsz; p++) {
+        if (*p == '_' || *p == '-' || *p == '/') {
+            /* No leading space, and a run of separators is one space. */
+            if (o && out[o - 1] != ' ')
+                out[o++] = ' ';
+        } else {
+            out[o++] = (char)*p;
+        }
+    }
+    while (o && out[o - 1] == ' ') o--;
+    out[o] = '\0';
+
+    if (out[0])
+        out[0] = (char)toupper((unsigned char)out[0]);
 }

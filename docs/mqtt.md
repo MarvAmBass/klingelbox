@@ -68,7 +68,7 @@ re-sending the password.
 | `<base>/status` | publish | **yes** | `online` / `offline`. Also the Last-Will. |
 | `<base>/button/<slug>/state` | publish | no | One recognised press. [Trigger JSON](#the-trigger-payload). |
 | `<base>/button/<slug>/press` | **subscribe** | — | Any message transmits that signal. |
-| `<base>/trigger/<suffix>` | **subscribe** | — | Any message fires the `source.virtual` node with that topic suffix. |
+| `<base>/trigger/<suffix>` | **subscribe** | — | Any message fires **every** MQTT button (`source.virtual`) answering on that suffix. The payload is never inspected. |
 | `<base>/unknown/state` | publish | no | An **unregistered** burst. Trigger JSON. |
 | `<base>/unknown` | publish | **yes** | The last unregistered burst, so you can look it up later. |
 | `<base>/event` | publish | no | Every node firing, plus system events. |
@@ -166,7 +166,7 @@ and one availability state.
 |---|---|---|
 | *(per signal)* "Front door pressed" | **device trigger** | Receiving. Fires on each press. |
 | *(per signal)* "Front door" | `button` | Transmitting. Pressing it replays the signal. |
-| *(per virtual node with a topic)* | `button` | Firing a `source.virtual` from the dashboard. |
+| *(per MQTT button topic)* | `button` | Pressing an MQTT button (`source.virtual`) from the dashboard. One per topic, not one per node. |
 | "Unregistered remote pressed" | **device trigger** | Any burst matching no stored signal. |
 | "Last unknown code" | `sensor` (diagnostic) | The fingerprint of the last unknown burst, with decode and RSSI as attributes. |
 | "Radio RSSI" | `sensor` (diagnostic) | Live noise floor, dBm. |
@@ -197,13 +197,13 @@ permanently unavailable entity behind that only a manual purge removes.
 ### Keeping one node off MQTT
 
 Every node has an **Expose to Home Assistant / MQTT** checkbox in its editor, on by
-default. It is on the three node types the bridge actually looks at — **Virtual trigger**,
+default. It is on the three node types the bridge actually looks at — **MQTT button**,
 **Switch** and **MQTT publish** — and unchecking it makes that one node invisible to the
 broker while leaving it completely unchanged inside the graph.
 
 | | with the box ticked | with it cleared |
 |---|---|---|
-| Virtual trigger | subscribed on `<base>/trigger/<topic>`, HA button entity | neither |
+| MQTT button | subscribed on `<base>/trigger/<topic>`, HA button entity | neither |
 | Switch | subscribed on `<base>/switch/<topic>/set`, HA switch entity, retained state | none of them, and a `set` command no longer moves it |
 | MQTT publish | publishes on `<base>/<topic>` and into `<base>/event` | publishes nothing at all |
 
@@ -213,31 +213,41 @@ when no exposed node carries that topic any more. Home Assistant therefore remov
 entity rather than showing it unavailable for ever — the same thing that happens when you
 delete the node.
 
-Inside the graph nothing changes. A Switch still gates its wire, a Virtual trigger still
+Inside the graph nothing changes. A Switch still gates its wire, an MQTT button still
 fires from its ▶ button and from the REST API, and an MQTT publish node is still reached
 by the chain. The checkbox answers one question only: can anything outside the box see it.
 
 {: .note }
-> This exists because a **blank topic on a Switch no longer means "no MQTT"** — it falls
-> back to a slug of the node's name, so a Switch called "Outside bell" gets the topic
-> `outside_bell` whether you asked for one or not. A magic topic value such as `-` was
+> This exists because a **blank topic no longer means "no MQTT"** — on a Switch or on an
+> MQTT button. Both fall back to a slug of the node's name, so a Switch called "Outside
+> bell" gets the topic `outside_bell`, and an MQTT button called "Ring the chime" gets
+> `ring_the_chime`, whether you asked for one or not. A magic topic value such as `-` was
 > considered and rejected: `-` is a perfectly legal MQTT topic level, and so is every other
 > string a sentinel could use, so any of them would collide with a topic somebody could
 > legitimately want.
 
 ## Recipes
 
-### Ring the chime from Home Assistant
+### Press a button in Home Assistant, ring the chime
 
-Add a `source.virtual` node with topic `chime`, link it to a `sink.transmit`, then:
+Add an **MQTT button** (`source.virtual`) called "Ring the chime" and link it to a
+`signal.tx` carrying the chime's code. That is the whole setup: with discovery on, a
+`button` entity for it appears on the Klingelbox device by itself, and pressing it puts the
+code on air. No YAML at all.
+
+The topic follows the node's name unless you type one, so the same button is reachable
+from an automation, a script, or a shell:
 
 ```yaml
 action:
   - service: mqtt.publish
     data:
-      topic: klingelbox/trigger/chime
+      topic: klingelbox/trigger/ring_the_chime
       payload: ""
 ```
+
+Any message fires it — the payload is never looked at. Give a second `source.virtual` the
+same topic and one press fires both chains.
 
 Or press the auto-created `button` entity. Or, if you would rather transmit a stored signal
 directly by name:

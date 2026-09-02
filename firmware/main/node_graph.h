@@ -295,16 +295,18 @@ typedef struct {
     /* Topic suffix, used by three node types:
      *   SINK_MQTT     - published to as <base>/<topic> when the node fires.
      *   SOURCE_VIRTUAL- SUBSCRIBED to as <base>/trigger/<topic>; any message
-     *                   arriving there fires the node. This is what makes a
-     *                   virtual input reachable from Home Assistant, Node-RED or
+     *                   arriving there fires the node. This is what makes an
+     *                   MQTT button reachable from Home Assistant, Node-RED or
      *                   a shell one-liner, with no RF involved at all.
      *   LOGIC_SWITCH  - SUBSCRIBED to as <base>/switch/<topic>/set, and its
      *                   position published retained on <base>/switch/<topic>/state.
-     *                   Deliberately NOT unique: several switch nodes may carry
-     *                   the same topic so that one HA toggle gates all of them.
-     * Empty on a SOURCE_VIRTUAL means "no MQTT" (UI/REST only). Empty on a
-     * LOGIC_SWITCH does NOT — it falls back to a slug of the node's NAME, which
-     * is why mqtt_enabled below had to exist. */
+     * On NEITHER of those two does empty mean "no MQTT": both fall back to a
+     * slug of the node's NAME (db_graph_node_suffix below), which is why
+     * mqtt_enabled had to exist. Only SINK_MQTT still needs a topic typed —
+     * there is no sensible default payload destination to invent for it.
+     * Deliberately NOT unique on either: several switch nodes may share a topic
+     * so one HA toggle gates all of them, and several virtual nodes may share
+     * one so a single HA button starts all their chains. */
     char     topic[DB_NODE_TOPIC_MAX];
 
     /*
@@ -408,6 +410,33 @@ int db_graph_monitor_hits(uint16_t node_id, int64_t *out_us, int max);
  * reports is the value the UI lights by. */
 uint16_t db_graph_monitor_hold_s(const db_node_t *n);
 
+/* ---- MQTT topic resolution ------------------------------------------------
+ *
+ * THE topic suffix a node answers on — the ONE resolver, for BOTH types that
+ * are addressable from the broker: a DB_NODE_LOGIC_SWITCH on
+ * <base>/switch/<suffix>/set and a DB_NODE_SOURCE_VIRTUAL on
+ * <base>/trigger/<suffix>.
+ *
+ * Explicit `topic` if it has one, otherwise a slug of its `name`, otherwise ""
+ * (no addressable topic). See db_mqtt_node_suffix() in mqtt_topic.h for the
+ * rule itself and for the bug that made sharing it necessary: the bridge
+ * resolved the suffix one way when subscribing while the graph matched on the
+ * raw `topic` field, so a switch relying on the name fallback got a Home
+ * Assistant entity it was impossible to command.
+ *
+ * The virtual trigger had the SAME trap in a different shape: no topic typed
+ * meant no subscription at all, so a node that looked healthy on the canvas was
+ * simply invisible to MQTT — and "add a node, wire it up, press it from Home
+ * Assistant" ended in silence with nothing to look at. It now resolves through
+ * here too, which is why this lives above the per-type sections rather than
+ * inside the switch's.
+ *
+ * EVERY comparison of "does this node answer on that topic?" goes through here,
+ * on both sides of the bridge. A caller that reads n->topic to answer that
+ * question is reintroducing the bug.
+ */
+void db_graph_node_suffix(const db_node_t *n, char *out, size_t outsz);
+
 /* ---- logic.switch --------------------------------------------------------
  *
  * The position of a switch node is its `enabled` flag (see DB_NODE_LOGIC_SWITCH
@@ -422,27 +451,11 @@ uint16_t db_graph_monitor_hold_s(const db_node_t *n);
  * switch the box is not actually in.
  */
 
-/*
- * THE topic suffix a switch node answers on — the ONE resolver.
- *
- * Explicit `topic` if it has one, otherwise a slug of its `name`, otherwise ""
- * (no addressable topic). See db_mqtt_switch_suffix() in mqtt_topic.h for the
- * rule itself and for the bug that made sharing it necessary: the bridge
- * resolved the suffix one way when subscribing while the two functions below
- * matched on the raw `topic` field, so a switch relying on the name fallback got
- * a Home Assistant entity it was impossible to command.
- *
- * EVERY comparison of "does this node answer on that topic?" goes through here,
- * on both sides of the bridge. A caller that reads n->topic to answer that
- * question is reintroducing the bug.
- */
-void db_graph_switch_suffix(const db_node_t *n, char *out, size_t outsz);
-
 /* Set one switch node by id. ESP_ERR_NOT_FOUND if there is no such node,
  * ESP_ERR_INVALID_ARG if it is not a DB_NODE_LOGIC_SWITCH. */
 esp_err_t db_graph_switch_set(uint16_t node_id, bool on);
 
-/* Set EVERY switch node whose RESOLVED suffix (db_graph_switch_suffix, above) is
+/* Set EVERY switch node whose RESOLVED suffix (db_graph_node_suffix, above) is
  * `topic` — the "one HA toggle, N switches" case. Returns how many nodes it
  * MATCHED, which is 0 when no switch node answers on that topic.
  *
@@ -577,6 +590,26 @@ void db_graph_on_wired(uint16_t node_id);
  * half the box, and the ▶ on a receiver would silently mean something different
  * from pressing the remote. Firing any other node type moves no switch. */
 esp_err_t db_graph_fire_node(uint16_t node_id);
+
+/*
+ * Fire EVERY source.virtual node whose RESOLVED suffix (db_graph_node_suffix)
+ * is `topic` — one message on <base>/trigger/<suffix>, every node listening on
+ * it fires. Returns how many were fired; 0 when no node answers on that topic.
+ *
+ * ALL OF THEM, NOT THE FIRST. The switch settled this question the same way for
+ * the same reason: one Home Assistant control, several nodes. On a switch that
+ * is "one toggle gates three paths"; here it is "one button starts three
+ * chains", which is the more obviously useful of the two — a "ring everything"
+ * button is a topic two chains happen to share, not a node type of its own.
+ * Firing only the first would make the second node's behaviour depend on the
+ * order the graph happens to be stored in, which is invisible on screen.
+ *
+ * Nodes with mqtt_enabled false, or switched off by hand, are skipped: the same
+ * rule as db_graph_switch_set_topic(), and for the same reason — a node the
+ * user has taken off MQTT must not be reachable from MQTT even when it shares a
+ * topic with one that is still exposed.
+ */
+int db_graph_fire_topic(const char *topic);
 
 /* ---- wired inputs ----
  * Applies the GPIO configuration of every enabled SOURCE_GPIO node: installs

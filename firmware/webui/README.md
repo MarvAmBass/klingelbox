@@ -369,18 +369,26 @@ input-only, `logic` has both.
   answers 404 the node type is removed from the "Add node" picker entirely. The
   editor states the wiring in one line: *button between the GPIO and GND, the
   internal pull-up does the rest*.
-* **`source.virtual`** carries a **trigger topic** bound to `topic`, subscribed
-  as `<base>/trigger/<topic>`. The editor shows the resulting full topic as
+* **`source.virtual`** is labelled **MQTT button** — it was "Virtual trigger"
+  until 0.5, under which name nobody looking for "a button Home Assistant can
+  press" ever found it, and it got asked for as a missing feature while sitting
+  on the palette. The wire name is unchanged: it is on flash and in the API.
+  It carries a **trigger topic** bound to `topic`, subscribed as
+  `<base>/trigger/<topic>`. The editor shows the resulting full topic as
   read-only helper text so it can be copied straight into Home Assistant or an
   `mosquitto_pub` line. The base comes from `GET /api/config`
   (`mqtt.base_topic`) — `klingelbox` appears only as placeholder text before
-  that answer arrives. Empty topic is fine: the node still fires from the
-  **▶ Trigger** button and from `POST /api/graph/nodes/{id}/fire`. If MQTT is
-  disabled the topic is still settable, with an inline note that it starts
-  working once MQTT is enabled. Firing by hand is what this type is *for*, so
-  ▶ Trigger is offered in three places and is the card's **primary** button
-  rather than a muted test affordance: on the list card, at the top of the
-  editor sheet, and as a ▶ hit target on the canvas node.
+  that answer arrives. **An empty topic follows the node's NAME**, exactly as a
+  Switch does and through the same resolver, so "Ring the chime" answers on
+  `ring_the_chime` with nothing typed; the editor says which name it is
+  following and what Home Assistant will call the entity. Blank used to mean "no
+  MQTT", which made a perfectly healthy-looking node invisible to the broker —
+  `mqtt_enabled` is the way to say that now. If MQTT is disabled the topic is
+  still settable, with an inline note that it starts working once MQTT is
+  enabled. Firing by hand is what this type is *also* for, so ▶ Trigger is
+  offered in three places and is the card's **primary** button rather than a
+  muted test affordance: on the list card, at the top of the editor sheet, and
+  as a ▶ hit target on the canvas node.
 * **`source.any_rf`** is a wildcard with no parameters. The editor explains that
   it fires on every burst including unregistered ones, that it fires *in
   addition to* a matching `signal` node (intended, not double-firing), and
@@ -406,9 +414,11 @@ patterns need no special node type — only links:
   (mode `any`) → `signal` (the chime’s code).
 * **Two buttons pressed together** — same, with mode `all` and a window.
 * **Proxy the whole band to Home Assistant** — `source.any_rf` → `sink.mqtt`.
-* **Ring the chime from HA** — `source.virtual` (trigger topic) → `signal`.
+* **Press a button in Home Assistant, ring the chime** — `source.virtual`
+  (MQTT button, named "Ring the chime") → `signal`. The HA button entity appears
+  by itself; no YAML, and no topic to type.
 * **Stop a stuck button** — `signal` → `logic.throttle` → `signal`.
-* **Test a chain without ringing anything** — `source.virtual` (▶) →
+* **Test a chain without ringing anything** — `source.virtual` (MQTT button, ▶) →
   `sink.monitor` (💡). Tap ▶ on the card, in the editor or on the canvas node and
   watch the lamp light and the mark land on the timeline.
 

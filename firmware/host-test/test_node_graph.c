@@ -520,8 +520,10 @@ static void test_topic_reporting(void)
 /*
  * THE BUG THIS FILE EXISTS TO HAVE CAUGHT.
  *
- * A switch node's topic is resolved as "explicit topic, else a slug of the
- * name". The MQTT bridge resolved it that way when deciding what to SUBSCRIBE
+ * An addressable node's topic is resolved as "explicit topic, else a slug of
+ * the name" — one rule, shared by logic.switch and source.virtual (see
+ * test_virtual_suffix below, which pins the second type to the same answer).
+ * The MQTT bridge resolved it that way when deciding what to SUBSCRIBE
  * to; node_graph.c matched an ARRIVING COMMAND against the raw `topic` field.
  * For every switch that relied on the name fallback the two disagreed, and the
  * user got a Home Assistant entity that could not be commanded and never
@@ -530,43 +532,43 @@ static void test_topic_reporting(void)
  * It was a pure string rule the whole time. These are the cases that would have
  * gone red the day the fallback was added.
  */
-static void test_switch_suffix(void)
+static void test_node_suffix(void)
 {
-    CASE("switch suffix: the resolver");
+    CASE("node suffix: the resolver");
 
     char out[DB_NODE_TOPIC_MAX];
 
     /* The user's actual node: a name, no topic. This is the case that broke. */
-    db_mqtt_switch_suffix("", "All Bells Switch", out, sizeof(out));
+    db_mqtt_node_suffix("", "All Bells Switch", out, sizeof(out));
     CHECK(strcmp(out, "all_bells_switch") == 0,
           "a named switch with no topic must resolve to its name slug, got '%s'", out);
 
     /* An explicit topic wins and is NEVER rewritten — not slugified, not
      * lowercased. Renaming the node must not move somebody's HA entity. */
-    db_mqtt_switch_suffix("outside_bell", "All Bells Switch", out, sizeof(out));
+    db_mqtt_node_suffix("outside_bell", "All Bells Switch", out, sizeof(out));
     CHECK(strcmp(out, "outside_bell") == 0, "explicit topic wins, got '%s'", out);
-    db_mqtt_switch_suffix("Haus/Tuer-1", "ignored", out, sizeof(out));
+    db_mqtt_node_suffix("Haus/Tuer-1", "ignored", out, sizeof(out));
     CHECK(strcmp(out, "Haus/Tuer-1") == 0,
           "an explicit topic must be passed through verbatim, got '%s'", out);
 
     /* Nothing usable either way. */
-    db_mqtt_switch_suffix("", "", out, sizeof(out));
+    db_mqtt_node_suffix("", "", out, sizeof(out));
     CHECK(out[0] == '\0', "no topic and no name resolves to nothing, got '%s'", out);
-    db_mqtt_switch_suffix("", "///", out, sizeof(out));
+    db_mqtt_node_suffix("", "///", out, sizeof(out));
     CHECK(out[0] == '\0', "a name that slugifies to nothing, got '%s'", out);
-    db_mqtt_switch_suffix(NULL, NULL, out, sizeof(out));
+    db_mqtt_node_suffix(NULL, NULL, out, sizeof(out));
     CHECK(out[0] == '\0', "NULLs resolve to nothing, got '%s'", out);
 
     /* Two nodes sharing a NAME share one toggle, exactly as two sharing an
      * explicit topic always have. That is the documented consequence. */
     char a[DB_NODE_TOPIC_MAX], b[DB_NODE_TOPIC_MAX];
-    db_mqtt_switch_suffix("", "Outside bell", a, sizeof(a));
-    db_mqtt_switch_suffix("", "outside  BELL", b, sizeof(b));
+    db_mqtt_node_suffix("", "Outside bell", a, sizeof(a));
+    db_mqtt_node_suffix("", "outside  BELL", b, sizeof(b));
     CHECK(strcmp(a, b) == 0,
           "two names that slugify alike must share a topic: '%s' vs '%s'", a, b);
 
     /* A zero-size buffer must be tolerated. */
-    db_mqtt_switch_suffix("x", "y", out, 0);
+    db_mqtt_node_suffix("x", "y", out, 0);
     CHECK(1, "zero-size output buffer did not crash");
 }
 
@@ -575,9 +577,9 @@ static void test_switch_suffix(void)
  * this node answer on that topic?". Before the fix, the subscribe side said yes
  * and the command side said no for the very same node.
  */
-static void test_switch_suffix_matching(void)
+static void test_node_suffix_matching(void)
 {
-    CASE("switch suffix: subscribe and command agree");
+    CASE("node suffix: subscribe and command agree");
 
     struct { const char *topic; const char *name; const char *arrives; int match; } T[] = {
         /* the reported bug */
@@ -595,7 +597,7 @@ static void test_switch_suffix_matching(void)
 
     for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++) {
         char sfx[DB_NODE_TOPIC_MAX];
-        db_mqtt_switch_suffix(T[i].topic, T[i].name, sfx, sizeof(sfx));
+        db_mqtt_node_suffix(T[i].topic, T[i].name, sfx, sizeof(sfx));
         /* Empty resolves to "no addressable topic", which never matches — the
          * same short-circuit db_graph_switch_set_topic() applies. */
         int m = (sfx[0] && T[i].arrives[0] && strcmp(sfx, T[i].arrives) == 0);
@@ -604,6 +606,131 @@ static void test_switch_suffix_matching(void)
               T[i].topic, T[i].name, T[i].arrives,
               T[i].match ? "a match" : "no match", sfx);
     }
+}
+
+/*
+ * THE SAME TRAP, THE SECOND NODE TYPE.
+ *
+ * source.virtual — the MQTT button — subscribes on <base>/trigger/<suffix>. It
+ * used to read the raw `topic` field and skip the node entirely when it was
+ * blank, so a button added without typing a topic subscribed to nothing,
+ * announced no Home Assistant entity, and sat on the canvas looking healthy.
+ * That is exactly what the switch did before the resolver, one topic level over.
+ *
+ * These cases pin the two types to ONE answer. They are written against
+ * db_mqtt_node_suffix() because that is the single implementation both sides of
+ * the bridge reach — if a virtual trigger ever resolves differently from a
+ * switch with the same name and topic, it can only be because someone added a
+ * second copy of the rule, and this goes red.
+ */
+static void test_virtual_suffix(void)
+{
+    CASE("node suffix: a virtual trigger resolves like a switch");
+
+    char out[DB_NODE_TOPIC_MAX];
+
+    /* The case the user hit: "add an MQTT button, wire it up, press it from Home
+     * Assistant" with nothing typed in the topic field. */
+    db_mqtt_node_suffix("", "Ring the chime", out, sizeof(out));
+    CHECK(strcmp(out, "ring_the_chime") == 0,
+          "a named virtual trigger with no topic must resolve to its name slug, got '%s'",
+          out);
+
+    /* A node still wearing the palette label is still addressable — the name is
+     * poor, but "poor topic" beats "no topic at all and no way to tell". */
+    db_mqtt_node_suffix("", "MQTT button", out, sizeof(out));
+    CHECK(strcmp(out, "mqtt_button") == 0,
+          "the default palette name still yields a topic, got '%s'", out);
+    db_mqtt_node_suffix("", "MQTT-Taster", out, sizeof(out));
+    CHECK(strcmp(out, "mqtt_taster") == 0,
+          "the German default name still yields a topic, got '%s'", out);
+
+    /* An explicit topic wins here too, and a later rename must not move it. */
+    db_mqtt_node_suffix("front_gate", "Ring the chime", out, sizeof(out));
+    CHECK(strcmp(out, "front_gate") == 0,
+          "an explicit trigger topic wins over the name, got '%s'", out);
+    db_mqtt_node_suffix("front_gate", "Renamed after the fact", out, sizeof(out));
+    CHECK(strcmp(out, "front_gate") == 0,
+          "renaming the node must not move an explicit topic, got '%s'", out);
+
+    /* Nothing usable: no subscription, which is the ONLY case where a virtual
+     * trigger is invisible to MQTT (mqtt_enabled false being the other, and that
+     * one is a decision rather than an accident). */
+    db_mqtt_node_suffix("", "", out, sizeof(out));
+    CHECK(out[0] == '\0', "no topic and no name resolves to nothing, got '%s'", out);
+    db_mqtt_node_suffix("", "!!!", out, sizeof(out));
+    CHECK(out[0] == '\0', "a name that slugifies to nothing, got '%s'", out);
+
+    /* ONE RULE, TWO TYPES: a switch and a virtual trigger with the same name and
+     * the same topic field must produce byte-identical suffixes. The resolver is
+     * type-blind, and this is the check that keeps it that way. */
+    struct { const char *topic; const char *name; } SAME[] = {
+        { "",             "Alle Klingeln"     },
+        { "",             "Outside bell"      },
+        { "front_gate",   "Ring the chime"    },
+        { "",             "Front door #2"     },
+        { "",             ""                  },
+    };
+    for (size_t i = 0; i < sizeof(SAME) / sizeof(SAME[0]); i++) {
+        char as_switch[DB_NODE_TOPIC_MAX], as_virtual[DB_NODE_TOPIC_MAX];
+        db_mqtt_node_suffix(SAME[i].topic, SAME[i].name, as_switch, sizeof(as_switch));
+        db_mqtt_node_suffix(SAME[i].topic, SAME[i].name, as_virtual, sizeof(as_virtual));
+        CHECK(strcmp(as_switch, as_virtual) == 0,
+              "the resolver must not depend on the node type: '%s' vs '%s'",
+              as_switch, as_virtual);
+    }
+
+    /* Two virtual nodes whose names slugify alike share ONE topic, and therefore
+     * one Home Assistant button that fires both. Documented behaviour, and the
+     * reason db_graph_fire_topic() fires every match rather than the first. */
+    char a[DB_NODE_TOPIC_MAX], b[DB_NODE_TOPIC_MAX];
+    db_mqtt_node_suffix("", "Ring everything", a, sizeof(a));
+    db_mqtt_node_suffix("", "ring  EVERYTHING", b, sizeof(b));
+    CHECK(strcmp(a, b) == 0,
+          "two trigger names that slugify alike must share a topic: '%s' vs '%s'", a, b);
+}
+
+/*
+ * The label a topic turns back into, which the node editor PROMISES before the
+ * user saves ("Appears in Home Assistant as: Outside bell"). The bridge used to
+ * publish the raw slug, so the promise and the dashboard disagreed; these cases
+ * pin the C rule to the JavaScript one in app.js.
+ */
+static void test_pretty_name(void)
+{
+    CASE("pretty name: a topic turned back into a label");
+
+    char out[DB_NODE_TOPIC_MAX];
+    struct { const char *in; const char *want; } T[] = {
+        { "outside_bell",   "Outside bell" },
+        { "ring_the_chime", "Ring the chime" },
+        { "haus/tuer-1",    "Haus tuer 1" },
+        { "a__b",           "A b" },
+        { "_leading",       "Leading" },
+        { "trailing_",      "Trailing" },
+        { "already nice",   "Already nice" },
+        { "___",            "" },
+        { "",               "" },
+    };
+    for (size_t i = 0; i < sizeof(T) / sizeof(T[0]); i++) {
+        db_mqtt_pretty_name(T[i].in, out, sizeof(out));
+        CHECK(strcmp(out, T[i].want) == 0,
+              "'%s' should read as '%s', got '%s'", T[i].in, T[i].want, out);
+    }
+
+    db_mqtt_pretty_name(NULL, out, sizeof(out));
+    CHECK(out[0] == '\0', "NULL resolves to nothing, got '%s'", out);
+    db_mqtt_pretty_name("x", out, 0);
+    CHECK(1, "zero-size output buffer did not crash");
+
+    /* It is a LABEL and must never be fed back into a topic: prettifying then
+     * slugifying returns the original, which is what makes the round trip safe
+     * to reason about. */
+    char slug[DB_NODE_TOPIC_MAX];
+    db_mqtt_pretty_name("outside_bell", out, sizeof(out));
+    db_mqtt_slugify(out, slug, sizeof(slug));
+    CHECK(strcmp(slug, "outside_bell") == 0,
+          "pretty then slugify must round-trip, got '%s'", slug);
 }
 
 static void test_slugify(void)
@@ -766,8 +893,10 @@ int main(void)
     test_topic_reporting();
 
     test_slugify();
-    test_switch_suffix();
-    test_switch_suffix_matching();
+    test_node_suffix();
+    test_node_suffix_matching();
+    test_virtual_suffix();
+    test_pretty_name();
     test_switch_reacts();
     test_switch_reacts_in_both_positions();
 

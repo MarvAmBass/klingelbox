@@ -85,13 +85,25 @@ Fires when a **wired button** on a GPIO is pressed. Configured entirely in the w
 | `gpio_active_low` | `true` by default — a button to GND with the internal pull-up on. An unconnected pin then reads "not pressed" rather than floating. |
 | `gpio_debounce_ms` | 50 ms by default. Mechanical buttons bounce; without this one press fires the chain several times. |
 
-#### `source.virtual`
-Fires from the web UI, from `POST /api/graph/nodes/{id}/fire`, or from MQTT. Give it a
-`topic` and it is **subscribed** as `<base>/trigger/<topic>` — any message there fires it.
-An empty `topic` means UI/REST triggering only.
+#### `source.virtual` — MQTT button
+**A button Home Assistant can press.** With MQTT discovery on it appears in your dashboard
+by itself — no YAML, no automation — and pressing it starts whatever is wired after it.
+The same button answers to any MQTT client, to ▶ in the web UI, and to
+`POST /api/graph/nodes/{id}/fire`.
 
-This is how a doorbell chain becomes reachable from Home Assistant, Node-RED, or a shell
-one-liner, with no radio involved at all.
+It is **subscribed** as `<base>/trigger/<topic>`, and *any* message there fires it: the
+payload is never inspected, so `mosquitto_pub -n` is a press. An empty `topic` does **not**
+mean "no MQTT" — it falls back to a slug of the node's `name`, so a button called
+"Ring the chime" answers on `ring_the_chime` with nothing typed. Use `mqtt_enabled: false`
+to keep one off the broker.
+
+Several of these may share one topic on purpose: one message fires **all** of them, which
+is how a single "ring everything" button drives several chains with no special node type.
+
+{: .note }
+> It is called `source.virtual` on the wire and in the API, and "Virtual trigger" in the UI
+> up to 0.5 — which is why people kept asking for an MQTT-triggerable button that had been
+> on the palette all along. The wire name is on flash and does not change.
 
 #### `source.any_rf`
 A **wildcard**: it fires on *every* received burst, including ones matching no stored
@@ -392,14 +404,20 @@ source.gpio (pin 6) ──▶ logic.throttle ──▶ signal.tx (chime)
 The wired switch behaves exactly like an RF button. Nothing downstream knows the
 difference.
 
-### Home Assistant rings the chime
+### Press a button in Home Assistant, ring the chime
 ```
-source.virtual (topic: "chime") ──▶ signal.tx (chime)
+source.virtual "Ring the chime" ──▶ signal.tx (chime)
 ```
+Two nodes, and nothing else to fill in. With discovery on, a **button** entity for it
+appears on the Klingelbox device in Home Assistant by itself; pressing it puts the chime's
+code on air. The topic follows the node's name unless you type one, so this button answers
+on `klingelbox/trigger/ring_the_chime`:
 ```sh
-mosquitto_pub -t klingelbox/trigger/chime -m ''
+mosquitto_pub -t klingelbox/trigger/ring_the_chime -m ''
 ```
-Any message on that topic fires the node. Payload content is irrelevant.
+Any message on that topic fires the node. Payload content is irrelevant — arriving *is*
+the press. Point a second `source.virtual` at the same topic and one press fires both
+chains.
 
 ---
 

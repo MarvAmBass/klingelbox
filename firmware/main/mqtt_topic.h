@@ -77,20 +77,30 @@ bool db_mqtt_topic_valid(const char *topic, const char *field, size_t max_len,
  *
  * THIS IS THE ONLY IMPLEMENTATION. It used to be a static in mqtt_bridge.c,
  * which was fine until a second place needed the same answer — see
- * db_mqtt_switch_suffix() below for what a second copy cost.
+ * db_mqtt_node_suffix() below for what a second copy cost.
  */
 void db_mqtt_slugify(const char *name, char *out, size_t outsz);
 
 /*
- * THE topic a switch answers on, from its explicit topic and its name.
+ * THE topic a node answers on, from its explicit topic and its name.
+ *
+ * TWO NODE TYPES, ONE RULE. A logic.switch is subscribed as
+ * <base>/switch/<suffix>/set and a source.virtual as <base>/trigger/<suffix>;
+ * the topics differ, the way the SUFFIX is arrived at does not. It was called
+ * db_mqtt_switch_suffix() while only the switch used it, and the name is now
+ * wrong rather than merely narrow — hence db_mqtt_node_suffix(). There is still
+ * exactly one implementation, which is the whole point: the two types cannot
+ * drift apart into "blank means a slug of the name here, blank means invisible
+ * there", which is precisely the trap each of them fell into in turn.
  *
  * An explicit `topic` always wins and is never rewritten, so once you have typed
  * one, renaming the node cannot move your Home Assistant entity out from under
  * you. Left blank, the NAME is slugified instead, because "MQTT topic
- * (optional)" made the single thing connecting a switch to Home Assistant look
- * like a detail you could skip — and skipping it silently meant no HA switch at
- * all. Both empty (or a name that slugifies to nothing) yields "", meaning the
- * switch has no addressable topic.
+ * (optional)" made the single thing connecting a node to Home Assistant look
+ * like a detail you could skip — and skipping it silently meant no HA entity at
+ * all, on a node that looked perfectly healthy on the canvas. Both empty (or a
+ * name that slugifies to nothing) yields "", meaning the node has no addressable
+ * topic.
  *
  * WHY THIS IS A SHARED FUNCTION AND NOT A RULE PEOPLE REIMPLEMENT. It was
  * written twice: the MQTT bridge resolved the suffix this way when deciding what
@@ -99,11 +109,30 @@ void db_mqtt_slugify(const char *name, char *out, size_t outsz);
  * Home Assistant entity that could not be commanded and never published its
  * retained state — the entity was real, the wiring behind it was not. One
  * resolver, reached from both sides, is the fix and the guard against it
- * recurring; db_graph_switch_suffix() in node_graph.h is the node-shaped door
+ * recurring; db_graph_node_suffix() in node_graph.h is the node-shaped door
  * onto it.
  */
-void db_mqtt_switch_suffix(const char *topic, const char *name,
-                           char *out, size_t outsz);
+void db_mqtt_node_suffix(const char *topic, const char *name,
+                         char *out, size_t outsz);
+
+/*
+ * A topic suffix turned back into something worth reading:
+ *
+ *     "outside_bell"   -> "Outside bell"
+ *     "haus/tuer-1"    -> "Haus tuer 1"
+ *     ""               -> ""
+ *
+ * Separator runs ('_', '-', '/') collapse to one space, the ends are trimmed,
+ * and the first character is capitalised. Nothing else is touched — this is a
+ * LABEL, not a topic, so it is never fed back into a topic.
+ *
+ * WHY IT EXISTS. A node still wearing its palette name is named after its topic
+ * in Home Assistant, and the editor tells the user exactly what that name will
+ * be — using this rule, in JavaScript (prettyTopic() in app.js). The bridge
+ * published the raw slug instead, so the editor promised "Outside bell" and the
+ * dashboard showed "outside_bell". Same rule, both sides, one place to read it.
+ */
+void db_mqtt_pretty_name(const char *suffix, char *out, size_t outsz);
 
 #ifdef __cplusplus
 }

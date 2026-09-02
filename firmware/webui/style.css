@@ -450,8 +450,11 @@ main {
 }
 .field select { padding-right: 2.1rem; }
 .field input:disabled, .field select:disabled { opacity: .55; }
+/* overflow-wrap because a hint's job is often to show a TOPIC, and a topic is
+   one unbreakable token: "klingelbox/trigger/<47 characters>" is wider than a
+   360 px phone and would otherwise push the whole sheet sideways. */
 .field .hint, .hint { font-size: .76rem; font-weight: 400; color: var(--muted);
-  text-transform: none; letter-spacing: 0; }
+  text-transform: none; letter-spacing: 0; overflow-wrap: anywhere; }
 /* A rejected topic. Empty until there is something to say, so it takes no room
    in the layout while the field is fine. */
 .field .hint.bad, .hint.bad { color: var(--bad); font-weight: 500; }
