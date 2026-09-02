@@ -4,7 +4,7 @@ layout: default
 nav_order: 6
 ---
 
-# doorbell433 REST API
+# Klingelbox REST API
 
 The contract between `firmware/main/http_api.c` and `firmware/webui/`. Both are
 written against this document; neither may invent endpoints.

@@ -1,17 +1,30 @@
-# doorbell433
+# Klingelbox
+
+*Die Klingel, lokal und ohne Cloud.*
 
 A **generic 433 MHz receive / analyze / replay appliance** on an ESP32-S3 with a
 CC1101 transceiver — built around a wireless doorbell, but deliberately not a
 doorbell hack.
 
-Register your doorbell buttons, replay their signals, synthesize new "virtual"
-signals to pair your own chimes to, and wire it all together in a node graph:
-*this button rings those chimes, these three all ring the upstairs one, and Home
-Assistant sees every press.*
+Learn your doorbell buttons, replay their signals, invent new ones to pair your
+own chimes to, and wire it all together in a node graph: *this button rings those
+chimes, these three all ring the upstairs one, and Home Assistant sees every
+press.*
 
-> **Status:** the RF chain is **validated on real hardware** — a live unit
-> captures, decodes and replays a real doorbell, and the replay rings the actual
-> chime. The appliance layer (web UI, MQTT, OTA) is in active development.
+![The Klingelbox dashboard: the node graph, with a switch blocking one path](docs/assets/dashboard.png)
+
+The whole box is one flow. Above: two doorbell buttons publish to MQTT; a
+**Switch** — toggleable from Home Assistant — is currently **off**, so the paths
+it gates are drawn broken and the chime behind it stays silent; a **Monitor**
+lights up whenever the signal beside it fires.
+
+> **Status:** validated on real hardware. A live unit captures a doorbell,
+> decodes it, replays it so the original chime rings, and has been running the
+> web UI, MQTT and over-the-air updates for days.
+>
+> **[Flash it from your browser →](https://marvambass.github.io/klingelbox/flasher/)**
+> · [Latest release](https://github.com/MarvAmBass/klingelbox/releases/latest)
+> · [Documentation](https://marvambass.github.io/klingelbox/)
 
 ---
 
