@@ -66,6 +66,27 @@ void db_mqtt_start(db_config_t *cfg);
  * Blocks until the worker has left any in-flight transmit. */
 void db_mqtt_stop(void);
 
+/*
+ * The MQTT section of the config changed: rebuild the bridge from the current
+ * values. Called by POST /api/config after applying the body; handles every
+ * transition — enabled→disabled (clean stop), disabled→enabled (fresh start),
+ * and a changed broker/base/prefix (stop + start).
+ *
+ * WHY A FULL STOP/START AND NOT A LIVE PATCH. The bridge captures the base
+ * topic and discovery prefix into private buffers at start (never pointers
+ * into the live config — see finding #10/#12: an in-place rewrite tore the
+ * strings under the bridge's feet and killed inbound routing until reboot).
+ * Half-applying a namespace change is the bug this replaces: subscriptions on
+ * the old base, routing against the new one. So the old bridge first RETIRES
+ * what it retained under the OLD base/prefix (discovery configs, switch
+ * states, telemetry — best-effort, while still connected), then stops, and a
+ * new bridge announces from scratch under the new values.
+ *
+ * Blocks like db_mqtt_stop() (the worker may be mid-transmit). Safe when the
+ * bridge never ran: it simply starts — or keeps not running — per the config.
+ */
+void db_mqtt_apply_config(void);
+
 /* True while the broker connection is up (for GET /api/system). */
 bool db_mqtt_connected(void);
 

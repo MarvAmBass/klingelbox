@@ -186,6 +186,11 @@ node graph, overwrite your Wi-Fi and MQTT credentials, and — via
 Reach it from outside over a VPN into your own network, never a port forward.
 
 Related, and deliberate:
+* What the box **does** defend against is your own browser being used as a
+  proxy: `/api` refuses requests whose `Host` header does not name the box
+  (DNS rebinding) and POSTs without a proper `Content-Type` (cross-site request
+  forgery from a hostile web page). Neither is authentication — see the intro
+  of [`docs/API.md`](docs/API.md).
 * The **recovery portal is open** (no passphrase) by default, so a box that has
   lost its Wi-Fi can always be rescued. Anyone in RF range can join it and
   reconfigure the device. Set a recovery password if that matters where you live.

@@ -2645,6 +2645,38 @@ function topicError(value, fieldName, maxLen) {
   return "";
 }
 
+/* First topic levels the box itself publishes and listens under <base>/.
+   SOURCE OF TRUTH: the TOPIC MAP in main/mqtt_bridge.c, mirrored by
+   db_mqtt_topic_reserved_level() in main/mqtt_topic.c \u2014 same list, same
+   order, one rule on both sides of the wire. */
+var RESERVED_TOPIC_LEVELS =
+  ["status", "button", "trigger", "switch", "unknown", "event", "radio"];
+
+/*
+ * The stricter rule for a NODE's topic: everything topicError() checks, plus
+ * the reserved-namespace rule. A node topic is composed UNDER the base topic
+ * (an MQTT-publish node posts to <base>/<topic>), so a first level like
+ * "trigger" would publish onto the box's own subscription and start a chain
+ * that fires itself forever. The base topic and discovery prefix in Settings
+ * keep the plain topicError() \u2014 they ARE the namespace and may be called
+ * anything. A DELIBERATE MIRROR of db_mqtt_node_topic_valid(), same caveats
+ * as topicError() above.
+ */
+function nodeTopicError(value, fieldName, maxLen) {
+  var e = topicError(value, fieldName, maxLen);
+  if (e) return e;
+  var val = String(value === null || value === undefined ? "" : value);
+  if (!val) return "";
+  var first = val.split("/")[0];
+  if (RESERVED_TOPIC_LEVELS.indexOf(first) >= 0)
+    return t("\"{field}\" starts with \"{level}\", a topic level the box itself " +
+             "publishes and listens under. A node publishing there would feed the " +
+             "box its own messages back \u2014 at worst a chain that fires itself " +
+             "forever. Choose a first level of your own.",
+             { field: fieldName || t("topic"), level: first });
+  return "";
+}
+
 /*
  * The "Expose to Home Assistant / MQTT" checkbox, shared by the three node types
  * the bridge actually looks at (MQTT button, Switch, MQTT publish).
@@ -2679,9 +2711,13 @@ function exposeField(n, onChange) {
  * true when the value is usable — call it before POSTing, so a Save can be
  * refused for a value the user pasted rather than typed.
  */
-function bindTopicCheck(input, errEl, field, after) {
+function bindTopicCheck(input, errEl, field, after, checker) {
+  /* `checker` picks the rule set: nodeTopicError for node topics (reserved
+     namespaces apply), the plain topicError — the default — for the Settings
+     fields that ARE the namespace. */
+  var check = checker || topicError;
   function run() {
-    var e = topicError(trimOf(input), field, TOPIC_MAX);
+    var e = check(trimOf(input), field, TOPIC_MAX);
     if (errEl) {
       errEl.textContent = e;
       errEl.className = e ? "hint bad" : "hint";
@@ -4019,7 +4055,7 @@ function openNodeEditor(n) {
     }
     ctl.mqttOn = exposeField(n, syncExposed);
     add(grid, ctl.mqttOn);
-    ctl.topicCheck = bindTopicCheck(ctl.topic, topicErr, "topic", syncTopic);
+    ctl.topicCheck = bindTopicCheck(ctl.topic, topicErr, "topic", syncTopic, nodeTopicError);
     if (nameIn) nameIn.addEventListener("input", syncTopic);
     add(tf, topicErr, topicPreview);
     add(grid, tf);
@@ -4203,7 +4239,7 @@ function openNodeEditor(n) {
     }
     ctl.mqttOn = exposeField(n, syncSwExposed);
     add(grid, ctl.mqttOn);
-    ctl.topicCheck = bindTopicCheck(ctl.topic, swErr, "topic", syncSw);
+    ctl.topicCheck = bindTopicCheck(ctl.topic, swErr, "topic", syncSw, nodeTopicError);
     if (nameIn) nameIn.addEventListener("input", syncSw);
     add(sf, swErr, swPreview);
     add(grid, sf);
@@ -4251,7 +4287,7 @@ function openNodeEditor(n) {
     }
     ctl.mqttOn = exposeField(n, syncPubExposed);
     add(grid, ctl.mqttOn);
-    ctl.topicCheck = bindTopicCheck(ctl.topic, pubErr, "topic", syncPub);
+    ctl.topicCheck = bindTopicCheck(ctl.topic, pubErr, "topic", syncPub, nodeTopicError);
     add(pf, pubErr, pubPreview);
     add(grid, pf);
     syncPubExposed();
@@ -4324,7 +4360,7 @@ function openNodeEditor(n) {
        topic is validated even when the node is not exposed, because it is still
        stored and would still be refused on the next save. */
     if (ctl.topicCheck && !ctl.topicCheck()) {
-      setMsg(msg, topicError(patch.topic, "topic", TOPIC_MAX), "err");
+      setMsg(msg, nodeTopicError(patch.topic, "topic", TOPIC_MAX), "err");
       return;
     }
     save.disabled = true;

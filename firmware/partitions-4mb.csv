@@ -4,10 +4,14 @@
 # 1.5 MB per app slot and a 512 KB web-UI SPIFFS image. Keep the firmware inside
 # 1.5 MB or this table stops fitting — CI should build both.
 #
+# NVS is 80 KB for the same reason as in partitions.csv (see the note there):
+# the 32-signal store simply does not fit in 24 KB. The growth fills the gap
+# that sat unused below ota_0, so the app and SPIFFS offsets are unchanged.
+#
 # Name,     Type, SubType,  Offset,    Size,     Flags
-nvs,        data, nvs,      0x9000,    0x6000,
-otadata,    data, ota,      0xf000,    0x2000,
-phy_init,   data, phy,      0x11000,   0x1000,
+nvs,        data, nvs,      0x9000,    0x14000,
+otadata,    data, ota,      0x1d000,   0x2000,
+phy_init,   data, phy,      0x1f000,   0x1000,
 ota_0,      app,  ota_0,    0x20000,   0x180000,
 ota_1,      app,  ota_1,    0x1A0000,  0x180000,
 storage,    data, spiffs,   0x320000,  0x80000,

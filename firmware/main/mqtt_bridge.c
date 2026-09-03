@@ -19,6 +19,14 @@
  *   <base>/<suffix>                    a SINK_MQTT node's own topic, when set
  *   <base>/radio                       radio telemetry, JSON, RETAINED
  *
+ * THIS MAP IS LOAD-BEARING BEYOND THIS FILE: the reserved-namespace rule in
+ * mqtt_topic.c (db_mqtt_topic_reserved_level) and its JavaScript mirror in
+ * app.js are derived from the FIRST LEVELS above — status, button, trigger,
+ * switch, unknown, event, radio — because a node topic starting with one of
+ * them publishes onto the box's own subscriptions (a sink on "trigger/x" is a
+ * chain that fires itself for ever). Add a namespace here and the validator,
+ * its host tests and docs/mqtt.md must grow in the same change.
+ *
  * EVERY NODE TOPIC ABOVE IS OPT-OUT. A node carries `mqtt_enabled` (node_graph.h),
  * true by default; with it false the bridge behaves as though the node were not
  * in the graph at all — nothing subscribed, nothing published, nothing announced
@@ -145,7 +153,15 @@ static const char *TAG = "db_mqtt";
 static db_config_t             *s_cfg;
 static esp_mqtt_client_handle_t s_client;
 static volatile bool            s_connected;
-static volatile bool            s_resub_all;   /* broker forgot our subscriptions */
+/* An announce (with full resubscribe) could not be queued — the connect-time
+ * MSG_ANNOUNCE was dropped on a full queue. The bridge loop retries it on its
+ * next pass, because a box that connects but never announces has no trigger
+ * or switch subscriptions and is invisible in Home Assistant for the rest of
+ * the session (finding #19). Written by the esp-mqtt event task, cleared by
+ * the bridge task — and cleared BEFORE the retry announce runs, so a set that
+ * lands mid-announce survives to the next pass instead of being lost the way
+ * the old read-then-clear inside announce() lost it (finding #20). */
+static volatile bool            s_announce_retry;
 static TaskHandle_t             s_task;
 static QueueHandle_t            s_queue;
 
@@ -153,9 +169,20 @@ static QueueHandle_t            s_queue;
  * esp_mqtt_client_init() — hence static, not a stack buffer. */
 static char s_status_topic[DB_STR_TOPIC + 16];
 
-/* Effective base / discovery prefix (config value, or the default when empty). */
-static const char *s_base;
-static const char *s_disc;
+/*
+ * Effective base / discovery prefix / device display name — COPIES taken at
+ * start, never pointers into the live config. POST /api/config rewrites the
+ * config buffer in place on the HTTP task while this module's tasks are
+ * mid-snprintf; aliasing it meant a base-topic change tore the string under
+ * route_inbound() and silently killed every inbound command until reboot
+ * (findings #10/#12). A change now arrives as db_mqtt_apply_config(): the old
+ * bridge retires and stops under these OLD values, the new one copies afresh.
+ * The scalar mqtt_homeassistant flag is still read live on purpose — a bool
+ * read is atomic and the toggle should apply on the next announce.
+ */
+static char s_base[DB_STR_TOPIC];
+static char s_disc[DB_STR_TOPIC];
+static char s_dev_name[DB_STR_HOSTNAME];
 
 /* HA device identity. Derived once at start: the MAC gives a stable identifier
  * that survives a hostname change, the hostname gives the friendly name. */
@@ -177,6 +204,22 @@ static int64_t  s_last_press_us;
 static uint16_t s_slug_id[DB_SIGNAL_MAX];
 static char     s_slug[DB_SIGNAL_MAX][DB_MQTT_SLUG_MAX];
 static int      s_slug_count;
+
+/*
+ * Cross-task snapshot buffers. This task runs concurrently with the HTTP task
+ * on the other core, and the store/graph pointer accessors are HTTP-task-only
+ * (see the threading contracts in signal_store.h / node_graph.h): a delete
+ * over there compacts the live arrays with element-by-element shifts, so a
+ * pointer held here can come to describe a DIFFERENT record mid-read — a
+ * press published under the wrong name, the wrong waveform keyed. Everything
+ * on this task therefore copies out under the store's lock, into these.
+ *
+ * STATIC, NOT STACK, deliberately: together they are ~6 KB against a 6 KB
+ * task stack that also carries cJSON. Single-buffer reuse is safe for the
+ * same reason s_tx_frame's is — only the bridge task ever touches them.
+ */
+static db_signal_meta_t s_sig_snap[DB_SIGNAL_MAX];   /* slug_table_build/announce */
+static db_node_t        s_node_snap[DB_NODE_MAX];    /* sync_*_subs               */
 
 /* Discovery snapshot: what we last announced, so a rename or a delete can clear
  * the retained config of the topic that went away. */
@@ -262,12 +305,19 @@ typedef enum {
     MSG_SET_SWITCH,   /* <base>/switch/<suffix>/set arrived                     */
     MSG_SWITCH_STATE, /* a switch moved elsewhere: republish the retained state */
     MSG_EVENT,        /* a node fired / a system event                          */
+    MSG_DISC_CHECK,   /* a retained discovery config arrived during the sweep   */
     MSG_STOP,
 } db_mqtt_msg_kind_t;
 
 typedef struct {
     uint8_t      kind;                    /* db_mqtt_msg_kind_t */
     uint8_t      ev_kind;                 /* db_event_kind_t, for MSG_EVENT */
+    /* MSG_ANNOUNCE: resubscribe everything (the broker forgot our session).
+     * Carried IN the message rather than in a shared flag, so the decision
+     * travels with the queue and cannot be lost to a read-then-clear racing
+     * MQTT_EVENT_CONNECTED on the event task (finding #20).
+     * MSG_STOP: retire all retained state first — the reconfig path. */
+    uint8_t      flag;
     uint16_t     node_id;
     db_trigger_t trig;                    /* what caused this, if anything */
     char         arg[DB_MQTT_ARG_MAX];    /* slug | trigger suffix | node topic */
@@ -300,6 +350,23 @@ static void post_simple(db_mqtt_msg_kind_t kind)
 {
     db_mqtt_msg_t m = { .kind = (uint8_t)kind };
     post(&m);
+}
+
+/*
+ * Queue an announce, and make its delivery RELIABLE: a dropped announce is not
+ * like a dropped telemetry refresh — at connect time it is the only thing that
+ * establishes the trigger/switch subscriptions and the discovery set, and
+ * nothing else would ever retry it (finding #19). So a failed post latches
+ * s_announce_retry and the bridge loop announces on its next pass. The latch
+ * always escalates to a FULL resubscribe: by the time the retry runs, whether
+ * the broker still holds our subscriptions is unknowable, and resubscribing to
+ * a subscription the broker already has is idempotent and costs one packet.
+ */
+static void post_announce(bool resub)
+{
+    db_mqtt_msg_t m = { .kind = MSG_ANNOUNCE, .flag = resub ? 1 : 0 };
+    if (!post(&m))
+        s_announce_retry = true;
 }
 
 static void pub(const char *topic, const char *payload, int qos, int retain)
@@ -373,11 +440,14 @@ static bool slug_taken(const char *cand, int upto)
  */
 static void slug_table_build(void)
 {
-    const db_signal_meta_t *list = db_signals_list();
-    int n = db_signals_count();
-    if (n > DB_SIGNAL_MAX) n = DB_SIGNAL_MAX;
+    /* A snapshot, not the live array: db_signals_list() is HTTP-task-only. A
+     * delete compacting the array mid-iteration here used to be able to pair
+     * one signal's name with another's id — and id_for_slug() then keyed the
+     * WRONG waveform onto the air (finding #11). The snapshot is one locked
+     * memcpy; announce() reads the same records by index afterwards. */
+    const db_signal_meta_t *list = s_sig_snap;
+    int n = db_signals_snapshot(s_sig_snap, DB_SIGNAL_MAX);
     s_slug_count = 0;
-    if (!list) return;
 
     for (int i = 0; i < n; i++) {
         char *dst = s_slug[s_slug_count];
@@ -440,17 +510,18 @@ static void add_device(cJSON *doc)
         }
     }
 
-    cJSON_AddStringToObject(dev, "name",
-                            s_cfg->hostname[0] ? s_cfg->hostname : "klingelbox");
+    /* s_dev_name is the bridge's own copy of the hostname (taken at start),
+     * not the live config field: the HTTP task rewrites that in place, and a
+     * hostname change takes a reboot to reach mDNS anyway — the same reboot
+     * refreshes this. */
+    cJSON_AddStringToObject(dev, "name", s_dev_name);
     cJSON_AddStringToObject(dev, "manufacturer", "MarvAmBass");
     cJSON_AddStringToObject(dev, "model", "Klingelbox");
     cJSON_AddStringToObject(dev, "sw_version", s_sw_version);
 
-    if (s_cfg->hostname[0]) {
-        char url[DB_STR_HOSTNAME + 16];
-        snprintf(url, sizeof(url), "http://%s.local/", s_cfg->hostname);
-        cJSON_AddStringToObject(dev, "configuration_url", url);
-    }
+    char url[DB_STR_HOSTNAME + 16];
+    snprintf(url, sizeof(url), "http://%s.local/", s_dev_name);
+    cJSON_AddStringToObject(dev, "configuration_url", url);
 }
 
 /* Availability off the retained <base>/status topic, which the LWT flips to
@@ -577,8 +648,11 @@ static bool name_is_default(const char *name)
  */
 static void announce_virtual_button(const db_mqtt_sub_t *sub)
 {
-    const db_node_t *n = db_graph_node(sub->node_id);
-    if (!n) return;
+    /* Copy-out (bridge task, see node_graph.h). Deleted since the announce was
+     * queued: skip — the next announce retires whatever this one had said. */
+    db_node_t nc;
+    if (db_graph_node_copy(sub->node_id, &nc) != ESP_OK) return;
+    const db_node_t *n = &nc;
 
     cJSON *d = cJSON_CreateObject();
     if (!d) return;
@@ -672,7 +746,10 @@ static void switch_object(char *out, size_t outsz, const db_mqtt_switch_t *sw)
  */
 static void announce_switch(const db_mqtt_switch_t *sw)
 {
-    const db_node_t *n = db_graph_node(sw->node_id);
+    /* Copy-out (bridge task, see node_graph.h); NULL is tolerated below — the
+     * entity is named after its topic when the naming node is gone. */
+    db_node_t nc;
+    const db_node_t *n = (db_graph_node_copy(sw->node_id, &nc) == ESP_OK) ? &nc : NULL;
 
     cJSON *d = cJSON_CreateObject();
     if (!d) return;
@@ -923,7 +1000,14 @@ static void retire_shared(void)
  * nothing (an unregistered burst) keeps its zeros and gets a usable label. */
 static void trigger_enrich(db_trigger_t *t)
 {
-    const db_signal_meta_t *m = t->signal_id ? db_signals_get(t->signal_id) : NULL;
+    /* Copy-out, not db_signals_get(): this runs on the bridge task, where a
+     * live pointer can start describing a different signal mid-read (see the
+     * threading contract in signal_store.h). A miss just means the signal was
+     * deleted since the message was queued — the zeros stay, which is the
+     * unregistered-burst shape and entirely presentable. */
+    db_signal_meta_t mc;
+    const db_signal_meta_t *m =
+        (t->signal_id && db_signals_get_copy(t->signal_id, &mc) == ESP_OK) ? &mc : NULL;
     if (m) {
         if (!t->label[0]) strlcpy(t->label, m->name, sizeof(t->label));
         if (!t->fingerprint) t->fingerprint = m->fingerprint;
@@ -972,12 +1056,16 @@ static cJSON *trigger_doc(const db_trigger_t *t, uint16_t node_id)
         cJSON_AddNullToObject(d, "decoded");   /* unknown protocol: normal */
     }
 
-    const db_node_t *n = node_id ? db_graph_node(node_id) : NULL;
+    /* node_copy, not db_graph_node(): bridge task, see node_graph.h. A node
+     * deleted since the firing was queued keeps its id and loses its name —
+     * "gone" is an ordinary answer here, not an error. */
+    db_node_t nc;
+    bool have_node = node_id && db_graph_node_copy(node_id, &nc) == ESP_OK;
     if (node_id) {
         cJSON *nd = cJSON_AddObjectToObject(d, "node");
         if (nd) {
             cJSON_AddNumberToObject(nd, "id", node_id);
-            cJSON_AddStringToObject(nd, "name", (n && n->name[0]) ? n->name : "");
+            cJSON_AddStringToObject(nd, "name", (have_node && nc.name[0]) ? nc.name : "");
         }
     } else {
         cJSON_AddNullToObject(d, "node");
@@ -1006,8 +1094,11 @@ static void publish_radio_state(void)
     cJSON_AddNumberToObject(d, "signals", db_signals_count());
 
     if (s_last_press_id) {
-        const db_signal_meta_t *m = db_signals_get(s_last_press_id);
-        cJSON_AddStringToObject(d, "last_press", (m && m->name[0]) ? m->name : "?");
+        /* Copy-out (bridge task, see signal_store.h); "?" for a signal deleted
+         * since it was last heard. */
+        db_signal_meta_t mc;
+        bool have = db_signals_get_copy(s_last_press_id, &mc) == ESP_OK;
+        cJSON_AddStringToObject(d, "last_press", (have && mc.name[0]) ? mc.name : "?");
         cJSON_AddNumberToObject(d, "last_press_id", s_last_press_id);
         cJSON_AddNumberToObject(d, "last_press_rssi_dbm", s_last_press_rssi);
         cJSON_AddNumberToObject(d, "last_press_ago_s",
@@ -1045,7 +1136,7 @@ static void publish_press(db_trigger_t *t)
             ESP_LOGW(TAG, "press for unknown signal %u", t->signal_id);
             return;
         }
-        post_simple(MSG_ANNOUNCE);
+        post_announce(false);
     }
 
     cJSON *d = cJSON_CreateObject();
@@ -1096,9 +1187,29 @@ static void publish_event(uint8_t ev_kind, const db_trigger_t *t, uint16_t node_
                           const char *node_topic, const char *text)
 {
     if (node_topic && node_topic[0]) {
-        char topic[DB_MQTT_TOPIC_MAX];
-        snprintf(topic, sizeof(topic), "%s/%s", s_base, node_topic);
-        pub_json(topic, trigger_doc(t, node_id), 0, 0);
+        /* Belt-and-braces for graphs saved BEFORE the reserved-namespace rule
+         * existed: a stored sink topic like "trigger/x" would publish onto the
+         * box's own subscription and self-fire forever (finding #3). The
+         * validator refuses such topics now; one already on flash is skipped
+         * — the node still fires, still feeds <base>/event, only its own-topic
+         * publish is suppressed — and the event log says so once per boot, so
+         * the silence is explained rather than mysterious. */
+        const char *rsv = db_mqtt_topic_reserved_level(node_topic);
+        if (rsv) {
+            static bool s_reserved_reported;
+            ESP_LOGW(TAG, "sink topic '%s' collides with the reserved '%s/' "
+                     "namespace; publish skipped", node_topic, rsv);
+            if (!s_reserved_reported) {
+                s_reserved_reported = true;
+                db_events_push(DB_EV_SYSTEM, 0, node_id, 0, 0,
+                               "MQTT: topic \"%s\" is reserved — edit the node",
+                               node_topic);
+            }
+        } else {
+            char topic[DB_MQTT_TOPIC_MAX];
+            snprintf(topic, sizeof(topic), "%s/%s", s_base, node_topic);
+            pub_json(topic, trigger_doc(t, node_id), 0, 0);
+        }
     }
 
     cJSON *d = trigger_doc(t, node_id);
@@ -1112,6 +1223,142 @@ static void publish_event(uint8_t ev_kind, const db_trigger_t *t, uint16_t node_
     char topic[DB_MQTT_TOPIC_MAX];
     topic_of(topic, sizeof(topic), "event");
     pub_json(topic, d, 0, 0);
+}
+
+/* ---- discovery reconciliation sweep ---------------------------------------
+ *
+ * THE PROBLEM (finding #21): retiring a deleted or renamed signal's retained
+ * discovery config relies on the in-RAM s_ann_* snapshot. Delete a signal
+ * while the broker is unreachable and then power-cycle before it returns, and
+ * the snapshot is gone — the old slug's retained configs sit on the broker
+ * forever, a permanently-unavailable ghost entity in Home Assistant that only
+ * a manual retained-topic purge removes.
+ *
+ * THE FIX: after each connect-time announce, subscribe ONCE to
+ *
+ *     <disc>/+/<device_uid>/+/config
+ *
+ * for a bounded window. The broker replays every retained config under our
+ * own device id — ours are freshly republished and match the announced set;
+ * anything that does not match is a leftover from a previous life and gets an
+ * empty retained publish, which is MQTT's "forget this entity".
+ *
+ * WHY THIS SHAPE:
+ *   - MEMORY IS O(1). Nothing is collected: each retained config is judged
+ *     the moment it arrives, against the tables announce() just rebuilt, and
+ *     either kept (expected) or cleared (one empty publish). No topic list,
+ *     no payloads — the alternative "persist the announced set to NVS" costs
+ *     flash writes on every announce and still misses configs written by a
+ *     DIFFERENT firmware or lost with a dead partition.
+ *   - OTHER DEVICES ARE UNTOUCHABLE BY CONSTRUCTION. The subscription itself
+ *     pins the third topic level to this box's MAC-derived uid, and the
+ *     router re-checks that segment byte-for-byte before queueing anything.
+ *   - EMPTY PAYLOADS ARE IGNORED, which is also what makes the sweep unable
+ *     to feed itself: our own clearing publishes echo back on the sweep
+ *     subscription as empty retained messages and drop out immediately.
+ *   - BEST-EFFORT, EVENTUALLY CONSISTENT. A check dropped on a full queue is
+ *     a ghost that survives until the next reconnect's sweep — never a wrong
+ *     clear.
+ */
+
+/* How long the sweep subscription stays open. Retained messages are replayed
+ * by the broker immediately after the SUBACK, so this only needs to cover one
+ * round trip plus the replay burst; generous because it costs nothing. */
+#define DB_MQTT_SWEEP_WINDOW_US  (5 * 1000000LL)
+
+static volatile int64_t s_sweep_until_us;     /* 0 = sweep not active */
+static char             s_sweep_filter[DB_MQTT_DISC_MAX];
+
+static void sweep_begin(void)
+{
+    snprintf(s_sweep_filter, sizeof(s_sweep_filter), "%s/+/%s/+/config",
+             s_disc, s_dev_uid);
+    esp_mqtt_client_subscribe(s_client, s_sweep_filter, 0);
+    s_sweep_until_us = esp_timer_get_time() + DB_MQTT_SWEEP_WINDOW_US;
+    ESP_LOGI(TAG, "discovery sweep: %s", s_sweep_filter);
+}
+
+static void sweep_end(void)
+{
+    if (!s_sweep_until_us) return;
+    s_sweep_until_us = 0;
+    if (s_client && s_connected)
+        esp_mqtt_client_unsubscribe(s_client, s_sweep_filter);
+}
+
+/* Called on every pass of the bridge loop; closes the window when it is over.
+ * A disconnect also ends the sweep — the subscription died with the session. */
+static void sweep_poll(void)
+{
+    if (!s_sweep_until_us) return;
+    if (!s_connected || esp_timer_get_time() > s_sweep_until_us)
+        sweep_end();
+}
+
+/*
+ * Would announce() publish this component/object right now? Judged against
+ * the s_ann_* tables — what the LAST announce actually put on the broker —
+ * which the sweep can rely on because it is started at the end of announce()
+ * on this same task. Anything unexpected includes every component this
+ * firmware never announces: under OUR device uid such a config can only be a
+ * leftover, and leftovers are exactly what the sweep exists to remove.
+ */
+static bool disc_object_expected(const char *component, const char *object)
+{
+    char buf[DB_MQTT_SLUG_MAX + 16];
+
+    if (!s_cfg->mqtt_homeassistant)
+        return false;    /* discovery is off: nothing under our uid is wanted */
+
+    if (strcmp(component, "device_automation") == 0) {
+        if (strcmp(object, "unknown_press") == 0) return true;
+        for (int i = 0; i < s_ann_count; i++) {
+            snprintf(buf, sizeof(buf), "%s_press", s_ann_slug[i]);
+            if (strcmp(buf, object) == 0) return true;
+        }
+        return false;
+    }
+    if (strcmp(component, "button") == 0) {
+        for (int i = 0; i < s_ann_count; i++) {
+            snprintf(buf, sizeof(buf), "%s_tx", s_ann_slug[i]);
+            if (strcmp(buf, object) == 0) return true;
+        }
+        for (int i = 0; i < s_ann_virt_count; i++) {
+            snprintf(buf, sizeof(buf), "node%u", (unsigned)s_ann_virt[i]);
+            if (strcmp(buf, object) == 0) return true;
+        }
+        return false;
+    }
+    if (strcmp(component, "switch") == 0) {
+        if (!s_ann_sw_ha) return false;
+        for (int i = 0; i < s_ann_sw_count; i++) {
+            db_mqtt_switch_t sw = { .node_id = 0, .count = 0 };
+            strlcpy(sw.suffix, s_ann_sw[i], sizeof(sw.suffix));
+            switch_object(buf, sizeof(buf), &sw);
+            if (strcmp(buf, object) == 0) return true;
+        }
+        return false;
+    }
+    if (strcmp(component, "sensor") == 0)
+        return strcmp(object, "rssi") == 0 || strcmp(object, "unknown") == 0;
+    if (strcmp(component, "binary_sensor") == 0)
+        return strcmp(object, "radio") == 0;
+
+    return false;
+}
+
+/* MSG_DISC_CHECK, on the bridge task: keep or clear one retained config. */
+static void handle_disc_check(const char *component, const char *object)
+{
+    if (disc_object_expected(component, object)) return;
+
+    char dt[DB_MQTT_DISC_MAX];
+    disc_topic(dt, sizeof(dt), component, object);
+    pub(dt, "", 1, 1);
+    ESP_LOGI(TAG, "discovery sweep: cleared stale %s/%s", component, object);
+    db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                   "MQTT: removed stale Home Assistant entity %s/%s",
+                   component, object);
 }
 
 /* ---- announce: discovery + subscriptions ---------------------------------- */
@@ -1152,8 +1399,13 @@ static bool node_mqtt_exposed(const db_node_t *n)
 static void sync_trigger_subs(bool resub)
 {
     char t[DB_MQTT_TOPIC_MAX];
-    const db_node_t *nodes = db_graph_nodes();
-    int n = db_graph_node_count();
+    /* Snapshot, not the live array (bridge task, see node_graph.h): a delete
+     * compacting s_nodes[] under this iteration could hand it half of one node
+     * and half of another — a subscription to a garbage suffix. The snapshot
+     * may be stale the moment it is taken, which is fine: the mutation that
+     * staled it also queued the MSG_ANNOUNCE that reruns this. */
+    const db_node_t *nodes = s_node_snap;
+    int n = db_graph_nodes_snapshot(s_node_snap, DB_NODE_MAX);
 
     if (resub)
         s_sub_count = 0;   /* the broker dropped them; nothing to unsubscribe */
@@ -1244,8 +1496,10 @@ static void sync_trigger_subs(bool resub)
 static void sync_switch_subs(bool resub)
 {
     char t[DB_MQTT_TOPIC_MAX];
-    const db_node_t *nodes = db_graph_nodes();
-    int n = db_graph_node_count();
+    /* Snapshot for the same reason as sync_trigger_subs() — one shared static
+     * buffer is fine, the two passes run sequentially on this one task. */
+    const db_node_t *nodes = s_node_snap;
+    int n = db_graph_nodes_snapshot(s_node_snap, DB_NODE_MAX);
 
     if (resub)
         s_sw_count = 0;
@@ -1311,18 +1565,20 @@ static void sync_switch_subs(bool resub)
  * set, and re-sync the trigger subscriptions. Run on every (re)connect (retained
  * discovery must survive a broker restart, which loses it) and after any signal
  * or graph change. Idempotent by construction.
+ *
+ * `resub` — the broker forgot our session, treat both subscription tables as
+ * empty — arrives as a PARAMETER, carried inside the MSG_ANNOUNCE that queued
+ * this call. It used to be a shared flag consumed here with a read-then-clear,
+ * which the event task's MQTT_EVENT_CONNECTED could interleave: the flag was
+ * set and immediately clobbered, and the fresh session got no subscriptions at
+ * all until the next reconnect (finding #20).
  */
-static void announce(void)
+static void announce(bool resub)
 {
     if (!s_connected) return;
     slug_table_build();
 
     bool ha = s_cfg->mqtt_homeassistant;
-    /* Read once and clear once: BOTH subscription tables were dropped by the
-     * broker, and whichever ran second would otherwise see the flag already
-     * cleared and keep a table the broker no longer honours. */
-    bool resub = s_resub_all;
-    s_resub_all = false;
 
     /* Anything we announced under a slug that no longer resolves to the same
      * signal — deleted, renamed, or shuffled by collision resolution. */
@@ -1336,8 +1592,11 @@ static void announce(void)
 
     if (ha) {
         for (int i = 0; i < s_slug_count; i++) {
-            const db_signal_meta_t *m = db_signals_get(s_slug_id[i]);
-            if (!m) continue;
+            /* s_sig_snap[i] and s_slug[i] describe the same signal by
+             * construction: slug_table_build() (just above) appends exactly
+             * one slug per snapshot record, in order. The snapshot, not
+             * db_signals_get() — bridge task, see signal_store.h. */
+            const db_signal_meta_t *m = &s_sig_snap[i];
             announce_signal_trigger(m, s_slug[i]);
             announce_tx_button(m, s_slug[i]);
         }
@@ -1395,7 +1654,11 @@ static void announce(void)
     s_ann_virt_count = 0;
     if (ha) {
         for (int j = 0; j < s_sub_count; j++) {
-            if (!db_graph_node(s_subs[j].node_id)) continue;
+            /* node_copy, not db_graph_node() — bridge task, see node_graph.h.
+             * A node deleted since sync_trigger_subs() snapshotted is simply
+             * not announced; the next announce retires it. */
+            db_node_t nc;
+            if (db_graph_node_copy(s_subs[j].node_id, &nc) != ESP_OK) continue;
             announce_virtual_button(&s_subs[j]);
             s_ann_virt[s_ann_virt_count++] = s_subs[j].node_id;
         }
@@ -1404,6 +1667,12 @@ static void announce(void)
     publish_radio_state();
     ESP_LOGI(TAG, "announced %d signal(s), %d virtual trigger(s), %d switch topic(s)%s",
              s_slug_count, s_sub_count, s_sw_count, ha ? "" : " (HA discovery off)");
+
+    /* A fresh session also means the broker may hold retained discovery
+     * configs this box no longer stands behind — start the reconciliation
+     * sweep now that everything CURRENT has just been (re)published, so the
+     * sweep's "is this one of ours?" question has a fresh answer. */
+    if (resub) sweep_begin();
 }
 
 /* ---- inbound commands (executed on OUR task, never the event task) --------- */
@@ -1414,6 +1683,9 @@ static void announce(void)
  * from a plain `mosquitto_pub -n`. */
 static void parse_tx_args(const char *payload, uint8_t *repeats, uint32_t *gap_us)
 {
+    /* Read live from the config on purpose (like mqtt_homeassistant): both are
+     * single aligned words, which cannot tear, and a changed transmit default
+     * should apply to the next press rather than wait for a bridge restart. */
     *repeats = s_cfg->tx_repeats ? s_cfg->tx_repeats : 6;
     *gap_us  = s_cfg->tx_gap_us  ? s_cfg->tx_gap_us  : 8000;
     if (!payload) return;
@@ -1454,10 +1726,14 @@ static void handle_transmit(const char *slug, const char *payload)
     /* Blocks for the airtime of the burst — which is precisely why this runs
      * here and not in the esp-mqtt event handler. */
     err = rf_service_transmit(&s_tx_frame, repeats, gap_us);
-    const db_signal_meta_t *m = db_signals_get(id);
+    /* Copy-out (bridge task, see signal_store.h): the transmit above blocked
+     * for the burst's whole airtime, ample room for an HTTP delete to have
+     * shifted the live array under a raw pointer. */
+    db_signal_meta_t mc;
+    bool have = db_signals_get_copy(id, &mc) == ESP_OK;
     ESP_LOGI(TAG, "MQTT transmit '%s' x%u: %s", slug, repeats, esp_err_to_name(err));
     db_events_push(DB_EV_TRANSMIT, id, 0, 0, repeats, "MQTT: %s",
-                   (m && m->name[0]) ? m->name : slug);
+                   (have && mc.name[0]) ? mc.name : slug);
 
     db_trigger_t t = { .signal_id = id, .repeats = repeats };
     trigger_enrich(&t);
@@ -1580,19 +1856,68 @@ static void handle_switch_set(const char *suffix, const char *payload)
 
 /* ---- the bridge task ------------------------------------------------------ */
 
+/*
+ * Retire EVERYTHING this bridge holds retained on the broker — discovery
+ * configs, switch states, telemetry — under the base/prefix it is CURRENTLY
+ * running with. The reconfig path (db_mqtt_apply_config) runs this on the
+ * bridge task before the old bridge stops, because once the restart happens
+ * every topic is built from the NEW values and nothing could ever address the
+ * old ones again: without this pass a base/prefix change leaves a permanent
+ * ghost device on the broker (finding #12). Best-effort by nature — offline
+ * means there is nothing to clean and nobody to clean it with.
+ */
+static void retire_all_for_reconfig(void)
+{
+    if (!s_connected) return;
+
+    for (int i = 0; i < s_ann_count; i++)      retire_signal(s_ann_slug[i]);
+    for (int i = 0; i < s_ann_virt_count; i++) retire_virtual(s_ann_virt[i]);
+    for (int i = 0; i < s_ann_sw_count; i++)   retire_switch(s_ann_sw[i], true);
+    retire_shared();
+
+    /* The retained non-discovery topics under <base>/ (switch states were
+     * taken by retire_switch above). An empty retained publish deletes the
+     * retained copy on the broker. */
+    char t[DB_MQTT_TOPIC_MAX];
+    topic_of(t, sizeof(t), "radio");   pub(t, "", 1, 1);
+    topic_of(t, sizeof(t), "unknown"); pub(t, "", 1, 1);
+
+    ESP_LOGI(TAG, "retired all retained state under base '%s', prefix '%s'",
+             s_base, s_disc);
+}
+
 static void bridge_task(void *arg)
 {
     (void)arg;
     db_mqtt_msg_t m;
 
     for (;;) {
-        if (xQueueReceive(s_queue, &m, pdMS_TO_TICKS(DB_MQTT_TICK_MS)) != pdTRUE) {
+        bool got = xQueueReceive(s_queue, &m, pdMS_TO_TICKS(DB_MQTT_TICK_MS)) == pdTRUE;
+
+        sweep_poll();
+
+        /* A connect-time announce was dropped on a full queue: retry it here,
+         * on every pass, until one lands (finding #19). Cleared BEFORE the
+         * announce so a reconnect that fires mid-announce re-arms the flag
+         * for the next pass instead of being swallowed (finding #20). */
+        if (s_announce_retry && s_connected) {
+            s_announce_retry = false;
+            announce(true);
+        }
+
+        if (!got) {
             /* Periodic tick: keep the retained radio telemetry fresh so the noise
              * floor in HA is current rather than whatever it was at boot. */
             if (s_connected) publish_radio_state();
             continue;
         }
-        if (m.kind == MSG_STOP) break;
+        if (m.kind == MSG_STOP) {
+            /* The reconfig stop retires the retained state first — this is
+             * the last moment the old base/prefix and the announce snapshot
+             * tables both still exist. */
+            if (m.flag) retire_all_for_reconfig();
+            break;
+        }
         if (!s_connected) continue;   /* offline: an event has no value late */
 
         switch ((db_mqtt_msg_kind_t)m.kind) {
@@ -1600,7 +1925,10 @@ static void bridge_task(void *arg)
             publish_radio_state();
             break;
         case MSG_ANNOUNCE:
-            announce();
+            announce(m.flag != 0);
+            break;
+        case MSG_DISC_CHECK:
+            handle_disc_check(m.text, m.arg);
             break;
         case MSG_PRESS:
             trigger_enrich(&m.trig);
@@ -1705,6 +2033,60 @@ static void route_inbound(const char *topic, int tlen, const char *data, int dle
     }
 }
 
+/*
+ * Is this MQTT_EVENT_DATA a retained discovery config for the reconciliation
+ * sweep? If so, judge-or-queue it and return true so it never reaches the
+ * command router. Runs on the esp-mqtt event task: it slices the topic and
+ * posts a message, nothing more.
+ *
+ * The device-uid path segment is compared BYTE FOR BYTE against s_dev_uid —
+ * the wildcard subscription already pins that level, but the check is what
+ * makes "this sweep can only ever clear this box's own configs" a property of
+ * the code rather than of the broker's matching.
+ */
+static bool sweep_route(const char *topic, int tlen, int dlen)
+{
+    if (!s_sweep_until_us) return false;   /* sweep window closed */
+
+    char t[DB_MQTT_DISC_MAX];
+    if (tlen <= 0 || tlen >= (int)sizeof(t)) return false;
+    memcpy(t, topic, (size_t)tlen);
+    t[tlen] = '\0';
+
+    /* "<disc>/" ... */
+    size_t plen = strlen(s_disc);
+    if (strncmp(t, s_disc, plen) != 0 || t[plen] != '/') return false;
+
+    /* ... "<component>/<uid>/<object>/config", exactly four segments. */
+    char *component = t + plen + 1;
+    char *uid = strchr(component, '/');
+    if (!uid) return false;
+    *uid++ = '\0';
+    char *object = strchr(uid, '/');
+    if (!object) return false;
+    *object++ = '\0';
+    char *leaf = strchr(object, '/');
+    if (!leaf) return false;
+    *leaf++ = '\0';
+    if (strcmp(leaf, "config") != 0) return false;   /* also excludes deeper paths */
+    if (strcmp(uid, s_dev_uid) != 0) return false;   /* another box's config */
+    if (!component[0] || !object[0]) return false;
+
+    /* An EMPTY retained payload is a topic already cleared — including the
+     * echo of this sweep's own clearing publishes. Consumed, not queued:
+     * reacting to it is how a sweep would feed itself. */
+    if (dlen <= 0) return true;
+
+    if (strlen(component) >= DB_MQTT_TEXT_MAX || strlen(object) >= DB_MQTT_ARG_MAX)
+        return true;   /* not a topic this firmware ever announced: ignore */
+
+    db_mqtt_msg_t m = { .kind = MSG_DISC_CHECK };
+    strlcpy(m.text, component, sizeof(m.text));
+    strlcpy(m.arg, object, sizeof(m.arg));
+    post(&m);   /* dropped on a full queue = retried by the next reconnect */
+    return true;
+}
+
 static void mqtt_event_handler(void *args, esp_event_base_t base,
                                int32_t id, void *event_data)
 {
@@ -1724,9 +2106,10 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
         esp_mqtt_client_subscribe(s_client, sub, 0);
 
         /* The broker dropped our subscriptions with the session, and retained
-         * discovery may not have survived a broker restart: re-do both. */
-        s_resub_all = true;
-        post_simple(MSG_ANNOUNCE);
+         * discovery may not have survived a broker restart: re-do both. The
+         * resubscribe decision rides IN the message (finding #20), and a
+         * failed post is latched and retried by the bridge loop (finding #19). */
+        post_announce(true);
         ESP_LOGI(TAG, "connected; subscribed %s", sub);
         break;
     }
@@ -1735,6 +2118,30 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
         ESP_LOGW(TAG, "disconnected from broker");
         break;
     case MQTT_EVENT_DATA:
+        /* The sweep's retained configs first: they are the ONE inbound stream
+         * where retained delivery is the point, and they must never fall
+         * through to the command router. */
+        if (sweep_route(e->topic, e->topic_len, e->data_len)) break;
+        /*
+         * DROP RETAINED COMMAND DELIVERIES (finding #7). Every remaining
+         * subscription — button/+/press, trigger/<sfx>, switch/<sfx>/set — is
+         * a COMMAND topic, and the broker redelivers a retained message on
+         * every re-subscribe: one stray `mosquitto_pub -r` and the bell would
+         * re-ring on every Wi-Fi blip, forever, with nothing in the box's
+         * config to explain it. A retained command is by definition stale —
+         * a press is a moment, not a condition (see the file header) — so it
+         * is refused outright. The flag is valid here because only the first
+         * fragment carries topic_len > 0, which is also the only fragment
+         * route_inbound() accepts. The box subscribes to NO state topics, so
+         * there is no legitimate retained delivery to preserve outside the
+         * sweep handled above; if such a subscription is ever added, it must
+         * be routed before this check, like the sweep.
+         */
+        if (e->retain) {
+            ESP_LOGW(TAG, "ignored retained message on %.*s — retained commands replay on every reconnect",
+                     e->topic_len, e->topic);
+            break;
+        }
         route_inbound(e->topic, e->topic_len, e->data, e->data_len);
         break;
     case MQTT_EVENT_ERROR:
@@ -1764,9 +2171,15 @@ void db_mqtt_start(db_config_t *cfg)
         return;
     }
 
-    s_base = cfg->mqtt_base_topic[0] ? cfg->mqtt_base_topic : DB_MQTT_DEFAULT_BASE;
-    s_disc = cfg->mqtt_discovery_prefix[0] ? cfg->mqtt_discovery_prefix
-                                           : DB_MQTT_DEFAULT_DISCOVERY;
+    /* COPIES, not pointers into *cfg — see the comment on the buffers. From
+     * here on the bridge is self-contained: a config edit cannot tear these,
+     * and a config CHANGE arrives as db_mqtt_apply_config(), never in place. */
+    strlcpy(s_base, cfg->mqtt_base_topic[0] ? cfg->mqtt_base_topic
+                                            : DB_MQTT_DEFAULT_BASE, sizeof(s_base));
+    strlcpy(s_disc, cfg->mqtt_discovery_prefix[0] ? cfg->mqtt_discovery_prefix
+                                                  : DB_MQTT_DEFAULT_DISCOVERY, sizeof(s_disc));
+    strlcpy(s_dev_name, cfg->hostname[0] ? cfg->hostname : "klingelbox",
+            sizeof(s_dev_name));
     snprintf(s_status_topic, sizeof(s_status_topic), "%s/status", s_base);
 
     /* Device identity. The MAC is the stable key; the hostname is only cosmetic
@@ -1838,20 +2251,46 @@ void db_mqtt_start(db_config_t *cfg)
              cfg->mqtt_homeassistant ? ", HA discovery on" : "");
 }
 
-void db_mqtt_stop(void)
+/*
+ * The one stop routine, two callers. `reconfig` is the db_mqtt_apply_config()
+ * path: the bridge task first RETIRES everything retained under the old
+ * base/prefix (nothing else will ever be able to address those topics again),
+ * and the retained "offline" is replaced by an empty publish when the base is
+ * about to move — an offline marker under a base nothing will ever republish
+ * on is just one more stranded retained topic. Explicit unsubscribes are not
+ * needed: the session is clean, so the broker drops every subscription with
+ * the DISCONNECT that esp_mqtt_client_stop() sends.
+ */
+static void stop_internal(bool reconfig)
 {
     if (!s_client) return;
 
-    if (s_connected) pub(s_status_topic, "offline", 1, 1);
-
     /* Ask the task to leave rather than deleting it: it may be inside
      * rf_service_transmit() holding the radio mutex, and killing it there would
-     * wedge the radio for the rest of the boot. */
+     * wedge the radio for the rest of the boot. On the reconfig path the same
+     * message carries "retire the retained state first" (m.flag). */
     if (s_task) {
-        db_mqtt_msg_t m = { .kind = MSG_STOP };
+        db_mqtt_msg_t m = { .kind = MSG_STOP, .flag = reconfig ? 1 : 0 };
         xQueueSend(s_queue, &m, pdMS_TO_TICKS(100));
         for (int i = 0; i < 150 && s_task; i++) vTaskDelay(pdMS_TO_TICKS(20));
         if (s_task) ESP_LOGW(TAG, "bridge task did not exit; leaking it");
+    }
+
+    if (s_connected) {
+        /* Will the restart come back under a DIFFERENT base? Reading the live
+         * config here is safe: apply_config runs synchronously on the HTTP
+         * task after the handler has finished writing it. */
+        bool base_moves = reconfig && s_cfg && s_cfg->mqtt_enabled &&
+                          strcmp(s_cfg->mqtt_base_topic[0] ? s_cfg->mqtt_base_topic
+                                                           : DB_MQTT_DEFAULT_BASE,
+                                 s_base) != 0;
+        pub(s_status_topic, base_moves ? "" : "offline", 1, 1);
+        /* The retirements and the status are qos-1 and sit in esp-mqtt's
+         * outbox; give the client task a moment to flush them before the
+         * connection is torn down. Best-effort — a broker that is slow or
+         * gone loses them, and the next connect's discovery sweep (see
+         * sweep_begin) mops up what this could not. */
+        if (reconfig) vTaskDelay(pdMS_TO_TICKS(300));
     }
 
     esp_mqtt_client_stop(s_client);
@@ -1870,7 +2309,26 @@ void db_mqtt_stop(void)
     s_ann_sw_count = 0;
     s_ann_sw_ha = false;
     s_shared_retired = false;
+    s_announce_retry = false;
+    s_sweep_until_us = 0;
     ESP_LOGI(TAG, "stopped");
+}
+
+void db_mqtt_stop(void)
+{
+    stop_internal(false);
+}
+
+void db_mqtt_apply_config(void)
+{
+    /* Never started at all — app_main calls db_mqtt_start() unconditionally at
+     * boot (it records the config pointer even when MQTT is disabled), so a
+     * NULL here means boot has not reached the bridge yet and there is nothing
+     * to apply onto. */
+    if (!s_cfg) return;
+
+    stop_internal(true);     /* no-op when the bridge was not running */
+    db_mqtt_start(s_cfg);    /* no-op when MQTT is now disabled       */
 }
 
 bool db_mqtt_connected(void)
@@ -1895,12 +2353,16 @@ void db_mqtt_on_signal_press(uint16_t signal_id, int rssi_dbm, uint8_t repeats)
 
 void db_mqtt_on_signals_changed(void)
 {
-    post_simple(MSG_ANNOUNCE);
+    /* post_announce, not post_simple: a change notification dropped on a full
+     * queue must still be delivered eventually, or the discovery set and the
+     * subscription tables quietly stop matching the store (finding #19's
+     * failure mode, on the change path instead of the connect path). */
+    post_announce(false);
 }
 
 void db_mqtt_on_graph_changed(void)
 {
-    post_simple(MSG_ANNOUNCE);
+    post_announce(false);
 }
 
 void db_mqtt_on_switch_changed(void)

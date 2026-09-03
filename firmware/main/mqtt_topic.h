@@ -66,6 +66,42 @@ bool db_mqtt_topic_valid(const char *topic, const char *field, size_t max_len,
                          char *err, size_t errsz);
 
 /*
+ * The stricter rule for a NODE's topic: everything db_mqtt_topic_valid()
+ * checks, PLUS the reserved-namespace rule below. Node topics get the extra
+ * rule because they are composed UNDER the base topic (`<base>/<topic>` for a
+ * sink.mqtt), while the base topic and the discovery prefix ARE the namespace
+ * and may legitimately be called anything — which is why this is a second
+ * entry point and not a change to db_mqtt_topic_valid() itself.
+ */
+bool db_mqtt_node_topic_valid(const char *topic, const char *field,
+                              size_t max_len, char *err, size_t errsz);
+
+/*
+ * If `topic`'s FIRST level is one the bridge itself owns under <base>/, return
+ * that level's name; NULL otherwise (including for NULL/empty topics).
+ *
+ * WHY A FIRST-LEVEL RULE EXISTS AT ALL. A sink.mqtt node publishes to
+ * <base>/<topic>. Give it the topic "trigger/x" while a virtual trigger is
+ * subscribed on <base>/trigger/x and every publish lands back on the box's own
+ * subscription: the sink fires the trigger, the trigger's chain reaches the
+ * sink, and the loop runs FOREVER — ringing chimes and keying the RF carrier
+ * until someone edits the graph (one message from a malicious broker starts
+ * it). MQTT 3.1.1 has no no-local option, so the only reliable place to break
+ * the cycle is here, before the topic is ever stored.
+ *
+ * THE LIST IS THE TOPIC MAP. Its source of truth is the "TOPIC MAP" comment at
+ * the top of mqtt_bridge.c — every first level the bridge subscribes to or
+ * publishes under <base>/. If the bridge grows a namespace, it must be added
+ * here in the same change, or the new namespace ships without the guard.
+ *
+ * Exposed separately (not only inside db_mqtt_node_topic_valid) so the bridge
+ * can SKIP, rather than publish, a reserved topic that an older firmware
+ * already stored — the graph keeps working, only the dangerous publish is
+ * suppressed.
+ */
+const char *db_mqtt_topic_reserved_level(const char *topic);
+
+/*
  * Turn a human name into a topic segment: lowercase, alphanumerics kept, every
  * run of anything else collapsed to a single '_', no leading or trailing '_'.
  *

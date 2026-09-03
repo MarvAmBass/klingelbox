@@ -64,9 +64,11 @@
  * "just add the field so the form can prefill" change: do not.
  *
  * DIFFERENCE FROM THE REFERENCE FIRMWARE (deliberate, the design notes): there is no
- * per-request origin gate. That box refused management over its softAP; this one
+ * network-side origin gate. That box refused management over its softAP; this one
  * must be reachable identically on the softAP and the LAN, because the softAP is
- * frequently the only network a doorbell in a hallway ever sees.
+ * frequently the only network a doorbell in a hallway ever sees. (The Host and
+ * Content-Type checks in api_request_allowed() are a different thing entirely:
+ * they refuse a BROWSER acting as another website's deputy, never a network.)
  *
  * BLOCKING. httpd worker threads are a scarce resource, so handlers must not
  * loiter. Two of them deliberately do: a transmit keys the radio for roughly
@@ -94,6 +96,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"                /* ESP_ERR_NVS_NOT_ENOUGH_SPACE in status_for() */
 
 #include "board_pins.h"
 #include "db_config.h"
@@ -208,6 +211,10 @@ static const char *status_for(esp_err_t err)
     case ESP_ERR_INVALID_SIZE:  return "400 Bad Request";
     case ESP_ERR_NO_MEM:        return "409 Conflict";   /* store/graph is full */
     case ESP_ERR_INVALID_STATE: return "409 Conflict";
+    /* The NVS partition is out of pages: the request was fine, the box is out
+     * of persistent storage — which is exactly what 507 was minted for, and a
+     * far better prompt to "delete some signals" than a generic 500. */
+    case ESP_ERR_NVS_NOT_ENOUGH_SPACE: return "507 Insufficient Storage";
     default:                    return "500 Internal Server Error";
     }
 }
@@ -471,7 +478,15 @@ static esp_err_t api_system_hostname(httpd_req_t *req)
     }
 
     strlcpy(s_cfg->hostname, name, sizeof(s_cfg->hostname));
-    db_config_save(s_cfg);
+    /* The hostname only ever applies at boot, so a failed save means the
+     * change is simply LOST — 200 here would be a straight lie. (Same pattern
+     * at every db_config_save call site in this file: RAM is mutated first, so
+     * a discarded error meant "works until reboot, then silently reverts".) */
+    esp_err_t save_err = db_config_save(s_cfg);
+    if (save_err != ESP_OK)
+        return send_esp_err(req, save_err,
+                            "could not save the new hostname to flash — the "
+                            "change will be lost at the next reboot");
 
     cJSON *o = cJSON_CreateObject();
     cJSON_AddBoolToObject(o, "ok", true);
@@ -575,7 +590,13 @@ static esp_err_t api_radio_post(httpd_req_t *req)
         s_cfg->radio_bandwidth_hz = rc.rx_bandwidth_hz;
         s_cfg->radio_tx_power_dbm = rc.tx_power_dbm;
     }
-    db_config_save(s_cfg);
+    /* The chip is already reconfigured, so the settings WORK — but only until
+     * the next reboot if the save failed, and that must not look like success. */
+    esp_err_t save_err = db_config_save(s_cfg);
+    if (save_err != ESP_OK)
+        return send_esp_err(req, save_err,
+                            "the radio settings are applied but could not be "
+                            "saved to flash — they will revert at the next reboot");
     return api_radio_get(req);
 }
 
@@ -1795,7 +1816,12 @@ static bool node_apply_json(db_node_t *n, const cJSON *j, char *err, size_t errs
          * value fits before it is copied into the node. */
         char topic[DB_TOPIC_SCRATCH];
         trim_copy(s, topic, sizeof(topic));
-        if (!db_mqtt_topic_valid(topic, "topic", DB_NODE_TOPIC_MAX - 1, err, errsz))
+        /* The NODE validator, not the plain one: a node topic is composed
+         * under <base>/, so a first level like "trigger" would publish onto
+         * the box's own subscription and self-fire forever. The base topic
+         * and discovery prefix keep the plain validator — they ARE the
+         * namespace. See db_mqtt_topic_reserved_level() in mqtt_topic.h. */
+        if (!db_mqtt_node_topic_valid(topic, "topic", DB_NODE_TOPIC_MAX - 1, err, errsz))
             return false;
         strlcpy(n->topic, topic, sizeof(n->topic));
     }
@@ -2348,6 +2374,26 @@ static esp_err_t api_config_post(httpd_req_t *req)
         }
     }
 
+    /* Snapshot the MQTT fields BEFORE the body is applied, so afterwards the
+     * handler can tell whether the running bridge must be restarted. Compared
+     * field-by-field rather than "did the body mention mqtt", because the UI
+     * posts the whole section on every save — restarting the bridge for a
+     * byte-identical config would drop a healthy broker connection for
+     * nothing. */
+    bool     old_mqtt_en   = s_cfg->mqtt_enabled;
+    bool     old_mqtt_ha   = s_cfg->mqtt_homeassistant;
+    uint16_t old_mqtt_port = s_cfg->mqtt_port;
+    char     old_mqtt_host[DB_STR_HOST];
+    char     old_mqtt_user[DB_STR_NAME];
+    char     old_mqtt_pass[DB_STR_PASS];
+    char     old_mqtt_base[DB_STR_TOPIC];
+    char     old_mqtt_disc[DB_STR_TOPIC];
+    strlcpy(old_mqtt_host, s_cfg->mqtt_host, sizeof(old_mqtt_host));
+    strlcpy(old_mqtt_user, s_cfg->mqtt_user, sizeof(old_mqtt_user));
+    strlcpy(old_mqtt_pass, s_cfg->mqtt_pass, sizeof(old_mqtt_pass));
+    strlcpy(old_mqtt_base, s_cfg->mqtt_base_topic, sizeof(old_mqtt_base));
+    strlcpy(old_mqtt_disc, s_cfg->mqtt_discovery_prefix, sizeof(old_mqtt_disc));
+
     cJSON *mqtt = cJSON_GetObjectItem(j, "mqtt");
     if (cJSON_IsObject(mqtt)) {
         if (json_bool(mqtt, "enabled", &b)) s_cfg->mqtt_enabled = b;
@@ -2371,9 +2417,35 @@ static esp_err_t api_config_post(httpd_req_t *req)
         strlcpy(s_cfg->ota_url, s, sizeof(s_cfg->ota_url));
 
     cJSON_Delete(j);
-    db_config_save(s_cfg);
-    /* Credentials apply live — no reboot needed to join a new home network. */
+    esp_err_t save_err = db_config_save(s_cfg);
+    /* Credentials apply live — no reboot needed to join a new home network.
+     * Applied even when the save failed: the values ARE in the running config,
+     * and joining the network the user just typed is still what they asked for. */
     if (sta_changed) db_wifi_retry_sta();
+    /* MQTT applies live for the same reason — the bridge would otherwise keep
+     * routing against the OLD base while the broker still holds the old
+     * subscriptions, i.e. every inbound command silently dead until reboot,
+     * with the retained discovery stranded under the old prefix forever.
+     * db_mqtt_apply_config() retires the old retained state, stops the bridge
+     * and restarts it from the running config (a no-op start when MQTT was
+     * just disabled). The homeassistant flag alone needs no restart: the
+     * bridge reads it live, so a re-announce is enough to publish — or retire
+     * — the discovery set. */
+    if (old_mqtt_en != s_cfg->mqtt_enabled ||
+        old_mqtt_port != s_cfg->mqtt_port ||
+        strcmp(old_mqtt_host, s_cfg->mqtt_host) != 0 ||
+        strcmp(old_mqtt_user, s_cfg->mqtt_user) != 0 ||
+        strcmp(old_mqtt_pass, s_cfg->mqtt_pass) != 0 ||
+        strcmp(old_mqtt_base, s_cfg->mqtt_base_topic) != 0 ||
+        strcmp(old_mqtt_disc, s_cfg->mqtt_discovery_prefix) != 0) {
+        db_mqtt_apply_config();
+    } else if (old_mqtt_ha != s_cfg->mqtt_homeassistant) {
+        db_mqtt_on_signals_changed();
+    }
+    if (save_err != ESP_OK)
+        return send_esp_err(req, save_err,
+                            "the settings are applied but could not be saved to "
+                            "flash — they will revert at the next reboot");
     return api_config_get(req);
 }
 
@@ -2486,10 +2558,14 @@ static esp_err_t api_ap_post(httpd_req_t *req)
     }
     cJSON_Delete(j);
 
-    db_config_save(s_cfg);
+    esp_err_t save_err = db_config_save(s_cfg);
     /* Only the on/off flag applies live (wifi_mgr keeps its no-STA safety
      * exemption); every other radio change needs a clean bring-up. */
     if (en_changed) db_wifi_apply_ap_enabled(s_cfg);
+    if (save_err != ESP_OK)
+        return send_esp_err(req, save_err,
+                            "the access-point settings could not be saved to "
+                            "flash — they will revert at the next reboot");
     return api_ap_get(req);
 }
 
@@ -2565,7 +2641,14 @@ static esp_err_t api_wifi_post(httpd_req_t *req)
     strlcpy(s_cfg->sta[slot].ssid, ssid, sizeof(s_cfg->sta[slot].ssid));
     strlcpy(s_cfg->sta[slot].pass, pass, sizeof(s_cfg->sta[slot].pass));
     cJSON_Delete(j);
-    db_config_save(s_cfg);
+    /* On a failed save the reboot below MUST be skipped: the credentials exist
+     * only in RAM, so restarting would erase the very thing just typed in and
+     * land straight back in the wizard with no explanation. */
+    esp_err_t save_err = db_config_save(s_cfg);
+    if (save_err != ESP_OK)
+        return send_esp_err(req, save_err,
+                            "could not save the Wi-Fi credentials to flash, so "
+                            "the reboot was skipped — they would have been lost");
 
     ESP_LOGI(TAG, "wizard: saved \"%s\" into slot %d — rebooting", s_cfg->sta[slot].ssid, slot);
 
@@ -2610,7 +2693,16 @@ static esp_err_t api_ota_url(httpd_req_t *req, bool webui)
 
     if (!webui) {   /* remember it as the new default */
         strlcpy(s_cfg->ota_url, copy, sizeof(s_cfg->ota_url));
-        db_config_save(s_cfg);
+        /* Refuse rather than flash: reporting the failure AFTER starting an
+         * update would race the reboot, and the flash-independent alternative
+         * (POST /api/ota/upload) exists precisely for a box whose NVS is
+         * unwell. The RAM copy still serves as this boot's default. */
+        esp_err_t save_err = db_config_save(s_cfg);
+        if (save_err != ESP_OK)
+            return send_esp_err(req, save_err,
+                                "could not save the URL as this box's new "
+                                "default, so the update was NOT started — try "
+                                "again, or use the browser upload");
     }
 
     esp_err_t err = webui ? db_ota_webui_from_url(copy) : db_ota_start(copy);
@@ -2795,10 +2887,147 @@ static esp_err_t api_update_install(httpd_req_t *req)
     return send_json(req, o, "200 OK");
 }
 
+/* ------------------------------------------------------------- origin guard */
+
+/*
+ * Cross-origin defense — the browser as a confused deputy. NOT authentication.
+ *
+ * This API is deliberately unauthenticated on the LAN (the file header, and the
+ * design notes): anyone who can open TCP port 80 is trusted. The attacker these
+ * checks stop is not that person — it is a hostile WEB PAGE running in a LAN
+ * user's browser. Such a page can make the browser fire "simple" POSTs at this
+ * box with no CORS preflight (classic CSRF), and with DNS rebinding it can even
+ * re-resolve its own hostname to this box's address and read the answers. Left
+ * alone, one opened link could drive every state-changing endpoint — up to and
+ * including POST /api/ota with an attacker-hosted image URL. Two independent
+ * checks make the browser useless as a proxy while changing nothing about who
+ * may talk to the box directly:
+ *
+ * 1. HOST, for the whole /api tree (host_is_this_box below). A DNS-rebound
+ *    request necessarily carries the ATTACKER's hostname in Host: — the browser
+ *    fills that header from the URL bar and no page can forge it. Answering
+ *    /api only under names that genuinely mean this box makes a rebound request
+ *    identifiable and refusable regardless of what the attacker's DNS answered.
+ *
+ * 2. CONTENT-TYPE, for every /api POST. The types a cross-origin page may send
+ *    without a preflight are text/plain and the two form encodings — so JSON
+ *    routes demand application/json and the two raw upload routes demand
+ *    application/octet-stream, both of which force the browser to preflight
+ *    with OPTIONS first. This server never answers OPTIONS, the preflight
+ *    fails, and the real request is never sent. DELETE needs no such rule: the
+ *    method itself is never "simple", so the preflight is built into the verb.
+ *    GETs are all side-effect-free here (kept that way on purpose — a mutating
+ *    GET would dodge both checks).
+ *
+ * curl and scripts merely have to state the Content-Type they were in practice
+ * already sending; docs/API.md spells both requirements out.
+ */
+
+/*
+ * Does the Host header name THIS box? Two callers, one meaning:
+ *
+ * For the /api guard above it is the DNS-rebinding check. For static_router it
+ * is the captive-portal detection, by HOST rather than by path — the obvious
+ * implementation, a list of known probe paths to redirect, is what that
+ * originally was, and it FLAPPED on iOS: every OS probes several URLs (Apple
+ * alone uses /hotspot-detect.html and /library/test/success.html), and a path
+ * list that catches one but not the other answers 302 (captive!) to some
+ * probes and 200 with the SPA (not captive!) to others, so the sheet opened
+ * and closed in a loop. Matching Host is exhaustive by construction: any
+ * request NOT addressed to this box is, by definition, aimed at somewhere on
+ * the real internet.
+ *
+ * Accepted, each with or without an explicit :port and a trailing FQDN dot:
+ * the mDNS hostname with and without .local (a home router's DNS often serves
+ * the bare DHCP name), the softAP IP and the STA IP.
+ */
+static bool host_is_this_box(httpd_req_t *req)
+{
+    char host[80];
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK)
+        return true;   /* no Host header (HTTP/1.0 tooling): browsers always
+                        * send one, and the deputy we distrust is a browser —
+                        * never redirect (or refuse) blindly */
+
+    char *colon = strchr(host, ':');   /* strip :port — same box, any port */
+    if (colon) *colon = '\0';
+    size_t hl = strlen(host);          /* strip the FQDN's trailing dot */
+    if (hl && host[hl - 1] == '.') host[hl - 1] = '\0';
+
+    const char *name = s_cfg->hostname[0] ? s_cfg->hostname : "klingelbox";
+    if (strcasecmp(host, name) == 0)
+        return true;
+    char mdns_name[LE_HOSTNAME_CMP_MAX];
+    snprintf(mdns_name, sizeof(mdns_name), "%s.local", name);
+    if (strcasecmp(host, mdns_name) == 0)
+        return true;
+
+    /* The EFFECTIVE softAP address first (it may differ from the stored one
+     * after a subnet-collision hop, wifi_mgr.h), the stored one as the
+     * before-the-netif-is-up fallback. */
+    char ip[16];
+    db_wifi_ap_ip(ip);
+    const char *ap_ip = ip[0] ? ip : s_cfg->ap_ip;
+    if (ap_ip[0] && strcmp(host, ap_ip) == 0)
+        return true;
+
+    char sta_ip[16];
+    db_wifi_sta_ip(sta_ip);
+    if (sta_ip[0] && strcmp(host, sta_ip) == 0)
+        return true;
+
+    return false;
+}
+
+/* True when the request's Content-Type is `want`, tolerating parameters:
+ * "application/json; charset=utf-8" matches "application/json". A MISSING
+ * header does not match — absence is exactly what a cross-origin "simple"
+ * request may look like, so it gets no benefit of the doubt. */
+static bool content_type_is(httpd_req_t *req, const char *want)
+{
+    char ct[96];
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", ct, sizeof(ct)) != ESP_OK)
+        return false;
+    size_t n = strcspn(ct, ";");
+    while (n && (ct[n - 1] == ' ' || ct[n - 1] == '\t')) n--;
+    return n == strlen(want) && strncasecmp(ct, want, n) == 0;
+}
+
+/* The one gate every /api router passes through. True = proceed; false = the
+ * 403/415 has already been sent. See the threat-model comment above. */
+static bool api_request_allowed(httpd_req_t *req)
+{
+    if (!host_is_this_box(req)) {
+        send_error(req, "403 Forbidden",
+                   "the Host header does not name this box, so the request was "
+                   "refused (DNS-rebinding protection, not authentication) — "
+                   "use the box's hostname or one of its IP addresses");
+        return false;
+    }
+
+    if (req->method == HTTP_POST) {
+        bool upload = uri_is(req->uri, "/api/ota/upload") ||
+                      uri_is(req->uri, "/api/ota/webui/upload");
+        const char *want = upload ? "application/octet-stream" : "application/json";
+        if (!content_type_is(req, want)) {
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                     "this endpoint requires \"Content-Type: %s\" "
+                     "(cross-site request forgery protection, not authentication) "
+                     "— add the header and retry", want);
+            send_error(req, "415 Unsupported Media Type", msg);
+            return false;
+        }
+    }
+    return true;
+}
+
 /* ------------------------------------------------------------------ routers */
 
 static esp_err_t get_router(httpd_req_t *req)
 {
+    if (!api_request_allowed(req)) return ESP_OK;
+
     const char *u = req->uri;
     char tail[24];
 
@@ -2836,6 +3065,8 @@ static esp_err_t get_router(httpd_req_t *req)
 
 static esp_err_t post_router(httpd_req_t *req)
 {
+    if (!api_request_allowed(req)) return ESP_OK;
+
     const char *u = req->uri;
     char tail[24];
 
@@ -2900,6 +3131,8 @@ static esp_err_t post_router(httpd_req_t *req)
 
 static esp_err_t delete_router(httpd_req_t *req)
 {
+    if (!api_request_allowed(req)) return ESP_OK;
+
     const char *u = req->uri;
     char tail[24];
 
@@ -2938,51 +3171,6 @@ static const char *content_type_for(const char *path)
     if (!strcasecmp(dot, ".txt"))  return "text/plain";
     if (!strcasecmp(dot, ".webmanifest")) return "application/manifest+json";
     return "text/plain";
-}
-
-/*
- * Captive-portal detection, by HOST rather than by path.
- *
- * The obvious implementation — a list of known probe paths to redirect — is what
- * this originally did, and it FLAPPED on iOS: the sheet opened and closed in a
- * loop. The reason is that every OS probes several URLs, and Apple alone uses
- * both /hotspot-detect.html and /library/test/success.html. A path list that
- * catches one but not the other answers 302 (captive!) to some probes and 200
- * with the SPA (not captive!) to others, and the phone oscillates between those
- * two verdicts forever.
- *
- * Matching the Host header instead is exhaustive by construction: any request
- * NOT addressed to this box is, by definition, a probe for somewhere on the real
- * internet, and gets redirected — no list to keep current, and every OS (iOS,
- * Android's generate_204, Windows NCSI) is handled by the same three lines.
- * Requests addressed to us are served normally, which is what lets the portal
- * page itself and its CSS/JS load once the sheet is open.
- */
-static bool host_is_this_box(httpd_req_t *req, const char *ap_ip)
-{
-    char host[80];
-    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK)
-        return true;   /* no Host (HTTP/1.0): assume ours, never redirect blindly */
-
-    char *colon = strchr(host, ':');   /* strip :port */
-    if (colon) *colon = '\0';
-
-    if (ap_ip && strcmp(host, ap_ip) == 0)
-        return true;
-
-    /* Reachable by mDNS name too, on the LAN side. */
-    char mdns_name[LE_HOSTNAME_CMP_MAX];
-    snprintf(mdns_name, sizeof(mdns_name), "%s.local",
-             s_cfg->hostname[0] ? s_cfg->hostname : "klingelbox");
-    if (strcasecmp(host, mdns_name) == 0)
-        return true;
-
-    char sta_ip[16];
-    db_wifi_sta_ip(sta_ip);
-    if (sta_ip[0] && strcmp(host, sta_ip) == 0)
-        return true;
-
-    return false;
 }
 
 static bool client_accepts_gzip(httpd_req_t *req)
@@ -3040,7 +3228,7 @@ static esp_err_t static_router(httpd_req_t *req)
         char ip[16];
         db_wifi_ap_ip(ip);
         const char *ap_ip = ip[0] ? ip : s_cfg->ap_ip;
-        if (!host_is_this_box(req, ap_ip)) {
+        if (!host_is_this_box(req)) {
             char loc[40];
             snprintf(loc, sizeof(loc), "http://%s/", ap_ip);
             httpd_resp_set_status(req, "302 Found");

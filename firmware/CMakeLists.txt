@@ -17,7 +17,7 @@ set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/components")
 
 # Single source of truth for the version, stamped into
 # esp_app_get_description()->version and reported by GET /api/system.
-set(PROJECT_VER "0.6.0")
+set(PROJECT_VER "0.7.0")
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(klingelbox)

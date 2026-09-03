@@ -70,6 +70,29 @@ static inline uint8_t rf_frame_level_at(const rf_frame_t *f, uint16_t i)
 bool rf_frame_similar(const rf_frame_t *a, const rf_frame_t *b,
                       uint8_t tolerance_pct, uint16_t tolerance_us);
 
+/*
+ * Echo-tolerant variant for TX echo suppression, where `sent` is a frame WE
+ * transmitted and `heard` is a frame just captured off the air. The verbatim
+ * comparison above is structurally wrong for that job: when `sent` ends in a
+ * low pulse at least as long as the receiver's idle threshold — a synthesized
+ * EV1527 frame carries its own 31x-base framing gap, ~10.85 ms at the default
+ * 350 us base against an 8 ms threshold — an echo of it can never be captured
+ * whole. That trailing low is exactly what TERMINATES the reception, and the
+ * capture path drops the terminating silence, so the echo arrives one pulse
+ * short of what was sent and an equal-count comparison never matches.
+ *
+ * This function therefore accepts either the verbatim match (rf_frame_similar)
+ * or `heard` matching `sent` with such a trailing gap stripped. The "is the gap
+ * long enough to have been truncated" test is widened by the same per-pulse
+ * tolerance window, because the echoing device re-times the gap with its own
+ * oscillator; the widening cannot cause false suppression, since every
+ * remaining pulse must still agree. `capture_idle_us` is the RX idle threshold
+ * currently in force; passing 0 disables the stripped form entirely.
+ */
+bool rf_frame_similar_tx_echo(const rf_frame_t *sent, const rf_frame_t *heard,
+                              uint8_t tolerance_pct, uint16_t tolerance_us,
+                              uint32_t capture_idle_us);
+
 #ifdef __cplusplus
 }
 #endif

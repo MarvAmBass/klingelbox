@@ -36,7 +36,8 @@ extern "C" {
  * both accepted (HTTPS is verified against the ESP-IDF certificate bundle).
  * Returns ESP_OK if the task was created — NOT that the update succeeded; the
  * device reboots either way. ESP_ERR_INVALID_STATE if another update is running
- * or the home Wi-Fi is down. */
+ * or the home Wi-Fi is down; ESP_ERR_INVALID_ARG for an empty URL or one longer
+ * than DB_UPDATE_URL_MAX-1 (a truncated URL must fail here, not mid-fetch). */
 esp_err_t db_ota_start(const char *url);
 
 /* Web-UI OTA: fetch a raw `storage.bin` SPIFFS image from `url` and write it to

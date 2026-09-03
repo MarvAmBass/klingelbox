@@ -56,9 +56,16 @@ static size_t parse_qname(const uint8_t *buf, size_t len, size_t off,
                           char *out, size_t out_sz)
 {
     size_t o = 0;
+    size_t wire = 1;                      /* on-wire name bytes; 1 = root label */
     while (off < len && buf[off]) {
         uint8_t l = buf[off++];
         if (l & 0xc0) return 0;           /* no compression in questions */
+        /* RFC 1035 caps a name at 255 wire octets. The 128-byte cap below only
+         * bounds the dotted-string COPY, not how far `off` walks — and the
+         * caller sizes its reply from `off` — so the wire length must be
+         * bounded here, not just the copy. */
+        wire += 1u + l;
+        if (wire > 255) return 0;
         for (int i = 0; i < l && off < len; i++) {
             if (o + 1 < out_sz) out[o++] = buf[off];
             off++;
@@ -101,7 +108,12 @@ static void dns_task(void *arg)
 
         char name[128];
         size_t qend = parse_qname(rx, n, sizeof(dns_header_t), name, sizeof(name));
-        if (!qend || qend + 4 > (size_t)n) continue;   /* need QTYPE + QCLASS */
+        /* The question must carry QTYPE + QCLASS, and the reply — the echoed
+         * header + question plus the fixed 16-byte answer appended below — must
+         * fit tx. parse_qname's 255-byte name cap already guarantees the
+         * latter; this check keeps the tx bound even if that cap changes. */
+        if (!qend || qend + 4 > (size_t)n) continue;
+        if (qend + 4 + 16 > sizeof(tx)) continue;
         uint16_t qtype = (rx[qend] << 8) | rx[qend + 1];
         size_t question_len = (qend + 4) - sizeof(dns_header_t);
 

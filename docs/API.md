@@ -18,8 +18,23 @@ written against this document; neither may invent endpoints.
   are documented at the endpoint that produces them.
 * A response that is too large to build on the free heap is a **503** with an
   `error` sentence, never a silently empty body.
-* `POST` bodies are JSON unless stated otherwise (the OTA upload routes take raw
-  binary).
+* `POST` bodies are JSON unless stated otherwise, and **every `POST` must carry
+  `Content-Type: application/json`** (a `; charset=...` suffix is fine) — even
+  when the body is `{}` or empty. The two OTA upload routes are the exception:
+  they take the raw `.bin` and require `Content-Type: application/octet-stream`.
+  Anything else, including a missing header, is a **415**.
+* Every `/api` request must carry a **`Host` header that names this box**: the
+  hostname with or without `.local`, its LAN (STA) IP, or its softAP IP — each
+  with or without a `:port`. Any other value is a **403**.
+
+**Why the Host and Content-Type rules exist.** They are *not* authentication —
+the box deliberately stays open to everyone on the LAN. They stop a hostile web
+page in a LAN user's browser from driving the API by proxy: the required
+content types are ones a cross-origin page cannot send without a CORS preflight
+the box never answers (which defeats CSRF), and refusing foreign `Host` values
+defeats DNS rebinding, where an attacker's own hostname is re-pointed at the
+box's address. The box's web UI and any direct client — `curl`, scripts, Home
+Assistant — pass both rules by simply stating the `Content-Type` they send.
 
 ---
 
@@ -150,7 +165,24 @@ hand-edited one would poison matching.
 * **400** — bad name, missing/empty `durations_us`, more than 512 pulses, or a
   duration outside 1..65535 µs (the message names the offending index).
 * **413** — body over 8192 bytes. This route takes one waveform, not a file.
-* **507** — the signal store is full (32 signals).
+* **507** — the box is out of room, in either of two distinct ways (see below):
+  the signal store is at its cap (`"the signal store is full (32 signals)…"`),
+  or the NVS partition has no space for this waveform (`"…its storage may be
+  full or worn out"`). Same status — both mean "delete signals, then retry" —
+  distinguishable by the message, for a bundle importer that must tell "at the
+  signal cap" apart from "out of flash for this amount of waveform data".
+
+**Two ways the store gets full.** The 32-signal cap is one limit; the NVS
+partition holding the waveforms is the other, and long raw recordings (up to
+512 pulses ≈ 1 KB each) can exhaust it first — especially on boxes still on
+the original 24 KB NVS partition, which an OTA update can never enlarge (the
+partition table is only written by a full flash). Every path that adds a
+signal — capture save, raw-session save, `virtual`, `import` — checks the
+partition's free space **before writing** and refuses with an explicit
+storage-full error while there is still headroom left for configuration and
+graph saves, so filling the signal store cannot break the rest of the box's
+persistence. The cure for both limits is the same: delete signals you no
+longer need (deleting is designed to work even on a completely full store).
 
 ---
 
@@ -270,7 +302,7 @@ mis-decoded — it is *invisible*, with nothing said about it anywhere.
 | RSSI squelch | −75 dBm, fixed | `rssi_floor_dbm`, default −80, `-120` = off |
 | minimum frame length | 32 pulses | `min_pulses`, 2–64, default 4 |
 | frame boundary (idle) | 8000 µs, fixed | `idle_us`, 1000–32000, default 8000 |
-| burst coalescing | 250 ms window, fuzzy merge | none — every frame kept separately |
+| burst coalescing | 250 ms after the last copy, fuzzy merge | none — every frame kept separately |
 
 A session holds **32 frames in RAM, never flash**, and stops when the slots are
 full or the time runs out, whichever comes first. Stopping does **not** free the
@@ -627,7 +659,12 @@ Six things follow from it being a control action rather than a traversal:
   child costs no more flash than an automation flapping the switch does.
 * **One press is one toggle.** A remote repeats its frame several times per
   press; `rf_service.c` coalesces those into a single burst before the graph sees
-  anything, so a press arrives once (with `repeats` counting the copies).
+  anything, so a press arrives once (with `repeats` counting the copies). This
+  holds for a *held* button too: the burst stays open as long as the repeats keep
+  coming and closes 250 ms after the last one, so leaning on the button is still
+  one toggle. Only a transmitter keying continuously for over five seconds is
+  force-flushed and starts a new burst — a stuck fob shows up as one event every
+  five seconds rather than never (or as a storm).
 * **If the same signal also drives a `signal.rx` node, both happen** — the rx
   node fires its chain *and* the switch flips. That is correct, and it is the
   same thing `source.any_rf` already does alongside a matching `signal.rx`. In
@@ -746,11 +783,17 @@ alike), and to `mqtt.base_topic` and `mqtt.discovery_prefix` on
 | a leading or trailing `/` | Legal MQTT, but it means an empty first or last topic level and here it is always a mistake. The box supplies the separators itself. |
 | an empty level (`a//b`) | Same reasoning. Refused rather than silently producing a topic nobody can read. |
 | longer than 47 characters | The field stores 48 bytes including the terminator. Checked before truncation, so an over-long value is refused rather than quietly cut short. |
+| **node topics only:** a first level of `status`, `button`, `trigger`, `switch`, `unknown`, `event` or `radio` | These are the levels the box itself publishes and listens under `<base>/` ([the topic map](mqtt.html#topic-map)). A `sink.mqtt` publishing to `trigger/x` lands on the box's **own** `<base>/trigger/x` subscription and starts a chain that fires itself forever. `mqtt.base_topic` and `mqtt.discovery_prefix` are exempt — they *are* the namespace, so `base_topic: "trigger"` is odd but harmless. |
 
 An **empty** value is always accepted: emptiness is the caller's business, not a
 syntax question. On a node it means "no topic"; on `base_topic` and
 `discovery_prefix` it means "use the default" (`klingelbox` and `homeassistant`),
 which is the behaviour those fields have always had.
+
+A reserved topic **already stored** by an older firmware does not break the
+graph: the node keeps firing and keeps feeding `<base>/event`, only its
+own-topic publish is skipped, and the activity log says so once per boot. Edit
+the node's topic to restore the publish.
 
 Values are trimmed of surrounding whitespace before both validation and storage,
 so the string that is checked is the string that is stored. The web UI applies
@@ -758,7 +801,8 @@ the identical rule as you type, so the same message appears before anything is
 sent.
 
 ```
-$ curl -sX POST http://klingelbox.local/api/graph/nodes/3 -d '{"topic":"a/#"}'
+$ curl -sX POST http://klingelbox.local/api/graph/nodes/3 \
+       -H "Content-Type: application/json" -d '{"topic":"a/#"}'
 {"error":"\"topic\" contains '#', which is an MQTT wildcard. A message cannot be
 published to a topic containing '#' or '+' — the broker refuses it."}
 ```
@@ -788,6 +832,11 @@ that to a `signal.tx` node carrying the virtual signal.
 ### `POST /api/graph/nodes` — a node object without `id`; returns the created node.
 ### `POST /api/graph/nodes/{id}` — partial update.
 ### `DELETE /api/graph/nodes/{id}` — also removes its links.
+
+Every graph mutation persists before it reports success, and **an error reply
+means nothing changed**: if the flash write fails, the in-RAM graph is rolled
+back too, so a failed delete leaves the node present (and retryable) rather
+than gone-until-reboot.
 ### `POST /api/graph/nodes/{id}/fire` — test-fire (or trigger a `source.virtual`).
 ### `POST /api/graph/nodes/{id}/switch` — `{"on":true}` on a `logic.switch`; see above.
 ### `POST /api/graph/links` — `{"from":1,"to":2}`
@@ -874,6 +923,18 @@ is refused with `400 Bad Request` naming the field, and **nothing else in the
 request body is applied**: this handler is checked before it mutates anything,
 so a rejected topic cannot leave the Wi-Fi half of a POST saved and the MQTT half
 not. Both may be empty, which means "use the default" as it always has.
+
+**MQTT changes apply live — no reboot.** When the POST changed any MQTT
+connection or namespace field (`enabled`, `host`, `port`, `user`, `password`,
+`base_topic`, `discovery_prefix`), the bridge is restarted from the new values
+before the response is sent: while still connected it first clears its retained
+Home Assistant discovery, switch states and telemetry under the **old**
+base/prefix (so a renamed base leaves no ghost device on the broker), then
+reconnects, re-subscribes and re-announces under the new ones. Enabling and
+disabling behave the same way — disabling stops the bridge cleanly and removes
+its discovery. Toggling only `homeassistant` re-announces (publishing or
+retiring the discovery set) without dropping the broker connection. See
+[Changing MQTT settings](mqtt.html#changing-mqtt-settings-at-runtime).
 
 `ota.url` is the app image URL this box will use for a manual update; it is
 writable and defaults to the stable release asset, so nobody has to type a GitHub

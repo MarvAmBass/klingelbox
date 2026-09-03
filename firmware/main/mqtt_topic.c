@@ -86,6 +86,60 @@ bool db_mqtt_topic_valid(const char *topic, const char *field, size_t max_len,
     return true;
 }
 
+/*
+ * First topic levels the bridge owns under <base>/. SOURCE OF TRUTH: the
+ * "TOPIC MAP" comment at the top of mqtt_bridge.c — this list is every first
+ * level that map subscribes to or publishes on, nothing more and nothing less.
+ * (status, event and radio have no '/' in the map; they are still first levels
+ * and still collide, because "status/loud" would shadow nothing today but the
+ * bare "status" topic itself is one of ours.)
+ */
+static const char *const RESERVED_LEVELS[] = {
+    "status",    /* <base>/status — availability + LWT                       */
+    "button",    /* <base>/button/<slug>/state|press                         */
+    "trigger",   /* <base>/trigger/<suffix> — SUBSCRIBED: the loop starter   */
+    "switch",    /* <base>/switch/<suffix>/set|state — /set is SUBSCRIBED    */
+    "unknown",   /* <base>/unknown, <base>/unknown/state                     */
+    "event",     /* <base>/event — every node firing                         */
+    "radio",     /* <base>/radio — retained telemetry                        */
+};
+
+const char *db_mqtt_topic_reserved_level(const char *topic)
+{
+    if (!topic || !topic[0])
+        return NULL;
+    const char *slash = strchr(topic, '/');
+    size_t flen = slash ? (size_t)(slash - topic) : strlen(topic);
+    for (size_t i = 0; i < sizeof(RESERVED_LEVELS) / sizeof(RESERVED_LEVELS[0]); i++) {
+        if (flen == strlen(RESERVED_LEVELS[i]) &&
+            strncmp(topic, RESERVED_LEVELS[i], flen) == 0)
+            return RESERVED_LEVELS[i];
+    }
+    return NULL;
+}
+
+bool db_mqtt_node_topic_valid(const char *topic, const char *field,
+                              size_t max_len, char *err, size_t errsz)
+{
+    if (!db_mqtt_topic_valid(topic, field, max_len, err, errsz))
+        return false;
+    if (!field) field = "topic";
+
+    const char *rsv = db_mqtt_topic_reserved_level(topic);
+    if (rsv) {
+        if (errsz)
+            snprintf(err, errsz,
+                     "\"%s\" starts with \"%s\", a topic level the box itself "
+                     "publishes and listens under. A node publishing there "
+                     "would feed the box its own messages back — at worst a "
+                     "chain that fires itself forever. Choose a first level "
+                     "of your own.",
+                     field, rsv);
+        return false;
+    }
+    return true;
+}
+
 /* Lowercase alphanumerics survive; every other byte becomes '_', runs collapse,
  * and leading/trailing separators are trimmed. Multi-byte UTF-8 (an umlaut in a
  * signal name) degrades to a single '_' rather than mangling the topic.

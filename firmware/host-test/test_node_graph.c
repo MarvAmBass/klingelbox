@@ -18,10 +18,22 @@
  *    means it can be pinned down completely here instead of by poking a live
  *    box.
  *
- * Neither of these needs ESP-IDF, and both are compiled against two tiny stubs
- * (see stubs/) rather than the framework. If that stops working it is worth
- * knowing about: it means node_graph.h has grown a real dependency and this
- * safety net has a hole in it.
+ * 3. PERSISTENCE AND ROLLBACK. node_graph.c and signal_store.c themselves,
+ *    linked against a fake in-RAM NVS (stubs/host_env.c) that can be told to
+ *    fill up or to fail its next write. What is pinned down here is the
+ *    discipline that keeps RAM and flash telling the same story: a mutation
+ *    that cannot be saved is rolled back rather than surviving until reboot
+ *    un-happens it; a delete commits the index before erasing the waveform so
+ *    a power cut leaves an invisible orphan, never a listed signal that
+ *    errors on use; the boot-time reconciliation cleans up both halves of an
+ *    interrupted delete without ever touching data a DIFFERENT firmware wrote;
+ *    and the store-full budget refuses an add while every other save on the
+ *    box still has room to keep working.
+ *
+ * None of this needs ESP-IDF: everything is compiled against the stubs in
+ * stubs/ rather than the framework. If a source file here ever needs a stub
+ * that is not a fair model of the real thing, that is the moment to stop and
+ * reconsider, not to fatten the fake.
  *
  * Build and run:  make test
  */
@@ -29,9 +41,13 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "esp_err.h"
+#include "host_env.h"
 #include "mqtt_topic.h"
 #include "node_graph.h"
 #include "node_migrate.h"
+#include "nvs.h"
+#include "signal_store.h"
 
 /* ---- micro test harness (same shape as test_rf_decode.c) ----------------- */
 
@@ -515,6 +531,86 @@ static void test_topic_reporting(void)
     CHECK(!db_mqtt_topic_valid("a/#", "topic", 47, e, 0), "refused with no buffer");
 }
 
+/*
+ * The reserved-namespace rule for NODE topics. A sink.mqtt publishes to
+ * <base>/<topic>, so a topic whose first level is one the bridge itself
+ * subscribes under — "trigger/x" being the killer — publishes onto the box's
+ * own subscription and self-fires forever. The list's source of truth is the
+ * TOPIC MAP in mqtt_bridge.c; this test pins every level in it, so growing
+ * the map without growing the validator fails HERE, not in a user's kitchen.
+ */
+static void test_topic_reserved(void)
+{
+    CASE("topic: reserved namespaces");
+
+    char e[224];
+
+    /* Every level of the bridge's topic map, bare and with a subpath. */
+    static const char *const RESERVED[] = {
+        "status", "button", "trigger", "switch", "unknown", "event", "radio",
+    };
+    for (size_t i = 0; i < sizeof(RESERVED) / sizeof(RESERVED[0]); i++) {
+        const char *lvl = RESERVED[i];
+        char with_sub[64];
+        snprintf(with_sub, sizeof(with_sub), "%s/x", lvl);
+
+        CHECK(!db_mqtt_node_topic_valid(lvl, "topic", 47, e, sizeof(e)),
+              "'%s' must be refused as a node topic", lvl);
+        CHECK(strstr(e, lvl) != NULL,
+              "'%s': message must name the colliding level, got: %s", lvl, e);
+        CHECK(!db_mqtt_node_topic_valid(with_sub, "topic", 47, e, sizeof(e)),
+              "'%s' must be refused as a node topic", with_sub);
+
+        /* The PLAIN validator must keep accepting them: the base topic and the
+         * discovery prefix ARE the namespace and may be called anything. */
+        CHECK(db_mqtt_topic_valid(lvl, "mqtt.base_topic", 47, e, sizeof(e)),
+              "'%s' stays legal as a base topic", lvl);
+
+        /* And the lookup names the level, for the bridge's skip-and-log path. */
+        CHECK(db_mqtt_topic_reserved_level(lvl) != NULL &&
+              strcmp(db_mqtt_topic_reserved_level(lvl), lvl) == 0,
+              "reserved_level('%s') must return the level itself", lvl);
+    }
+
+    /* Only the WHOLE first level collides: prefixes, suffixes and deeper
+     * appearances of a reserved word are all fine. */
+    TOPIC_OK("triggers");
+    TOPIC_OK("my_trigger");
+    TOPIC_OK("front/trigger");        /* second level: not ours */
+    TOPIC_OK("statusx");
+    TOPIC_OK("eventual");
+    CHECK(db_mqtt_node_topic_valid("triggers/x", "topic", 47, e, sizeof(e)),
+          "'triggers/x' is not reserved: %s", e);
+    CHECK(db_mqtt_node_topic_valid("front", "topic", 47, e, sizeof(e)),
+          "'front' is not reserved: %s", e);
+    CHECK(db_mqtt_topic_reserved_level("triggers/x") == NULL,
+          "'triggers' first level is not reserved");
+    CHECK(db_mqtt_topic_reserved_level("front/trigger") == NULL,
+          "a reserved word below the first level does not collide");
+    CHECK(db_mqtt_topic_reserved_level(NULL) == NULL, "NULL has no level");
+    CHECK(db_mqtt_topic_reserved_level("") == NULL, "empty has no level");
+
+    /* The node validator still applies every plain rule first. */
+    CHECK(!db_mqtt_node_topic_valid("a/#", "topic", 47, e, sizeof(e)),
+          "wildcards stay refused through the node validator");
+    CHECK(strstr(e, "wildcard") != NULL, "with the wildcard message: %s", e);
+    CHECK(db_mqtt_node_topic_valid("", "topic", 47, e, sizeof(e)),
+          "empty stays the caller's business");
+    CHECK(db_mqtt_node_topic_valid(NULL, "topic", 47, e, sizeof(e)),
+          "NULL stays valid (empty)");
+    e[0] = 'X'; e[1] = '\0';
+    CHECK(db_mqtt_node_topic_valid("front_gate", "topic", 47, e, sizeof(e)),
+          "an ordinary topic passes the node validator");
+    CHECK(e[0] == '\0', "and leaves no stale message");
+
+    /* A NULL field name must not crash and must still produce a message. */
+    CHECK(!db_mqtt_node_topic_valid("trigger", NULL, 47, e, sizeof(e)), "refused");
+    CHECK(e[0] != '\0', "a NULL field name still produces a message");
+    /* A zero-size error buffer must be tolerated, not written to. */
+    CHECK(!db_mqtt_node_topic_valid("trigger/x", "topic", 47, e, 0),
+          "refused with no buffer");
+}
+
 /* ---- 4. the switch suffix resolver --------------------------------------- */
 
 /*
@@ -869,6 +965,321 @@ static void test_switch_reacts_in_both_positions(void)
           "a switch taken off MQTT must still react to its control signal");
 }
 
+/* ---- 3. persistence and rollback, against the fake NVS -------------------- */
+
+/* One imported test waveform: `pulses` alternating widths starting HIGH. The
+ * analysis code sees a plausible OOK-ish pattern; nothing here asserts on the
+ * analysis, only on what is stored and what survives failure. */
+static void make_frame(rf_frame_t *f, int pulses)
+{
+    rf_frame_reset(f);
+    f->first_level = 1;
+    f->count = (uint16_t)pulses;
+    for (int i = 0; i < pulses; i++)
+        f->durations_us[i] = (uint16_t)((i & 1) ? 900 : 300);
+}
+
+static esp_err_t add_signal(const char *name, int pulses, uint16_t *id_out)
+{
+    static rf_frame_t f;
+    make_frame(&f, pulses);
+    return db_signals_add_frame(&f, NULL, name, DB_ORIGIN_IMPORTED, id_out);
+}
+
+/* A fresh box: empty fake flash, forgotten resident state, one clean init. */
+static void store_fresh(void)
+{
+    host_nvs_reset();
+    db_signals_hosttest_reset();
+    CHECK(db_signals_init() == ESP_OK, "fresh init must succeed");
+}
+
+/* A reboot: resident state forgotten, flash kept exactly as it is. */
+static void store_reboot(void)
+{
+    db_signals_hosttest_reset();
+    CHECK(db_signals_init() == ESP_OK, "re-init (reboot) must succeed");
+}
+
+/* Does the frame blob for `id` exist on the fake flash right now? */
+static int frame_on_flash(uint16_t id)
+{
+    nvs_handle_t h;
+    if (nvs_open("dbsig", NVS_READONLY, &h) != ESP_OK)
+        return 0;
+    char key[16];
+    snprintf(key, sizeof(key), "f%u", (unsigned)id);
+    int present = (nvs_find_key(h, key, NULL) == ESP_OK);
+    nvs_close(h);
+    return present;
+}
+
+static void test_store_copy_accessors(void)
+{
+    CASE("signal store copy accessors");
+    store_fresh();
+
+    uint16_t id = 0;
+    CHECK(add_signal("Front door", 50, &id) == ESP_OK, "add must succeed");
+    CHECK(id == 1, "first id is 1, got %u", (unsigned)id);
+
+    db_signal_meta_t m;
+    memset(&m, 0, sizeof(m));
+    CHECK(db_signals_get_copy(id, &m) == ESP_OK, "get_copy finds it");
+    CHECK(strcmp(m.name, "Front door") == 0, "copy carries the name");
+    CHECK(m.pulse_count == 50, "copy carries the pulse count");
+    CHECK(db_signals_get_copy(999, &m) == ESP_ERR_NOT_FOUND,
+          "get_copy on a missing id says NOT_FOUND");
+
+    db_signal_meta_t snap[DB_SIGNAL_MAX];
+    CHECK(db_signals_snapshot(snap, DB_SIGNAL_MAX) == 1, "snapshot returns 1");
+    CHECK(snap[0].id == id, "snapshot holds the record");
+    CHECK(db_signals_snapshot(NULL, DB_SIGNAL_MAX) == 0, "NULL out is 0");
+}
+
+static void test_store_full_budget(void)
+{
+    CASE("store-full budget check");
+    store_fresh();
+
+    uint16_t id = 0;
+    CHECK(add_signal("First", 50, &id) == ESP_OK, "add fits while unlimited");
+
+    /* Leave less than the reserve free: the budget must refuse BEFORE writing
+     * anything, with the storage-full error, not a generic one. */
+    host_nvs_set_capacity(host_nvs_used_entries() + 100);
+    uint16_t id2 = 0;
+    CHECK(add_signal("Second", 50, &id2) == ESP_ERR_NVS_NOT_ENOUGH_SPACE,
+          "add into a near-full partition reports NOT_ENOUGH_SPACE");
+    CHECK(db_signals_count() == 1, "refused add changed nothing in RAM");
+    CHECK(!frame_on_flash(2), "refused add left no partial frame blob");
+
+    /* Not a wedge: room returns, the same add succeeds. */
+    host_nvs_set_capacity(0);
+    CHECK(add_signal("Second", 50, &id2) == ESP_OK, "add succeeds again");
+    CHECK(db_signals_count() == 2, "both signals stored");
+}
+
+static void test_store_add_rollback(void)
+{
+    CASE("add rolls back on index-save failure");
+    store_fresh();
+
+    /* The frame blob is set_blob #1 of an add, the index rewrite is #2. */
+    host_nvs_fail_set_blob(2, ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    uint16_t id = 0;
+    CHECK(add_signal("Doomed", 50, &id) == ESP_ERR_NVS_NOT_ENOUGH_SPACE,
+          "failed index save surfaces to the caller");
+    CHECK(db_signals_count() == 0, "RAM rolled back");
+    CHECK(!frame_on_flash(1), "the already-written frame blob was erased");
+
+    CHECK(add_signal("Kept", 50, &id) == ESP_OK, "the add is retryable");
+    store_reboot();
+    CHECK(db_signals_count() == 1, "exactly the retried signal survives");
+}
+
+static void test_delete_order_and_full_fallback(void)
+{
+    CASE("delete order + full-partition fallback");
+    store_fresh();
+
+    uint16_t a = 0, b = 0;
+    CHECK(add_signal("A", 50, &a) == ESP_OK, "add A");
+    CHECK(add_signal("B", 200, &b) == ESP_OK, "add B (long frame)");
+
+    /* The ordinary path: index first, then the frame. Both gone afterwards. */
+    CHECK(db_signals_delete(a) == ESP_OK, "delete A");
+    CHECK(!frame_on_flash(a), "A's frame erased");
+    db_signal_meta_t m;
+    CHECK(db_signals_get_copy(a, &m) == ESP_ERR_NOT_FOUND, "A gone from RAM");
+
+    /* The full-partition fallback: with zero entries free the index rewrite
+     * cannot go first (the new copy needs room beside the old), so delete
+     * frees the frame and retries — the store must always be dig-out-able. */
+    host_nvs_set_capacity(host_nvs_used_entries());
+    CHECK(db_signals_delete(b) == ESP_OK, "delete works on a FULL partition");
+    CHECK(!frame_on_flash(b), "B's frame erased");
+    CHECK(db_signals_count() == 0, "store empty in RAM");
+
+    host_nvs_set_capacity(0);
+    store_reboot();
+    CHECK(db_signals_count() == 0, "store empty after reboot too");
+}
+
+static void test_delete_rollback_when_nothing_committed(void)
+{
+    CASE("delete rolls back when flash refuses everything");
+    store_fresh();
+
+    uint16_t id = 0;
+    CHECK(add_signal("Sticky", 50, &id) == ESP_OK, "add");
+
+    /* Index save fails AND the frame erase fails: flash still holds the
+     * signal in full, so the delete must report failure and put RAM back —
+     * anything else is a signal that resurrects at the next boot. */
+    host_nvs_fail_set_blob(1, ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    host_nvs_fail_erase(1, ESP_FAIL);
+    CHECK(db_signals_delete(id) == ESP_ERR_NVS_NOT_ENOUGH_SPACE,
+          "delete reports the failure");
+    db_signal_meta_t m;
+    CHECK(db_signals_get_copy(id, &m) == ESP_OK, "signal still in RAM");
+    CHECK(frame_on_flash(id), "signal still on flash");
+
+    CHECK(db_signals_delete(id) == ESP_OK, "the delete is retryable");
+    CHECK(db_signals_count() == 0, "and then it is gone");
+}
+
+static void test_boot_reconcile_ghost_and_orphan(void)
+{
+    CASE("boot reconcile: ghosts and orphans");
+    store_fresh();
+
+    uint16_t a = 0, b = 0;
+    CHECK(add_signal("Ghost", 50, &a) == ESP_OK, "add A");
+    CHECK(add_signal("Survivor", 50, &b) == ESP_OK, "add B");
+
+    /* A power cut in delete()'s fallback path: frame erased, index not yet
+     * rewritten. Fake it by erasing the blob behind the store's back. */
+    nvs_handle_t h;
+    CHECK(nvs_open("dbsig", NVS_READWRITE, &h) == ESP_OK, "open dbsig");
+    CHECK(nvs_erase_key(h, "f1") == ESP_OK, "simulate the interrupted delete");
+    /* And the other half: an orphaned frame blob no index entry names. */
+    uint8_t junk[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    CHECK(nvs_set_blob(h, "f9", junk, sizeof(junk)) == ESP_OK, "plant orphan");
+    nvs_close(h);
+
+    store_reboot();
+    CHECK(db_signals_count() == 1, "ghost pruned: 1 signal left, got %d",
+          db_signals_count());
+    db_signal_meta_t m;
+    CHECK(db_signals_get_copy(b, &m) == ESP_OK, "the survivor survived");
+    CHECK(!frame_on_flash(9), "orphan blob swept");
+
+    static rf_frame_t f;
+    CHECK(db_signals_load_frame(b, &f) == ESP_OK, "survivor's frame loads");
+    CHECK(f.count == 50, "and is intact");
+
+    store_reboot();
+    CHECK(db_signals_count() == 1, "repairs are idempotent across boots");
+}
+
+static void test_reconcile_leaves_foreign_data_alone(void)
+{
+    CASE("reconcile never touches a foreign index's data");
+    store_fresh();
+
+    uint16_t id = 0;
+    CHECK(add_signal("Future", 50, &id) == ESP_OK, "add under this layout");
+
+    /* A NEWER firmware rewrote the index in a layout this build refuses to
+     * parse (the first header word is the version — that much of the format
+     * is frozen). The refusal loads an empty store ON PURPOSE, and the sweep
+     * must then keep its hands off the frame blobs: they belong to the
+     * firmware the user may roll forward to. */
+    uint32_t foreign_hdr[3] = { 99u, 96u, 1u };
+    nvs_handle_t h;
+    CHECK(nvs_open("dbsig", NVS_READWRITE, &h) == ESP_OK, "open dbsig");
+    CHECK(nvs_set_blob(h, "index", foreign_hdr, sizeof(foreign_hdr)) == ESP_OK,
+          "plant a newer-layout index");
+    nvs_close(h);
+
+    store_reboot();
+    CHECK(db_signals_count() == 0, "foreign index loads as empty");
+    CHECK(frame_on_flash(id), "but the frame blob was NOT swept");
+}
+
+/* ---- 4. graph mutation rollback, against the fake NVS --------------------- */
+
+static uint16_t graph_add(db_node_type_t type, const char *name)
+{
+    db_node_t n;
+    db_graph_node_defaults(&n, type);
+    snprintf(n.name, sizeof(n.name), "%s", name);
+    uint16_t id = 0;
+    CHECK(db_graph_add_node(&n, &id) == ESP_OK, "add node '%s'", name);
+    return id;
+}
+
+static int graph_link_count_snapshot(void)
+{
+    static db_link_t links[DB_LINK_MAX];
+    return db_graph_links_snapshot(links, DB_LINK_MAX);
+}
+
+static void test_graph_mutation_rollback(void)
+{
+    CASE("graph mutations roll back on failed saves");
+
+    /* One init for all the graph tests; the fake flash is empty, so the graph
+     * starts empty. (node ids and RAM state then flow test to test — each
+     * block below leaves the graph as it found it.) */
+    host_nvs_reset();
+    CHECK(db_graph_init() == ESP_OK, "graph init");
+    CHECK(db_graph_node_count() == 0, "starts empty");
+
+    uint16_t src  = graph_add(DB_NODE_SOURCE_VIRTUAL, "button");
+    uint16_t sink = graph_add(DB_NODE_SINK_MQTT, "publish");
+    CHECK(db_graph_add_link(src, sink) == ESP_OK, "wire them");
+
+    /* add_node: the failed save must not leave a phantom node in RAM. */
+    db_node_t n;
+    db_graph_node_defaults(&n, DB_NODE_SINK_MONITOR);
+    host_nvs_fail_set_blob(1, ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    uint16_t id = 0;
+    CHECK(db_graph_add_node(&n, &id) == ESP_ERR_NVS_NOT_ENOUGH_SPACE,
+          "failed add surfaces the error");
+    CHECK(db_graph_node_count() == 2, "failed add changed nothing");
+
+    /* delete_node: the failed save must put the node AND its links back —
+     * without this the node vanishes from the UI and broker but resurrects,
+     * links and all, at the next reboot. */
+    host_nvs_fail_set_blob(1, ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    CHECK(db_graph_delete_node(src) == ESP_ERR_NVS_NOT_ENOUGH_SPACE,
+          "failed delete surfaces the error");
+    db_node_t copy;
+    CHECK(db_graph_node_copy(src, &copy) == ESP_OK, "node still present");
+    CHECK(copy.id == src && copy.type == DB_NODE_SOURCE_VIRTUAL,
+          "and intact");
+    CHECK(graph_link_count_snapshot() == 1, "its link still present");
+
+    /* delete_link: same discipline, one entry. */
+    host_nvs_fail_set_blob(1, ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    CHECK(db_graph_delete_link(src, sink) == ESP_ERR_NVS_NOT_ENOUGH_SPACE,
+          "failed link delete surfaces the error");
+    CHECK(graph_link_count_snapshot() == 1, "link rolled back");
+
+    /* And every one of them is retryable once flash cooperates. */
+    CHECK(db_graph_delete_link(src, sink) == ESP_OK, "link delete retries");
+    CHECK(graph_link_count_snapshot() == 0, "link gone");
+    CHECK(db_graph_add_link(src, sink) == ESP_OK, "re-wire");
+    CHECK(db_graph_delete_node(src) == ESP_OK, "node delete retries");
+    CHECK(db_graph_node_copy(src, &copy) == ESP_ERR_NOT_FOUND, "node gone");
+    CHECK(graph_link_count_snapshot() == 0, "its link went with it");
+    CHECK(db_graph_delete_node(sink) == ESP_OK, "tidy up");
+}
+
+static void test_graph_delete_survives_failed_links_write(void)
+{
+    CASE("node delete is durable even if the links write fails");
+
+    /* db_graph_init already ran. The nodes blob decides existence; a failed
+     * LINKS rewrite after a committed nodes blob leaves only dangling links
+     * on flash, which the loader sweeps — so the delete must still report
+     * success and RAM must be fully consistent. */
+    uint16_t src  = graph_add(DB_NODE_SOURCE_VIRTUAL, "button2");
+    uint16_t sink = graph_add(DB_NODE_SINK_MQTT, "publish2");
+    CHECK(db_graph_add_link(src, sink) == ESP_OK, "wire them");
+
+    host_nvs_fail_set_blob(2, ESP_ERR_NVS_NOT_ENOUGH_SPACE);  /* nodes OK, links fail */
+    CHECK(db_graph_delete_node(src) == ESP_OK,
+          "delete succeeds — the node blob committed");
+    db_node_t copy;
+    CHECK(db_graph_node_copy(src, &copy) == ESP_ERR_NOT_FOUND, "node gone");
+    CHECK(graph_link_count_snapshot() == 0, "links gone from RAM");
+    CHECK(db_graph_delete_node(sink) == ESP_OK, "tidy up");
+    CHECK(db_graph_node_count() == 0, "graph empty again");
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 int main(void)
@@ -891,6 +1302,7 @@ int main(void)
     test_topic_slashes();
     test_topic_length();
     test_topic_reporting();
+    test_topic_reserved();
 
     test_slugify();
     test_node_suffix();
@@ -899,6 +1311,17 @@ int main(void)
     test_pretty_name();
     test_switch_reacts();
     test_switch_reacts_in_both_positions();
+
+    test_store_copy_accessors();
+    test_store_full_budget();
+    test_store_add_rollback();
+    test_delete_order_and_full_fallback();
+    test_delete_rollback_when_nothing_committed();
+    test_boot_reconcile_ghost_and_orphan();
+    test_reconcile_leaves_foreign_data_alone();
+
+    test_graph_mutation_rollback();
+    test_graph_delete_survives_failed_links_write();
 
     printf("---------------------\n");
     printf("%d checks passed, %d failed\n", g_pass, g_fail);

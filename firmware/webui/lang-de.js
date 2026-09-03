@@ -36,6 +36,7 @@ window.KLINGELBOX_DE = {
   "\"{field}\" is too long: {len} characters, the limit is {max}.": "„{field}“ ist zu lang: {len} Zeichen, das Limit liegt bei {max}.",
   "\"{field}\" must not end with '/' — a trailing slash makes an empty last topic level.": "„{field}“ darf nicht mit '/' enden — ein abschließender Schrägstrich erzeugt eine leere letzte Topic-Ebene.",
   "\"{field}\" must not start with '/' — a leading slash makes an empty first topic level. The box adds the separators itself.": "„{field}“ darf nicht mit '/' anfangen — ein führender Schrägstrich erzeugt eine leere erste Topic-Ebene. Die Box setzt die Trennzeichen selbst.",
+  "\"{field}\" starts with \"{level}\", a topic level the box itself publishes and listens under. A node publishing there would feed the box its own messages back — at worst a chain that fires itself forever. Choose a first level of your own.": "„{field}“ beginnt mit „{level}“, einer Topic-Ebene, unter der die Box selbst veröffentlicht und lauscht. Ein Node, der dorthin veröffentlicht, würde der Box ihre eigenen Nachrichten zurückspielen — schlimmstenfalls eine Kette, die sich endlos selbst auslöst. Wähle eine eigene erste Ebene.",
   "# and +": "# und +",
   ", and ": " und ",
   ", exported {when}": ", exportiert {when}",

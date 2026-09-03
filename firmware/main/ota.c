@@ -37,6 +37,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "update_check.h"   /* DB_UPDATE_URL_MAX */
 #include "wifi_mgr.h"
 
 static const char *TAG = "db_ota";
@@ -44,7 +45,24 @@ static const char *TAG = "db_ota";
 /* Shared guard: the app OTA, the web-UI OTA and a browser upload session are all
  * mutually exclusive — they compete for the same flash and the same radio. */
 static volatile bool s_running;
-static char s_url[160];
+/* Sized to the longest URL any caller can legally hand over: update_check.c
+ * delivers discovered asset URLs up to DB_UPDATE_URL_MAX. A URL that still does
+ * not fit is rejected in set_url() — fetching a silently truncated URL would
+ * fail with a baffling reboot instead of an error the user can act on. */
+static char s_url[DB_UPDATE_URL_MAX];
+
+/* Both URL entry points share this so neither can forget the truncation check. */
+static esp_err_t set_url(const char *url)
+{
+    if (!url || !url[0]) return ESP_ERR_INVALID_ARG;
+    if (strlcpy(s_url, url, sizeof(s_url)) >= sizeof(s_url)) {
+        s_url[0] = '\0';
+        ESP_LOGE(TAG, "OTA URL longer than %u bytes — refusing to fetch a "
+                      "truncated URL", (unsigned)sizeof(s_url) - 1);
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
 
 /* SPIFFS mount identity — must match the web UI's mount in http_api.c. */
 #define WEBUI_PART_LABEL  "storage"
@@ -93,13 +111,13 @@ static void ota_task(void *arg)
 esp_err_t db_ota_start(const char *url)
 {
     if (s_running) return ESP_ERR_INVALID_STATE;
-    if (!url || !url[0]) return ESP_ERR_INVALID_ARG;
     if (!db_wifi_sta_connected()) {
         ESP_LOGE(TAG, "app OTA needs the STA (home Wi-Fi) up — use the browser "
                       "upload instead when the box is only on its own AP");
         return ESP_ERR_INVALID_STATE;
     }
-    strlcpy(s_url, url, sizeof(s_url));
+    esp_err_t err = set_url(url);
+    if (err != ESP_OK) return err;
     s_running = true;
     if (xTaskCreate(ota_task, "db_ota", 8192, NULL, 5, NULL) != pdPASS) {
         s_running = false;
@@ -211,12 +229,12 @@ done:
 esp_err_t db_ota_webui_from_url(const char *url)
 {
     if (s_running) return ESP_ERR_INVALID_STATE;
-    if (!url || !url[0]) return ESP_ERR_INVALID_ARG;
     if (!db_wifi_sta_connected()) {
         ESP_LOGE(TAG, "web UI OTA needs the STA (home Wi-Fi) up");
         return ESP_ERR_INVALID_STATE;
     }
-    strlcpy(s_url, url, sizeof(s_url));
+    esp_err_t err = set_url(url);
+    if (err != ESP_OK) return err;
     s_running = true;
     if (xTaskCreate(webui_ota_task, "db_webui_ota", 8192, NULL, 5, NULL) != pdPASS) {
         s_running = false;

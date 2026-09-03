@@ -30,6 +30,7 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_random.h"
+#include "event_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 /* For DB_UPDATE_APP_URL — the ONE place the release repo is named (see
@@ -51,10 +52,52 @@ typedef struct {
 esp_err_t db_nvs_init(void)
 {
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_LOGW(TAG, "erasing NVS (%s) and re-initialising", esp_err_to_name(err));
+
+    /*
+     * The stock IDF example answers BOTH failure codes with nvs_flash_erase().
+     * On this appliance that is a data-destruction bug, because the partition
+     * is the user's whole world: Wi-Fi credentials, the generated AP pass,
+     * every learned signal, the node graph. The two codes mean very different
+     * things and must not share a fate:
+     *
+     * NEW_VERSION_FOUND — the partition holds a VALID store written in a newer
+     * on-flash format, i.e. a downgrade or rollback booted an older-IDF
+     * firmware after a newer one ran. The data is perfectly recoverable by the
+     * firmware that wrote it, and this codebase promises everywhere else
+     * (signal_store.c load_index, node_graph.c load_blob, db_config_load) that
+     * a rollback finds its data intact. So: leave the partition alone and
+     * return the error. Yes, the caller's ESP_ERROR_CHECK then halts the boot
+     * — deliberately. Running on without NVS is not an option (the Wi-Fi
+     * driver's init requires it and would panic anyway, with a message that
+     * points at the wrong culprit), and erasing would trade the user's entire
+     * configuration for one convenient boot of a DOWNGRADED firmware. A halt
+     * whose serial log names the fix — flash the newer firmware back — loses
+     * nothing and lies about nothing.
+     *
+     * NO_FREE_PAGES — no erased page exists for the GC to work with: the
+     * partition was truncated by a table change or is worn/corrupt. No
+     * firmware, past or future, can mount it as it stands, so erasing is the
+     * only path back to a working box. It still must not happen SILENTLY on a
+     * serial console nobody is watching — the event ring surfaces in the web
+     * UI, so the user gets told their settings are gone and why.
+     */
+    if (err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGE(TAG, "NVS was written in a NEWER on-flash format than this "
+                      "firmware understands. REFUSING to erase it: the stored "
+                      "settings and signals are intact and readable by the "
+                      "firmware that wrote them. Flash that (newer) firmware "
+                      "back to recover the device and its data.");
+        return err;
+    }
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES) {
+        ESP_LOGE(TAG, "NVS is unusable (no free pages — truncated or worn "
+                      "partition). Erasing and re-initialising; stored settings "
+                      "and signals are lost.");
         ESP_ERROR_CHECK(nvs_flash_erase());
         err = nvs_flash_init();
+        db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                       "Storage was unusable and had to be reset - "
+                       "settings and signals were lost");
     }
     return err;
 }

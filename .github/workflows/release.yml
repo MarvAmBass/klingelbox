@@ -128,11 +128,15 @@ jobs:
       # with "keep" and never re-stamp it.
       #
       # CRITICAL: the merge must NEVER include an nvs segment. Nothing is listed at
-      # 0x9000, so merge_bin leaves 0x9000..0xf000 as 0xFF padding — and that gap is
-      # exactly where the browser flasher injects its generated NVS config seed (Wi-Fi
-      # credentials etc.) before writing. Merging an nvs image here would overwrite
-      # that seed with an empty partition and silently break first-boot provisioning.
-      # The step after this one verifies the gap really is 0xFF in the produced file.
+      # 0x9000, so merge_bin leaves 0x9000..0x1d000 (the whole NVS partition —
+      # partitions.csv grew it from 0x6000 to 0x14000) as 0xFF padding. That window
+      # is reserved for the browser flasher to inject a generated NVS config seed
+      # (Wi-Fi credentials etc.) before writing; merging an nvs image here would
+      # overwrite that seed with an empty partition and silently break first-boot
+      # provisioning. The step after this one verifies the window really is 0xFF in
+      # the produced file. If the NVS partition moves or resizes again, update the
+      # offsets HERE, in the verify step, in the manifest's nvs_gap, and in ci.yml —
+      # they all describe the same partitions.csv fact.
       # -----------------------------------------------------------------------
       - name: Merge flashable image and collect OTA images
         working-directory: firmware
@@ -148,7 +152,7 @@ jobs:
           expected = {
               0x0:      "bootloader/bootloader.bin",
               0x8000:   "partition_table/partition-table.bin",
-              0xf000:   "ota_data_initial.bin",
+              0x1d000:  "ota_data_initial.bin",
               0x20000:  "klingelbox.bin",
               0x420000: "storage.bin",
           }
@@ -163,7 +167,7 @@ jobs:
             --flash_mode dio --flash_freq 80m --flash_size 16MB \
             0x0      "$BUILD/bootloader/bootloader.bin" \
             0x8000   "$BUILD/partition_table/partition-table.bin" \
-            0xf000   "$BUILD/ota_data_initial.bin" \
+            0x1d000  "$BUILD/ota_data_initial.bin" \
             0x20000  "$BUILD/klingelbox.bin" \
             0x420000 "$BUILD/storage.bin"
           # App-only image for POST /api/ota, and the web-UI image for
@@ -179,7 +183,11 @@ jobs:
         run: |
           python3 - <<'PY'
           import sys
-          START, END = 0x9000, 0xf000
+          # The FULL nvs partition from partitions.csv (0x9000, size 0x14000) —
+          # not merely the gap up to the next merged segment. Checking the whole
+          # window is what catches a partition-table edit that quietly slides
+          # otadata into what the flasher believes is reserved NVS space.
+          START, END = 0x9000, 0x1d000
           with open("dist/klingelbox-esp32s3-full.bin", "rb") as fh:
               fh.seek(START)
               gap = fh.read(END - START)
@@ -232,8 +240,9 @@ jobs:
               "idf_version": os.environ.get("IDF_VERSION", "v5.3.1"),
               "flash": {"size": "16MB", "mode": "dio", "freq": "80m"},
               # Deliberately left as 0xFF in the merged image so the browser flasher
-              # can inject a generated NVS config seed there before writing.
-              "nvs_gap": {"offset": "0x9000", "size": "0x6000"},
+              # can inject a generated NVS config seed there before writing. Matches
+              # the nvs partition in partitions.csv (grown from 0x6000 in v0.6.x).
+              "nvs_gap": {"offset": "0x9000", "size": "0x14000"},
               "assets": assets,
           }
           with open("dist/manifest.json", "w") as fh:

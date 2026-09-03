@@ -159,8 +159,10 @@ curl -X POST http://klingelbox.local/api/ota/webui \
 Or upload the files directly, without the device needing internet access:
 
 ```sh
-curl -X POST --data-binary @klingelbox.bin http://klingelbox.local/api/ota/upload
-curl -X POST --data-binary @storage.bin    http://klingelbox.local/api/ota/webui/upload
+curl -X POST -H 'Content-Type: application/octet-stream' \
+     --data-binary @klingelbox.bin http://klingelbox.local/api/ota/upload
+curl -X POST -H 'Content-Type: application/octet-stream' \
+     --data-binary @storage.bin    http://klingelbox.local/api/ota/webui/upload
 ```
 
 Both reboot on success. See the

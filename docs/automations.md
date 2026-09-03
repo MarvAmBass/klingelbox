@@ -243,6 +243,12 @@ label, fingerprint, RSSI, repeat count and the decode, if any. See
 For an unregistered burst arriving via `source.any_rf`, `signal_id` is `0` and `decoded`
 may be `null`. That is the normal case behind a proxy, not an error.
 
+The topic's **first level must be your own**: `status`, `button`, `trigger`, `switch`,
+`unknown`, `event` and `radio` are the levels the box itself publishes and listens under
+`<base>/`, and a node topic starting with one of them is refused — `trigger/x` would
+publish onto the box's own subscription and fire itself forever. See
+[the reserved-levels note](mqtt.html#topic-map).
+
 #### `sink.monitor`
 A sink that **acts on nothing**. Reaching it records a timestamp — no transmit, no publish,
 no pin — and the web UI turns that into a lamp that lights on every hit plus a rolling
@@ -285,13 +291,16 @@ Detection is now permissive and protocol-agnostic — everything the radio hands
 kept — and the box **ranks** instead of filtering:
 
 ```sh
-curl -X POST http://klingelbox.local/api/raw/start -d '{"seconds":30}'
+curl -X POST -H 'Content-Type: application/json' \
+     http://klingelbox.local/api/raw/start -d '{"seconds":30}'
 # press the remote several times, then:
 curl http://klingelbox.local/api/raw/candidates
 # try the top one at the bell, without storing anything:
-curl -X POST http://klingelbox.local/api/raw/candidates/1/transmit -d '{}'
+curl -X POST -H 'Content-Type: application/json' \
+     http://klingelbox.local/api/raw/candidates/1/transmit -d '{}'
 # keep it:
-curl -X POST http://klingelbox.local/api/raw/candidates/1/save -d '{"name":"Front door"}'
+curl -X POST -H 'Content-Type: application/json' \
+     http://klingelbox.local/api/raw/candidates/1/save -d '{"name":"Front door"}'
 ```
 
 **Repetition dominates the ranking.** A real remote sends the same word several times and
@@ -315,6 +324,7 @@ remote, invent a signal:
 
 ```sh
 curl -X POST http://klingelbox.local/api/signals/virtual \
+     -H 'Content-Type: application/json' \
      -d '{"name":"Upstairs chime","button":8,"base_us":350}'
 ```
 

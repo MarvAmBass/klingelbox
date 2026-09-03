@@ -375,14 +375,57 @@ typedef void (*db_sink_fn)(const db_node_t *node, const db_trigger_t *trig, void
 
 esp_err_t db_graph_init(void);
 
+/*
+ * THREADING CONTRACT FOR READERS.
+ *
+ * The pointer-returning accessors below hand out interior pointers into the
+ * live arrays, and db_graph_delete_node() compacts those arrays with
+ * element-by-element shifts under the engine's lock — a lock these accessors
+ * deliberately do not take, because taking it would not help: the pointer
+ * OUTLIVES the call, and it is the later dereferences that race the shift.
+ * A reader on another task can therefore see a record that is half node k and
+ * half node k+1, or watch its pointer quietly come to describe a different
+ * node (a switch announced under another node's topic, a retained state
+ * published for the wrong entity).
+ *
+ * So: the pointer accessors are for the ONE task that performs the mutations —
+ * the HTTP server task in this firmware — where nothing can shift the arrays
+ * between a call and the last dereference. Every other task (the MQTT bridge
+ * building subscriptions and announcements, the app's dispatch path) must use
+ * the _copy/_snapshot functions, which hold the lock for the whole copy and
+ * leave the caller with bytes nobody can mutate. The graph task itself walks
+ * the arrays under the lock and never through these accessors.
+ */
 int                db_graph_node_count(void);
-const db_node_t   *db_graph_nodes(void);
-const db_node_t   *db_graph_node(uint16_t id);
+const db_node_t   *db_graph_nodes(void);       /* HTTP task only — see above */
+const db_node_t   *db_graph_node(uint16_t id); /* HTTP task only — see above */
 int                db_graph_link_count(void);
-const db_link_t   *db_graph_links(void);
+const db_link_t   *db_graph_links(void);       /* HTTP task only — see above */
+
+/* Copy one node out under the lock. Safe from any task; ESP_ERR_NOT_FOUND if
+ * no such id (which a concurrent delete can make true at any moment — treat
+ * "not found" as an ordinary answer, not a bug). */
+esp_err_t db_graph_node_copy(uint16_t id, db_node_t *out);
+
+/* Copy up to `max` nodes/links out under the lock; returns how many were
+ * written. Each snapshot is internally consistent — taken in one critical
+ * section, so no record is ever half of two nodes — but it is a snapshot: the
+ * graph may change the moment it returns. That is exactly right for building
+ * MQTT subscription tables and Home Assistant announcements, because every
+ * mutation also queues a re-announce that will rebuild from a fresh snapshot.
+ * Note the two calls are separate critical sections: a link snapshot may name
+ * a node a concurrent delete just removed, the same dangling reference the
+ * loader already tolerates — resolve ids via db_graph_node_copy() and treat
+ * misses as gone. `out` must hold max records; DB_NODE_MAX / DB_LINK_MAX
+ * always suffice. */
+int db_graph_nodes_snapshot(db_node_t *out, int max);
+int db_graph_links_snapshot(db_link_t *out, int max);
 
 /* Mutation. All of these persist immediately — a doorbell that forgets its
- * wiring on power loss is worse than useless. */
+ * wiring on power loss is worse than useless. And all of them ROLL BACK the
+ * in-RAM change when the NVS write fails: an error return means the graph is
+ * exactly as it was, in RAM and on flash, never "gone until the next reboot
+ * resurrects it". */
 esp_err_t db_graph_add_node(const db_node_t *node, uint16_t *id_out);
 esp_err_t db_graph_update_node(const db_node_t *node);   /* matched by node->id */
 esp_err_t db_graph_delete_node(uint16_t id);             /* also drops its links */

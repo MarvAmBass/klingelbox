@@ -39,8 +39,22 @@ static const char *TAG = "rf_service";
 
 /* How long after the last similar frame a burst is considered finished. Real
  * remotes repeat every few tens of milliseconds; 250 ms comfortably spans the
- * gaps within one press without merging two deliberate presses together. */
+ * gaps within one press without merging two deliberate presses together.
+ * Measured from the LAST folded copy, not the first — every absorbed repeat
+ * re-arms the window (see absorb()), so a held button stays one burst. */
 #define BURST_WINDOW_US 250000
+
+/* Hard ceiling on one burst's lifetime, measured from its FIRST frame. The
+ * window above measures quiet time since the last copy, which is what makes a
+ * press-and-hold a single event — but it also means a transmitter stuck keying
+ * (a fob wedged under something, a neighbour's jammed sensor) would hold the
+ * burst open forever and nothing would ever be reported. Five seconds is well
+ * past any deliberate press-and-hold on a doorbell, and at the ~40-70 ms repeat
+ * period of EV1527-class remotes it also keeps the repeat counter (uint8_t,
+ * ~70-125 copies in five seconds) clear of saturating at 255. A stuck
+ * transmitter therefore surfaces as one event every five seconds — visible and
+ * diagnosable — instead of either silence or an event storm. */
+#define BURST_MAX_US (5 * 1000 * 1000)
 
 /* Similarity tolerances for "this is the same frame again". Cheap transmitters
  * drift by a few percent, and the absolute floor keeps short pulses from failing
@@ -115,13 +129,30 @@ static void         *s_cb_ctx;
  * rf_event_t is ~2 KB and the capture task does not need that headroom. */
 static rf_event_t s_pending;
 static bool       s_pending_valid;
+/* When the LAST copy was folded into s_pending. s_pending.ts_us keeps marking
+ * the burst's first frame (that is the event's public timestamp); this one
+ * drives the quiet-time flush, so a held button's stream of repeats keeps the
+ * burst open instead of being chopped into a "press" every BURST_WINDOW_US. */
+static int64_t    s_pending_last_us;
 static uint32_t   s_squelched;   /* frames dropped below the RSSI floor */
 
-/* Last transmitted frame, for echo suppression (see TX_ECHO_WINDOW_US). */
+/* Last transmitted frame, for echo suppression (see TX_ECHO_WINDOW_US). All
+ * three are written by rf_service_transmit() and read by absorb() UNDER the
+ * radio mutex — nothing here runs in ISR context (the RMT done-ISR only feeds
+ * a queue; both absorb() and every transmit caller are plain tasks), so the
+ * mutex is sufficient and necessary: on this dual-core build a capture-task
+ * read racing a half-done 1 KB frame copy or a torn int64 timestamp would make
+ * the echo decision on garbage. */
 static rf_frame_t s_tx_last;
 static int64_t    s_tx_end_us;
 static bool       s_tx_last_valid;
 static uint32_t   s_echo_suppressed;
+
+/* The idle threshold the RX channel is currently armed with — the length of
+ * silence that ends a recording. Recorded by capture_cfg(), the single place
+ * the channel's configuration is decided, so echo suppression always reasons
+ * about truncation with the same number the hardware is actually using. */
+static uint32_t   s_capture_idle_us;
 
 /* Relaxed capture parameters while a raw session runs. Read by capture_cfg(),
  * which is the single place the RMT channel's configuration is decided. */
@@ -155,6 +186,7 @@ static void capture_cfg(rf_capture_cfg_t *cfg)
         cfg->min_pulses  = s_relaxed_min_pulses;
         cfg->queue_depth = RAW_QUEUE_DEPTH;
     }
+    s_capture_idle_us = cfg->idle_us;   /* see the declaration for why */
 }
 
 /* Enter receive: radio in async RX (GDO0 = data out), RMT bound as an input. */
@@ -243,19 +275,39 @@ static void absorb(const rf_frame_t *frame, int rssi)
 
     /* Our own transmission, bounced back by a repeater or a second box. Dropping
      * it here — before matching, before the graph — is what breaks the
-     * transmit/hear/transmit feedback loop. */
+     * transmit/hear/transmit feedback loop.
+     *
+     * The comparison must tolerate the capture path's framing-gap truncation
+     * (bench + review finding, 2026-09): a synthesized EV1527 frame ends in its
+     * own 31x-base sync low — 10.85 ms at the default 350 us base, LONGER than
+     * the capture idle threshold — so an echo of it always arrives with that
+     * trailing low cut off, one pulse short of what we sent. The plain
+     * equal-count rf_frame_similar() could therefore never match an echo of a
+     * synthesized frame, and this defence was a no-op for exactly the signals
+     * the box generates itself. rf_frame_similar_tx_echo() also accepts the
+     * sent frame in its as-heard form, with the truncated gap stripped. */
     if (s_tx_last_valid && (now - s_tx_end_us) < TX_ECHO_WINDOW_US &&
-        rf_frame_similar(&s_tx_last, frame, BURST_TOL_PCT, BURST_TOL_US)) {
+        rf_frame_similar_tx_echo(&s_tx_last, frame, BURST_TOL_PCT, BURST_TOL_US,
+                                 s_capture_idle_us)) {
         s_echo_suppressed++;
         ESP_LOGD(TAG, "ignored an echo of our own transmission");
         return;
     }
 
+    /* Fold a repeat into the open burst. The quiet-time window is measured
+     * from the LAST copy and re-armed on every fold — that is what makes one
+     * long press one event (a fob repeats every ~40-70 ms while held, so each
+     * copy lands well inside the 250 ms window and keeps it open). BURST_MAX_US
+     * is the escape hatch: past it the fold is refused even for a perfect
+     * repeat, the burst flushes below, and a fresh one starts — so a stuck
+     * transmitter cannot suppress the event forever. */
     if (s_pending_valid &&
-        (now - s_pending.ts_us) < BURST_WINDOW_US &&
+        (now - s_pending_last_us) < BURST_WINDOW_US &&
+        (now - s_pending.ts_us) < BURST_MAX_US &&
         rf_frame_similar(&s_pending.frame, frame, BURST_TOL_PCT, BURST_TOL_US)) {
         if (s_pending.repeats < 255)
             s_pending.repeats++;
+        s_pending_last_us = now;
         return;
     }
 
@@ -266,6 +318,7 @@ static void absorb(const rf_frame_t *frame, int rssi)
     s_pending.frame   = *frame;
     s_pending.repeats = 1;
     s_pending.ts_us   = now;
+    s_pending_last_us = now;
     s_pending.rssi_dbm = rssi;   /* sampled above, while the burst is still live */
     s_pending_valid = true;
 
@@ -383,15 +436,35 @@ static void capture_task(void *arg)
             }
         }
 
-        /* Flush a burst that has gone quiet, and keep an eye on the band. */
-        if (s_pending_valid && (esp_timer_get_time() - s_pending.ts_us) >= BURST_WINDOW_US)
+        /* Flush a burst that has gone quiet, and keep an eye on the band.
+         * Quiet means "no copy folded in for BURST_WINDOW_US" — measured from
+         * the last folded frame, not the first, so a held button flushes once,
+         * when it is released (or at BURST_MAX_US, enforced in absorb()). */
+        if (s_pending_valid && (esp_timer_get_time() - s_pending_last_us) >= BURST_WINDOW_US)
             flush_pending();
         raw_slice();
         check_idle_health();
         radio_unlock();
 
-        if (err != ESP_OK)
-            vTaskDelay(1);   /* yield; the slice already provided the pacing */
+        /* Fairness gap, UNCONDITIONALLY — after a received frame just as after
+         * a timeout. A FreeRTOS mutex does not hand itself to a waiter on give:
+         * whichever ready task asks first wins, and this task (prio 12) used to
+         * loop straight back into radio_lock() whenever a frame HAD arrived, so
+         * under sustained frame arrival (a busy band, or a deliberate OOK
+         * flood) the prio-5 waiters — tx_task, HTTP handlers in
+         * rf_service_transmit()/_rssi(), the MQTT bridge — lost the
+         * unlock->relock race indefinitely and the whole box wedged behind the
+         * radio mutex. Blocking here for one tick (1 ms at
+         * CONFIG_FREERTOS_HZ=1000) takes this task off the scheduler so any
+         * waiter acquires the lock; once it holds it, priority inheritance
+         * lifts it to ours and it finishes promptly.
+         *
+         * The tick costs no legitimate frames: the capture layer buffers 4
+         * frames in its queue, EV1527-class remotes repeat every ~40-70 ms,
+         * and even the fastest frame the filters admit (32 pulses of a few ms
+         * plus the 8 ms idle gap, one frame per ~11 ms) arrives an order of
+         * magnitude slower than the ~1 kHz drain this loop still sustains. */
+        vTaskDelay(1);
     }
 }
 
@@ -517,6 +590,19 @@ esp_err_t rf_service_transmit(const rf_frame_t *frame, uint8_t repeats, uint32_t
     if (err == ESP_OK)
         err = rf_transmit_frame(frame, repeats, gap_us);
 
+    if (err == ESP_OK) {
+        /* Arm echo suppression — BEFORE the lock is released, because absorb()
+         * on the capture task reads all three of these under the same mutex
+         * (see their declaration): written after the unlock, a capture running
+         * on the other core could compare against a half-copied frame or a
+         * torn 64-bit timestamp. Taken here the timestamp also marks the
+         * moment the carrier actually stopped, rather than after the RX
+         * channel has been rebuilt. */
+        s_tx_last       = *frame;
+        s_tx_end_us     = esp_timer_get_time();
+        s_tx_last_valid = true;
+    }
+
     /* Always return to receive, even if the transmit failed — otherwise a single
      * bad send would leave the box deaf until reboot. */
     esp_err_t back = enter_rx();
@@ -525,11 +611,6 @@ esp_err_t rf_service_transmit(const rf_frame_t *frame, uint8_t repeats, uint32_t
     if (err != ESP_OK) {
         db_diag_report(DB_DIAG_TX_FAILED, "%s", db_err_text(err));
     } else {
-        /* Arm echo suppression. Recorded AFTER the send so the window starts
-         * when the carrier stops, not when it started. */
-        s_tx_last       = *frame;
-        s_tx_end_us     = esp_timer_get_time();
-        s_tx_last_valid = true;
         /* ">=": gap_us is a floor, and a frame that ends with its own framing
          * gap keeps that period instead (see rf_transmit.h). Saying "gap 8000"
          * when the wire carried 9021 would be a lie in a diagnostic. */

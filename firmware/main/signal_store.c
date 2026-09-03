@@ -21,6 +21,24 @@
  * accepting that a capture-time match may wait a few milliseconds behind a save.
  * That is far preferable to a lock-free scan racing an index rewrite.
  *
+ * READERS ON OTHER TASKS GET COPIES, NOT POINTERS. The pointer-returning
+ * accessors exist for the HTTP task alone — the task that also runs every
+ * delete, so nothing can compact the array under a pointer it is still using.
+ * The MQTT bridge and the dispatch task run concurrently with HTTP on the
+ * other core; for them db_signals_get_copy()/db_signals_snapshot() copy the
+ * records out under the mutex, because a live pointer read against a
+ * delete-in-progress can change which signal it describes between two field
+ * reads. See the threading contract in signal_store.h.
+ *
+ * THE PARTITION IS SMALLER THAN THE ADVERTISED STORE. 32 signals at the
+ * 512-pulse maximum are ~33 KB of frame blobs — more than the original 24 KB
+ * NVS partition holds in total, and OTA never enlarges a partition table, so
+ * boxes first flashed before the table grew keep 24 KB forever. store()
+ * therefore checks the partition's ACTUAL free space before every add and
+ * refuses with ESP_ERR_NVS_NOT_ENOUGH_SPACE while there is still headroom
+ * left for the index rewrite and for the config/graph blobs, so filling the
+ * signal store can never wedge every other save on the box.
+ *
  * THE TRAILING-FRAGMENT PROBLEM (bench, 2026-08-31)
  *
  * A single real press of the user's doorbell yields the 49-pulse frame and then,
@@ -54,6 +72,7 @@
 #include "signal_store.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -65,6 +84,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
+#include "nvs_flash.h"   /* NVS_DEFAULT_PART_NAME, for stats and the sweep */
 
 static const char *TAG = "db_signals";
 
@@ -193,6 +213,14 @@ static esp_err_t save_index(void)
     return err;
 }
 
+/* True only when load_index() positively parsed an index written in THIS
+ * build's exact layout. reconcile_flash() keys on it: an ignored newer-layout
+ * index means the frame blobs belong to the firmware that wrote it, and
+ * "sweeping orphans" against an index we chose not to read would erase every
+ * one of that firmware's waveforms — the precise rollback destruction the
+ * ignore rule exists to prevent. */
+static bool s_index_authoritative;
+
 /* Caller holds the lock. */
 static esp_err_t load_index(void)
 {
@@ -246,6 +274,7 @@ static esp_err_t load_index(void)
         s_meta[s_count].seen_count   = 0;
         s_count++;
     }
+    s_index_authoritative = true;
     return ESP_OK;
 }
 
@@ -282,24 +311,189 @@ static esp_err_t save_frame(uint16_t id, const rf_frame_t *frame)
     return err;
 }
 
-/* Caller holds the lock. */
-static void erase_frame(uint16_t id)
+/* Caller holds the lock. An already-absent frame counts as success — the goal
+ * is "no such blob on flash", however we got there. The return value matters
+ * to delete(): "the blob is gone" and "flash would not let go of it" lead to
+ * different recoveries there. */
+static esp_err_t erase_frame(uint16_t id)
 {
     char key[16];
     frame_key(key, sizeof(key), id);
 
     nvs_handle_t h;
-    if (nvs_open(DB_SIG_NS, NVS_READWRITE, &h) != ESP_OK)
-        return;
-    esp_err_t err = nvs_erase_key(h, key);
+    esp_err_t err = nvs_open(DB_SIG_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK)
+        return err;
+    err = nvs_erase_key(h, key);
     if (err == ESP_OK)
-        nvs_commit(h);
-    else if (err != ESP_ERR_NVS_NOT_FOUND)
+        err = nvs_commit(h);
+    else if (err == ESP_ERR_NVS_NOT_FOUND)
+        err = ESP_OK;
+    else
         ESP_LOGW(TAG, "frame erase (%s): %s", key, esp_err_to_name(err));
     nvs_close(h);
+    return err;
+}
+
+/* ---- flash budget ---------------------------------------------------------
+ *
+ * The store must refuse an add BEFORE it starts writing, with an error that
+ * names the real problem, because "the partition is full" has very different
+ * consequences from "this one request failed": once NVS is genuinely full,
+ * config saves, graph edits and the deferred switch-position flush all start
+ * failing too — some of them silently. The reserve below is what keeps that
+ * state unreachable through this module, whatever the partition size under us
+ * happens to be (24 KB on boxes flashed before the table grew, 80 KB after).
+ */
+
+/* NVS accounting is in 32-byte entries. A blob costs its data rounded up to
+ * entries, plus one entry per chunk header, plus one for the blob index — and
+ * a chunk cannot span a page, so a blob a little over a page boundary takes a
+ * second chunk. 4 entries of overhead covers two chunks plus the index with
+ * one spare; every blob this module writes fits in two chunks (the largest,
+ * the full index, is under two pages). Deliberately a slight OVERestimate —
+ * the price of refusing one add early is a user deleting a signal they could
+ * technically have kept; the price of underestimating is the wedged-box state
+ * this exists to prevent. */
+static size_t entries_for_blob(size_t len)
+{
+    return 4u + (len + 31u) / 32u;
+}
+
+/* Entries kept free for everything that is NOT a signal frame: rewriting the
+ * signal index costs a full extra copy while the old one still exists (~110
+ * entries at 32 signals — already counted separately by store()), and beyond
+ * that the config blob (~50), the graph's nodes blob (~90) and links blob
+ * (~15) must each stay REWRITABLE, which likewise needs room for a fresh copy
+ * next to the old. 160 entries ≈ 5 KB covers those three with margin. */
+#define DB_SIG_RESERVE_ENTRIES 160u
+
+/* Would adding a frame of `frame_len` bytes (plus the grown index rewrite)
+ * still leave the reserve free? Caller holds the lock. */
+static bool store_has_room(size_t frame_len)
+{
+    nvs_stats_t st;
+    if (nvs_get_stats(NVS_DEFAULT_PART_NAME, &st) != ESP_OK)
+        return true;   /* no stats, no verdict — let the write itself decide */
+
+    size_t index_len = sizeof(sig_hdr_t) +
+                       ((size_t)s_count + 1u) * sizeof(db_signal_meta_t);
+    size_t need = entries_for_blob(frame_len) + entries_for_blob(index_len) +
+                  DB_SIG_RESERVE_ENTRIES;
+    if (st.available_entries >= need)
+        return true;
+
+    ESP_LOGE(TAG, "store full: %u NVS entries free, this add needs %u "
+                  "(%u-byte frame) plus a %u-entry reserve — delete a signal "
+                  "or two first",
+             (unsigned)st.available_entries,
+             (unsigned)(need - DB_SIG_RESERVE_ENTRIES),
+             (unsigned)frame_len, (unsigned)DB_SIG_RESERVE_ENTRIES);
+    return false;
 }
 
 /* ---- init ---------------------------------------------------------------- */
+
+/*
+ * RECONCILE THE INDEX AND THE FRAME BLOBS AFTER A BADLY-TIMED POWER CUT.
+ *
+ * delete() commits two independent NVS writes, so a power cut between them
+ * necessarily leaves one of two mismatches on flash, and this sweep repairs
+ * both at every boot:
+ *
+ *   GHOST   an index entry whose frame blob is gone (the frame was erased but
+ *           the shrunken index never committed — only reachable through
+ *           delete()'s full-partition fallback path). It is dropped from the
+ *           loaded index: the user deleted it, it has no waveform to replay,
+ *           and listing it would be advertising a signal that errors on every
+ *           use. The pruned index is written back best-effort; if THAT write
+ *           fails, RAM is still correct and the next successful save or boot
+ *           finishes the job.
+ *
+ *   ORPHAN  a frame blob no index entry names (the normal delete order,
+ *           interrupted after the index committed — or the remnant of a
+ *           pre-fix firmware's failed delete). Invisible but not free: at up
+ *           to ~1 KB each, orphans eat exactly the space the flash budget
+ *           above is defending. Erased outright — an id absent from the
+ *           committed index is deleted BY DEFINITION, because the index
+ *           commit is the moment a mutation becomes real (see store()'s
+ *           rollback, which relies on the same rule).
+ *
+ * Caller holds the lock. Runs before repair_synthesized_ev1527(), so that
+ * one-time repair never wastes a rebuild on a ghost.
+ */
+static void reconcile_flash(void)
+{
+    /* Repairs are only meaningful against an index this build actually read.
+     * An absent, truncated or NEWER-layout index loads as empty ON PURPOSE
+     * (rollback preservation, see load_index) — sweeping "orphans" against
+     * that emptiness would erase waveforms that are not ours to judge. */
+    if (!s_index_authoritative)
+        return;
+
+    nvs_handle_t h;
+    if (nvs_open(DB_SIG_NS, NVS_READWRITE, &h) != ESP_OK)
+        return;   /* no namespace yet — nothing stored, nothing to reconcile */
+
+    /* Ghosts first: with them gone, the orphan scan below sees the true
+     * membership. Only a definite NOT_FOUND drops an entry — any other
+     * verdict (transient NVS trouble) keeps it, because deleting a user's
+     * signal on a maybe is precisely what this module must never do. */
+    int kept = 0, ghosts = 0;
+    for (int i = 0; i < s_count; i++) {
+        char key[16];
+        frame_key(key, sizeof(key), s_meta[i].id);
+        if (nvs_find_key(h, key, NULL) == ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "signal %u '%s' has no stored waveform (interrupted "
+                          "delete) — completing the delete",
+                     (unsigned)s_meta[i].id, s_meta[i].name);
+            ghosts++;
+            continue;
+        }
+        s_meta[kept++] = s_meta[i];
+    }
+    if (ghosts > 0) {
+        for (int i = kept; i < s_count; i++)
+            memset(&s_meta[i], 0, sizeof(s_meta[i]));
+        s_count = kept;
+        save_index();   /* best-effort: RAM is already right (see above) */
+    }
+
+    /* Orphans: every "f<id>" blob in the namespace whose id the index does not
+     * carry. Collected first, erased after — erasing under a live iterator is
+     * asking the NVS internals a question they do not promise to answer. The
+     * array bounds the sweep at one store's worth per boot; anything past that
+     * (unreachable in practice) waits for the next one. */
+    uint16_t orphan[DB_SIGNAL_MAX];
+    int n_orphan = 0;
+
+    nvs_iterator_t it = NULL;
+    esp_err_t r = nvs_entry_find(NVS_DEFAULT_PART_NAME, DB_SIG_NS,
+                                 NVS_TYPE_BLOB, &it);
+    while (r == ESP_OK) {
+        nvs_entry_info_t info;
+        nvs_entry_info(it, &info);
+        if (info.key[0] == 'f') {
+            char *end = NULL;
+            long v = strtol(info.key + 1, &end, 10);
+            if (end && *end == '\0' && v > 0 && v <= 0xFFFF &&
+                !find_meta((uint16_t)v) && n_orphan < DB_SIGNAL_MAX)
+                orphan[n_orphan++] = (uint16_t)v;
+        }
+        r = nvs_entry_next(&it);
+    }
+    nvs_release_iterator(it);
+
+    for (int i = 0; i < n_orphan; i++) {
+        char key[16];
+        frame_key(key, sizeof(key), orphan[i]);
+        ESP_LOGW(TAG, "erasing orphaned frame blob %s (interrupted delete)", key);
+        nvs_erase_key(h, key);
+    }
+    if (n_orphan > 0)
+        nvs_commit(h);
+    nvs_close(h);
+}
 
 /*
  * ONE-TIME REPAIR OF SYNTHESIZED EV1527 FRAMES WRITTEN BY THE OLD ENCODER
@@ -397,6 +591,7 @@ esp_err_t db_signals_init(void)
 
     lock();
     esp_err_t err = load_index();
+    reconcile_flash();
     repair_synthesized_ev1527();
     s_ready = true;
     int n = s_count;
@@ -410,14 +605,43 @@ esp_err_t db_signals_init(void)
 
 int db_signals_count(void) { return s_count; }
 
+/*
+ * The two POINTER-RETURNING accessors take no lock, and locking inside them
+ * would not help: the hazard is not the lookup but the pointer OUTLIVING it,
+ * still being dereferenced while delete() compacts the array underneath. So
+ * the contract (signal_store.h) restricts them to the HTTP task — the task
+ * every mutation runs on, where nothing can move the array between a lookup
+ * and its last use. Any other task must use db_signals_get_copy() /
+ * db_signals_snapshot() below, which hold the lock for the whole copy.
+ */
 const db_signal_meta_t *db_signals_list(void) { return s_meta; }
 
 const db_signal_meta_t *db_signals_get(uint16_t id)
 {
-    /* No lock: the array is only ever compacted under the lock and the caller is
-     * the single-threaded HTTP task. Returning an interior pointer is the
-     * header's contract. */
     return find_meta(id);
+}
+
+esp_err_t db_signals_get_copy(uint16_t id, db_signal_meta_t *out)
+{
+    if (!out)
+        return ESP_ERR_INVALID_ARG;
+    lock();
+    const db_signal_meta_t *m = find_meta(id);
+    if (m)
+        *out = *m;
+    unlock();
+    return m ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+int db_signals_snapshot(db_signal_meta_t *out, int max)
+{
+    if (!out || max <= 0)
+        return 0;
+    lock();
+    int n = (s_count < max) ? s_count : max;
+    memcpy(out, s_meta, (size_t)n * sizeof(*out));
+    unlock();
+    return n;
 }
 
 /* Caller holds the lock. */
@@ -511,6 +735,16 @@ static esp_err_t store(const db_signal_meta_t *meta, const rf_frame_t *frame,
                  meta->name, DB_SIGNAL_MAX);
         return ESP_ERR_NO_MEM;
     }
+
+    /* The OTHER way the store gets full: the partition itself. Checked before
+     * anything is written, so a refusal leaves no half-added state behind, and
+     * reported as its own error — the API must be able to say "delete some
+     * signals" rather than shrugging with a generic failure. See the flash
+     * budget section above for the arithmetic. */
+    size_t frame_len = sizeof(frm_hdr_t) +
+                       (size_t)frame->count * sizeof(uint16_t);
+    if (!store_has_room(frame_len))
+        return ESP_ERR_NVS_NOT_ENOUGH_SPACE;
 
     esp_err_t err = save_frame(meta->id, frame);
     if (err != ESP_OK)
@@ -653,13 +887,58 @@ esp_err_t db_signals_delete(uint16_t id)
         return ESP_ERR_NOT_FOUND;
     }
 
+    db_signal_meta_t removed = s_meta[idx];   /* for the rollback below */
+
     for (int i = idx; i < s_count - 1; i++)
         s_meta[i] = s_meta[i + 1];
     s_count--;
     memset(&s_meta[s_count], 0, sizeof(s_meta[s_count]));
 
-    erase_frame(id);
+    /*
+     * ORDER MATTERS, FOR POWER LOSS. The two flash writes cannot be atomic
+     * together, so one of them commits first — and the index must be that one.
+     * A cut after the index commit leaves an ORPHANED frame blob, which lists
+     * nowhere and is swept at the next boot; the other order leaves a GHOST: a
+     * signal that is listed but whose waveform is gone, i.e. a delete that
+     * visibly un-happened. (Both leftovers are repaired by reconcile_flash()
+     * at init, but only one of them was ever visible to the user.)
+     *
+     * The exception is a partition too full to rewrite the index, because the
+     * rewrite needs room for the new copy while the old one still exists. In
+     * exactly that case the order flips — free the ~1 KB frame, then retry —
+     * since delete is the only shovel the user has to dig a full store out
+     * with, and the safe order would refuse to dig.
+     */
     esp_err_t err = save_index();
+    if (err == ESP_OK) {
+        erase_frame(id);
+    } else if (erase_frame(id) == ESP_OK) {
+        err = save_index();
+        if (err != ESP_OK) {
+            /* Frame gone, old index still on flash: the ghost resurrects at
+             * the next boot only until reconcile_flash() prunes it (no frame,
+             * no listing). RAM is already what the user asked for, so this IS
+             * a successful delete — just one whose durability arrives at the
+             * next index write or reboot instead of now. */
+            ESP_LOGW(TAG, "signal %u deleted, but the smaller index could not "
+                          "be written (%s) — flash catches up at the next "
+                          "save or boot", (unsigned)id, esp_err_to_name(err));
+            err = ESP_OK;
+        }
+    } else {
+        /* Neither write took, so flash still holds the signal in full. Put the
+         * RAM entry back — the same rollback discipline as store() — because a
+         * signal that is "deleted" until the next reboot and then resurrects
+         * is the worst of both worlds. The caller gets the honest error. */
+        for (int i = s_count; i > idx; i--)
+            s_meta[i] = s_meta[i - 1];
+        s_meta[idx] = removed;
+        s_count++;
+        unlock();
+        ESP_LOGE(TAG, "signal %u NOT deleted: %s", (unsigned)id,
+                 esp_err_to_name(err));
+        return err;
+    }
 
     /* The recent-burst reference may name the signal we just removed. */
     if (s_recent.matched_id == id)
@@ -881,3 +1160,21 @@ esp_err_t db_signals_create_virtual(const char *name, uint32_t id20, uint8_t but
                  (unsigned long)id20, button4, frame.count);
     return err;
 }
+
+/* ---- host-test hook ------------------------------------------------------- */
+
+#ifdef DB_HOSTTEST
+/* Compiled ONLY into host-test/test_node_graph (its Makefile defines
+ * DB_HOSTTEST; no device build does). Forgetting the resident state is what
+ * lets one test binary simulate several BOOTS against the same fake flash —
+ * the power-cut repairs (reconcile_flash) only ever run inside
+ * db_signals_init(), so testing them requires dying and coming back. */
+void db_signals_hosttest_reset(void)
+{
+    memset(s_meta, 0, sizeof(s_meta));
+    s_count = 0;
+    s_ready = false;
+    s_index_authoritative = false;
+    memset(&s_recent, 0, sizeof(s_recent));
+}
+#endif

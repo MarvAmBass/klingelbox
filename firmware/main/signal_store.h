@@ -39,6 +39,23 @@
  * The receiver is, and always was, ALWAYS listening — there is no on-demand
  * receive mode to switch on, because a button you already registered has to ring
  * the instant it is pressed.
+ *
+ * THREADING CONTRACT — read before calling anything here from a new task.
+ *
+ * Every function that takes or fills a caller-owned buffer is safe from ANY
+ * task: it locks, copies, unlocks (db_signals_get_copy, db_signals_snapshot,
+ * db_signals_load_frame, db_signals_match, all mutators).
+ *
+ * The three POINTER-RETURNING accessors — db_signals_list, db_signals_get,
+ * db_signals_find_decoded — hand out interior pointers into the live array,
+ * which delete() compacts with element-by-element shifts. Such a pointer is
+ * only meaningful on the one task that performs the mutations, where nothing
+ * can shift the array between the call and the last dereference. In this
+ * firmware that is the HTTP server task, and ONLY that task may use them. The
+ * MQTT bridge and the dispatch task run concurrently with HTTP on the other
+ * core: from there a live pointer can start describing a DIFFERENT signal
+ * mid-read (a press published under the wrong name, the wrong waveform keyed).
+ * Those tasks must take snapshots/copies instead.
  */
 #ifndef DB_SIGNAL_STORE_H
 #define DB_SIGNAL_STORE_H
@@ -86,11 +103,43 @@ typedef struct {
 
 esp_err_t db_signals_init(void);
 
-int                     db_signals_count(void);
+int db_signals_count(void);
+
+/* HTTP TASK ONLY (see the threading contract above): these return pointers
+ * into the live array, valid only where no delete can run concurrently. Every
+ * other task uses db_signals_get_copy() / db_signals_snapshot() below. */
 const db_signal_meta_t *db_signals_list(void);              /* array of count() */
 const db_signal_meta_t *db_signals_get(uint16_t id);        /* NULL if absent */
 
-/* Store a captured burst. Copies the frame to NVS and adds the metadata. */
+/* Copy one signal's metadata out under the lock. Safe from any task; this is
+ * what the MQTT bridge and the dispatch task must use instead of
+ * db_signals_get(). ESP_ERR_NOT_FOUND if no such id. */
+esp_err_t db_signals_get_copy(uint16_t id, db_signal_meta_t *out);
+
+/* Copy up to `max` metadata records out under the lock and return how many
+ * were written. The copy is internally consistent — taken in one critical
+ * section, so no record in it can be half one signal and half another — but it
+ * is a snapshot: signals may be added or deleted the moment it returns, which
+ * is fine for building tables and announcements (the change notification will
+ * trigger a rebuild) and exactly why no pointer into the live array is given
+ * out. `out` must hold max records; DB_SIGNAL_MAX always suffices. */
+int db_signals_snapshot(db_signal_meta_t *out, int max);
+
+/* Store a captured burst. Copies the frame to NVS and adds the metadata.
+ *
+ * FULLNESS IS TWO DIFFERENT ERRORS, on this and every other add path:
+ *   ESP_ERR_NO_MEM                the DB_SIGNAL_MAX slot count is exhausted;
+ *   ESP_ERR_NVS_NOT_ENOUGH_SPACE  the NVS partition itself has no room for
+ *                                 this frame plus the index rewrite (checked
+ *                                 UP FRONT, with headroom reserved so config
+ *                                 and graph saves keep working — see store()
+ *                                 in signal_store.c). Long raw recordings can
+ *                                 hit this well before the slot count does,
+ *                                 especially on boxes still running the
+ *                                 original 24 KB NVS partition, which an OTA
+ *                                 update can never enlarge.
+ * Both are cured the same way — delete signals — but the API must be able to
+ * say which wall was hit. */
 esp_err_t db_signals_add_event(const rf_event_t *ev, const char *name,
                                db_signal_origin_t origin, uint16_t *id_out);
 
@@ -105,6 +154,13 @@ esp_err_t db_signals_add_frame(const rf_frame_t *frame, const rf_decoded_t *deco
 
 esp_err_t db_signals_load_frame(uint16_t id, rf_frame_t *out);
 esp_err_t db_signals_rename(uint16_t id, const char *name);
+
+/* Delete a signal: the index (minus the entry) is committed FIRST, then the
+ * frame blob is erased — a power cut between the two leaves an orphaned blob
+ * (harmless, swept at the next boot), never a listed signal whose waveform is
+ * gone. On a partition too full to rewrite the index the order flips once
+ * (frame freed first) so a full store can always be dug out of; init() repairs
+ * whatever a badly-timed power cut leaves either way. */
 esp_err_t db_signals_delete(uint16_t id);
 
 /* Match an incoming burst against the store. Returns the signal id, or 0.
@@ -112,6 +168,8 @@ esp_err_t db_signals_delete(uint16_t id);
 uint16_t db_signals_match(const rf_event_t *ev);
 
 /* Find the stored signal that carries a given decoded identity, or NULL.
+ * HTTP TASK ONLY — returns a pointer into the live array (threading contract
+ * above).
  *
  * The key is protocol + address + button — deliberately the SAME key
  * db_signals_match() uses, because "would an incoming burst be ambiguous
@@ -138,6 +196,13 @@ const db_signal_meta_t *db_signals_find_decoded(const char *protocol,
 esp_err_t db_signals_create_virtual(const char *name, uint32_t id20, uint8_t button4,
                                     uint16_t base_us, bool allow_duplicate,
                                     uint16_t *id_out);
+
+#ifdef DB_HOSTTEST
+/* Host tests only (host-test/Makefile defines DB_HOSTTEST): forget the
+ * resident state so db_signals_init() can be run again, simulating a reboot
+ * against whatever the fake flash holds. Does not exist in a device build. */
+void db_signals_hosttest_reset(void);
+#endif
 
 #ifdef __cplusplus
 }

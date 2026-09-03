@@ -154,7 +154,16 @@ static void trigger_from_event(db_trigger_t *trig, const rf_event_t *ev, uint16_
         trig->decoded_button = ev->decoded.button;
     }
 
-    const db_signal_meta_t *meta = signal_id ? db_signals_get(signal_id) : NULL;
+    /* Copy-out, not db_signals_get(): this runs on the dispatch task while the
+     * HTTP task may be compacting the store with a delete — a live pointer
+     * here can come to describe a DIFFERENT signal mid-read, and the press
+     * would be logged and published under the wrong name (see the threading
+     * contract in signal_store.h). A miss means "deleted since the match" and
+     * falls through to the decode/fingerprint labels below. */
+    db_signal_meta_t meta_copy;
+    const db_signal_meta_t *meta =
+        (signal_id && db_signals_get_copy(signal_id, &meta_copy) == ESP_OK)
+            ? &meta_copy : NULL;
     /* strlcpy, not snprintf("%s"): the label is a short display name and both
      * sources can legitimately be longer, so truncation is intended. strlcpy
      * says that outright and always NUL-terminates, where snprintf makes the

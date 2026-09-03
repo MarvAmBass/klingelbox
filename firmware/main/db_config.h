@@ -122,8 +122,18 @@ typedef struct {
     uint32_t tx_gap_us;                  /* 8000 — silence between repeats */
 } db_config_t;
 
-/* Initialise NVS flash (call once, early, before db_config_load). Erases and
- * re-initialises a full/incompatible NVS partition rather than failing. */
+/* Initialise NVS flash (call once, early, before db_config_load).
+ *
+ * The partition holds everything the user has ever put into this box — Wi-Fi
+ * credentials, the generated AP passphrase, every learned signal, the node
+ * graph — so this function never mass-erases data that a different firmware
+ * could still read. An NVS format from a newer IDF (the downgrade/rollback
+ * case) is left untouched and the error is returned: the caller's
+ * ESP_ERROR_CHECK halts the boot with a readable reason, and flashing the
+ * newer firmware back finds every byte intact. Only a partition that NO
+ * firmware can use (no free pages: truncated or worn out) is erased and
+ * re-initialised, and that is reported loudly in the log and the event ring
+ * rather than happening in silence. */
 esp_err_t db_nvs_init(void);
 
 /* Fill *cfg with factory defaults. Generates the softAP passphrase from the

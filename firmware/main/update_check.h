@@ -26,7 +26,9 @@
  *
  *   3. VERSIONS ARE COMPARED NUMERICALLY, NEVER WITH strcmp(). "0.10.0" sorts
  *      BEFORE "0.9.0" as text, so a string compare would hide exactly the
- *      release a user most wants. See ver_cmp() in update_check.c.
+ *      release a user most wants. And a prerelease sorts BEFORE its final
+ *      release, so a box running "v0.7.0-rc1" is offered "v0.7.0". See
+ *      db_ver_cmp() in version_cmp.h.
  *
  * The check needs the STA (home Wi-Fi) up. On a box that only has its own
  * softAP the status carries a plain-language reason instead of an empty result.

@@ -78,6 +78,30 @@ re-sending the password.
 | `<base>/radio` | publish | **yes** | [Radio telemetry](#radio-telemetry). |
 
 {: .note }
+> **Reserved first levels.** The first topic levels in this map — `status`, `button`,
+> `trigger`, `switch`, `unknown`, `event`, `radio` — belong to the box, and a node's
+> topic may not start with any of them. The reason is the row above marked
+> *subscribe*: an MQTT-publish node given the topic `trigger/x` would publish onto the
+> box's **own** `<base>/trigger/x` subscription, and the chain would fire itself
+> forever. The editor and the firmware both refuse such a topic; one stored by an
+> older firmware is skipped (with an activity-log entry) instead of published.
+> `base_topic` and `discovery_prefix` themselves are exempt — they *are* the
+> namespace. Deeper levels are fine: `front/trigger` is yours, `trigger/front` is not.
+
+{: .note }
+> **Retained messages on the subscribed topics are ignored.** Every topic the box
+> subscribes to under `<base>/` is a *command* — press, fire, set — and a command is a
+> moment, not a condition. A retained command is redelivered by the broker on **every
+> reconnect**, so one stray `mosquitto_pub -r` to `<base>/button/front_door/press`
+> would re-ring the bell on every Wi-Fi blip, forever, with nothing in the box's
+> config to explain it. The box therefore drops any inbound message carrying the
+> retain flag (logged, not silent). Publish commands unretained — which is the
+> default of every MQTT client — and everything behaves as this map says. The one
+> place the box *does* consume retained messages is its own discovery-cleanup sweep
+> under `<discovery_prefix>/…` (see
+> [ghost entities](#ghost-entities-clean-themselves-up)).
+
+{: .note }
 > **Which suffix does a Switch answer on?** Its **Topic** if you typed one, otherwise a slug
 > of its **name** — a switch called "All Bells Switch" with an empty topic answers on
 > `all_bells_switch`. The same rule decides the subscription, the Home Assistant entity, the
@@ -193,6 +217,40 @@ trigger for *receiving*, and a `button` entity for *transmitting*.
 Deleting a signal publishes an empty retained discovery payload, which is how MQTT
 discovery says "forget this entity". Without that, a deleted signal would leave a
 permanently unavailable entity behind that only a manual purge removes.
+
+### Ghost entities clean themselves up
+
+The clean-up above needs the broker to be reachable at the moment of the delete. Delete
+or rename a signal **while the broker is down**, then power-cycle the box before it comes
+back, and the debt is forgotten — the old retained configs would sit on the broker
+forever as a permanently unavailable ghost entity.
+
+So after every (re)connect's announce, the box runs a short **reconciliation sweep**: it
+subscribes once to `<discovery_prefix>/+/<its own device id>/+/config` for a few seconds,
+and for each retained config the broker replays it asks one question — *would I announce
+this right now?* Configs it just published match and are kept; anything else under its
+device id is a leftover from a previous life and is cleared with an empty retained
+publish (the activity log records each one). Then it unsubscribes.
+
+The device-id path segment is matched exactly, so the sweep can only ever touch this
+box's own entities — another Klingelbox on the same broker, or anything else under the
+discovery prefix, is out of reach by construction. Nothing is collected or stored: each
+config is judged as it arrives, so the sweep costs no memory and no flash. With
+`homeassistant: false` the sweep clears **everything** under the box's device id, which is
+how discovery turned off also removes entities a long-gone firmware once announced.
+
+### Changing MQTT settings at runtime
+
+Saving MQTT settings applies them **live** — no reboot. The running bridge first retires
+what it holds on the broker under the *old* values (discovery configs, retained switch
+states, telemetry; best-effort, while still connected), then stops and restarts from the
+new ones: new connection, new subscriptions, fresh announce. A changed `base_topic` or
+`discovery_prefix` therefore moves the whole device instead of stranding a retained ghost
+copy under the old prefix; anything the retirement could not deliver is mopped up by the
+next connect's [reconciliation sweep](#ghost-entities-clean-themselves-up). Disabling
+MQTT stops the bridge the same way; enabling it starts one. Toggling only
+`homeassistant` re-announces (or retires) the discovery set without dropping the broker
+connection.
 
 ### Keeping one node off MQTT
 
@@ -310,6 +368,19 @@ come back on its own.
 Almost certainly a `source.any_rf` node *and* a `source.button` node both reaching the same
 sink. A recognised burst legitimately fires both — see
 [the note in Automations](automations.html#sourceany_rf).
+
+**The bell used to re-ring on every reconnect.**
+That was a *retained* message sitting on a command topic (someone once published to
+`<base>/button/…/press` or `<base>/switch/…/set` with the retain flag), which the broker
+redelivered on every re-subscribe. The box now ignores retained deliveries on all
+command topics and logs that it did; clear the stray message for tidiness with
+`mosquitto_pub -r -n -t '<the topic>'`.
+
+**A deleted signal still shows in Home Assistant as unavailable.**
+It should disappear on its own within seconds of the next broker (re)connect — the
+[reconciliation sweep](#ghost-entities-clean-themselves-up) clears retained discovery
+configs the box no longer stands behind. If it persists, check the entity actually
+belongs to this box's device id: the sweep never touches another device's entities.
 
 **Renaming a signal changed its topic.**
 Yes — topics follow the slug of the name. HA entities do not, because their `unique_id` is

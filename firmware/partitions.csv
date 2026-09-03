@@ -5,13 +5,28 @@
 # is a SPIFFS image carrying the web UI, so the UI can be re-flashed without
 # recompiling the firmware.
 #
+# NVS IS 80 KB (0x14000), NOT THE STOCK 24 KB. The store advertises 32 signals
+# and a raw capture is up to ~1 KB of frame blob, so 24 KB filled up after a
+# dozen long recordings and every save (config, graph, switch positions) then
+# failed. The extra pages come out of the gap that used to sit unused between
+# phy_init and ota_0: NVS grows IN PLACE at 0x9000 and only otadata/phy_init
+# slide up against the app, so ota_0/ota_1/storage do not move at all.
+#
+# THE APP OFFSETS ARE A CONTRACT. OTA never rewrites the partition table, so a
+# box first flashed with the old 24 KB table keeps it (and its 24 KB NVS)
+# forever — the firmware handles that with a runtime free-space check
+# (signal_store.c) rather than by assuming this table. Re-flashing the full
+# merged image installs this table; NVS starting at the same 0x9000 means the
+# whole 0x9000..0x1d000 window stays reserved 0xFF in the merged image
+# (release.yml verifies that), exactly as the old 0x9000..0xf000 window was.
+#
 # For the ESP32-S3 Zero (4 MB, no PSRAM) use partitions-4mb.csv instead — see
 # sdkconfig.defaults.4mb and README "Porting to the ESP32-S3 Zero".
 #
 # Name,     Type, SubType,  Offset,    Size,     Flags
-nvs,        data, nvs,      0x9000,    0x6000,
-otadata,    data, ota,      0xf000,    0x2000,
-phy_init,   data, phy,      0x11000,   0x1000,
+nvs,        data, nvs,      0x9000,    0x14000,
+otadata,    data, ota,      0x1d000,   0x2000,
+phy_init,   data, phy,      0x1f000,   0x1000,
 ota_0,      app,  ota_0,    0x20000,   0x200000,
 ota_1,      app,  ota_1,    0x220000,  0x200000,
 storage,    data, spiffs,   0x420000,  0x100000,

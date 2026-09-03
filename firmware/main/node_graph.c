@@ -2081,6 +2081,10 @@ esp_err_t db_graph_init(void)
 
 /* ---- read-only accessors ------------------------------------------------- */
 
+/* The pointer-returning four are HTTP-task-only — the full argument for why a
+ * lock inside them would not fix anything (the pointer outlives the call) is
+ * on their declarations in node_graph.h. Everything cross-task goes through
+ * the copy/snapshot functions below them. */
 int              db_graph_node_count(void) { return s_node_count; }
 const db_node_t *db_graph_nodes(void)      { return s_nodes; }
 int              db_graph_link_count(void) { return s_link_count; }
@@ -2090,6 +2094,40 @@ const db_node_t *db_graph_node(uint16_t id)
 {
     int i = node_index(id);
     return (i >= 0) ? &s_nodes[i] : NULL;
+}
+
+esp_err_t db_graph_node_copy(uint16_t id, db_node_t *out)
+{
+    if (!out)
+        return ESP_ERR_INVALID_ARG;
+    lock();
+    int i = node_index(id);
+    if (i >= 0)
+        *out = s_nodes[i];
+    unlock();
+    return (i >= 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+int db_graph_nodes_snapshot(db_node_t *out, int max)
+{
+    if (!out || max <= 0)
+        return 0;
+    lock();
+    int n = (s_node_count < max) ? s_node_count : max;
+    memcpy(out, s_nodes, (size_t)n * sizeof(*out));
+    unlock();
+    return n;
+}
+
+int db_graph_links_snapshot(db_link_t *out, int max)
+{
+    if (!out || max <= 0)
+        return 0;
+    lock();
+    int n = (s_link_count < max) ? s_link_count : max;
+    memcpy(out, s_links, (size_t)n * sizeof(*out));
+    unlock();
+    return n;
 }
 
 /* ---- defaults ------------------------------------------------------------ */
@@ -2266,6 +2304,14 @@ esp_err_t db_graph_update_node(const db_node_t *node)
 
 esp_err_t db_graph_delete_node(uint16_t id)
 {
+    /* Rollback staging for a failed save, static like every other buffer in
+     * this file (no malloc on a mutation path) and guarded by s_lock like the
+     * arrays it mirrors. The node itself is one record, but the link pruning
+     * below drops entries at arbitrary positions, so the cheapest faithful
+     * undo for the links is a copy of the whole (small) arrays. */
+    static db_link_t prev_links[DB_LINK_MAX];
+    static int64_t   prev_fired[DB_LINK_MAX];
+
     lock();
     int i = node_index(id);
     if (i < 0) {
@@ -2276,11 +2322,21 @@ esp_err_t db_graph_delete_node(uint16_t id)
     /* Before the shift, and unconditionally: an emission still owed by this node
      * would otherwise come due against a node that no longer exists — at best a
      * silent no-op, at worst a ring from a chain the user has just deleted. The
-     * table is keyed by node id, so the shift below cannot touch it either way. */
+     * table is keyed by node id, so the shift below cannot touch it either way.
+     * Also deliberately NOT restored by the rollback below: a cancelled repeat
+     * and a cleared monitor history stay cancelled, because "delete this node"
+     * was said either way and a chime that rings after a FAILED delete is even
+     * more surprising than after a successful one. */
     int stopped = repeat_cancel_node(id);
     /* Likewise the monitor ring: ids are handed back out to new nodes, so a
      * ring left behind would surface as somebody else's history. */
     monitor_clear_node(id);
+
+    db_node_t removed_node = s_nodes[i];
+    int64_t   removed_pass = s_pass_us[i];
+    int       prev_link_count = s_link_count;
+    memcpy(prev_links, s_links, sizeof(prev_links));
+    memcpy(prev_fired, s_fired_us, sizeof(prev_fired));
 
     for (int k = i; k < s_node_count - 1; k++) {
         s_nodes[k]   = s_nodes[k + 1];
@@ -2302,8 +2358,41 @@ esp_err_t db_graph_delete_node(uint16_t id)
     s_link_count = kept;
 
     esp_err_t err = save_nodes();
-    if (err == ESP_OK && dropped)
-        err = save_links();
+    if (err != ESP_OK) {
+        /* Same discipline as add/update: an error return means NOTHING
+         * changed, RAM or flash. Without this a failed save left the node
+         * gone from the UI and the broker but still on flash — a retried
+         * DELETE then 404s (reads as success) and the node resurrects, links
+         * and all, at the next reboot. */
+        for (int k = s_node_count; k > i; k--) {
+            s_nodes[k]   = s_nodes[k - 1];
+            s_pass_us[k] = s_pass_us[k - 1];
+        }
+        s_nodes[i]   = removed_node;
+        s_pass_us[i] = removed_pass;
+        s_node_count++;
+        memcpy(s_links, prev_links, sizeof(prev_links));
+        memcpy(s_fired_us, prev_fired, sizeof(prev_fired));
+        s_link_count = prev_link_count;
+        unlock();
+        ESP_LOGE(TAG, "node %u NOT deleted: %s", (unsigned)id,
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    if (dropped) {
+        /* The nodes blob — the one that decides existence — is committed, so
+         * the delete is real and durable whatever happens next. A failed
+         * links write leaves stale links on flash pointing at a node the
+         * nodes blob no longer holds, which is precisely the dangling state
+         * the loader already sweeps at every boot (and the next successful
+         * save_links() fixes sooner). RAM is right either way, so this is a
+         * warning, not a failure. */
+        if (save_links() != ESP_OK)
+            ESP_LOGW(TAG, "node %u deleted, but its links could not be "
+                          "rewritten — the boot-time dangling-link sweep "
+                          "covers them", (unsigned)id);
+    }
 
     /* A wired input pointing at the deleted node keeps interrupting until the
      * caller reconciles; the edge handler simply finds no node and does nothing.
@@ -2312,7 +2401,7 @@ esp_err_t db_graph_delete_node(uint16_t id)
 
     ESP_LOGI(TAG, "node %u deleted (%d link(s) with it%s)", (unsigned)id, dropped,
              stopped ? ", repeat run stopped" : "");
-    return err;
+    return ESP_OK;
 }
 
 esp_err_t db_graph_add_link(uint16_t from, uint16_t to)
@@ -2368,6 +2457,8 @@ esp_err_t db_graph_delete_link(uint16_t from, uint16_t to)
         return ESP_ERR_NOT_FOUND;
     }
 
+    int64_t removed_fired = s_fired_us[found];
+
     for (int i = found; i < s_link_count - 1; i++) {
         s_links[i]    = s_links[i + 1];
         s_fired_us[i] = s_fired_us[i + 1];
@@ -2376,10 +2467,27 @@ esp_err_t db_graph_delete_link(uint16_t from, uint16_t to)
     s_fired_us[s_link_count] = 0;
 
     esp_err_t err = save_links();
+    if (err != ESP_OK) {
+        /* Same rollback discipline as every other mutation here: on a failed
+         * save the wire is put back (its group-ALL timestamp included, so a
+         * half-satisfied group is not quietly reset), because a link that is
+         * gone until the reboot that restores it is a graph nobody can debug. */
+        for (int i = s_link_count; i > found; i--) {
+            s_links[i]    = s_links[i - 1];
+            s_fired_us[i] = s_fired_us[i - 1];
+        }
+        s_links[found].from  = from;
+        s_links[found].to    = to;
+        s_fired_us[found]    = removed_fired;
+        s_link_count++;
+    }
     unlock();
 
     if (err == ESP_OK)
         ESP_LOGI(TAG, "link %u -> %u deleted", (unsigned)from, (unsigned)to);
+    else
+        ESP_LOGE(TAG, "link %u -> %u NOT deleted: %s", (unsigned)from,
+                 (unsigned)to, esp_err_to_name(err));
     return err;
 }
 

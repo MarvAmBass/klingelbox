@@ -62,6 +62,7 @@
 
 #include "event_log.h"
 #include "ota.h"
+#include "version_cmp.h"
 #include "wifi_mgr.h"
 
 static const char *TAG = "db_update";
@@ -98,56 +99,10 @@ static volatile bool s_busy;        /* a checker task exists */
 static void lock(void)   { if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY); }
 static void unlock(void) { if (s_lock) xSemaphoreGive(s_lock); }
 
-/* ------------------------------------------------------------------ versions */
-
-/*
- * Parse "v0.10.0", "0.10", "v1.2.3-rc2", "1.2.3+build7" into three numbers.
- *
- * Tolerant on purpose: the leading "v" is conventional but not guaranteed, a
- * tag may carry only two components, and a pre-release/build suffix must not
- * make the whole tag unreadable. Returns false only when there is no leading
- * number at all (e.g. a tag named "nightly"), which the caller reports as an
- * unreadable release rather than silently treating as "no update".
- */
-static bool ver_parse(const char *s, unsigned out[3])
-{
-    out[0] = out[1] = out[2] = 0;
-    if (!s) return false;
-    while (*s == ' ' || *s == '\t') s++;
-    if (*s == 'v' || *s == 'V') s++;
-    if (*s < '0' || *s > '9') return false;
-
-    for (int i = 0; i < 3; i++) {
-        unsigned v = 0;
-        int digits = 0;
-        while (*s >= '0' && *s <= '9') {
-            if (digits < 6) v = v * 10 + (unsigned)(*s - '0');   /* clamp absurd input */
-            digits++;
-            s++;
-        }
-        out[i] = v;
-        if (*s != '.') break;            /* '-rc1', '+meta' or end of string */
-        s++;
-        if (*s < '0' || *s > '9') break; /* "1.2." — take what we have */
-    }
-    return true;
-}
-
-/*
- * -1 / 0 / +1 for a < b, a == b, a > b. Component-wise and NUMERIC: this
- * function exists solely because strcmp("0.10.0", "0.9.0") < 0, i.e. a textual
- * comparison hides every release after the ninth minor. A pre-release suffix is
- * ignored, so "v0.2.0-rc1" compares equal to "0.2.0" and a box already on the
- * final release is never nagged to "upgrade" to its own release candidate.
- */
-static int ver_cmp(const unsigned a[3], const unsigned b[3])
-{
-    for (int i = 0; i < 3; i++) {
-        if (a[i] < b[i]) return -1;
-        if (a[i] > b[i]) return 1;
-    }
-    return 0;
-}
+/* Version parsing and ordering live in version_cmp.h (header-only so the host
+ * test suite compiles the same code): numeric component compare, and a
+ * prerelease sorts BEFORE its final release — both directions of that rule
+ * matter, see the header. */
 
 /* ------------------------------------------------------------------ scanner */
 
@@ -421,16 +376,16 @@ static void update_task(void *arg)
     if (!p) {
         strlcpy(err, "out of memory for the update check", sizeof(err));
     } else if (gh_fetch(p, err, sizeof(err))) {
-        unsigned cur[3], latest[3];
+        db_semver_t cur, latest;
         char current[DB_UPDATE_VER_MAX];
         strlcpy(current, s_st.current, sizeof(current));
 
-        if (!ver_parse(p->tag, latest)) {
+        if (!db_ver_parse(p->tag, &latest)) {
             snprintf(err, sizeof(err), "unreadable release tag \"%s\"", p->tag);
-        } else if (!ver_parse(current, cur)) {
+        } else if (!db_ver_parse(current, &cur)) {
             snprintf(err, sizeof(err), "unreadable running version \"%s\"", current);
         } else {
-            bool newer = ver_cmp(latest, cur) > 0;
+            bool newer = db_ver_cmp(&latest, &cur) > 0;
             lock();
             strlcpy(s_st.latest, p->tag, sizeof(s_st.latest));
             strlcpy(s_st.published_at, p->published, sizeof(s_st.published_at));

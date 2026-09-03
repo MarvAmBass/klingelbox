@@ -499,6 +499,137 @@ static void test_frame_similar(void)
     }
 }
 
+/*
+ * THE REGRESSION TEST FOR THE TX-ECHO SUPPRESSION HOLE (review, 2026-09-03).
+ *
+ * rf_service remembers the last frame it transmitted and drops an identical
+ * frame heard shortly afterwards — the defence against a repeater or second box
+ * echoing our own transmission back into a transmit->hear->transmit loop. That
+ * defence compared frames verbatim, and verbatim is structurally impossible for
+ * a synthesized EV1527 frame: it ends in its own 31x-base sync low (10.85 ms at
+ * the default 350 us base), which is LONGER than the 8 ms capture idle
+ * threshold, so the echo's reception is terminated BY that low and the capture
+ * path drops the terminating silence. The echo arrives as 49 pulses against the
+ * 50 we sent, the equal-count comparison never matched, and the suppression was
+ * a no-op for exactly the frames the box generates itself — the likely cause of
+ * a stored signal "hearing itself" shortly after every transmit.
+ *
+ * The tolerances (25 %, 120 us) and the 8000 us idle threshold below mirror
+ * rf_service.c's BURST_TOL_PCT/BURST_TOL_US and rf_capture's default idle_us.
+ * The negative cases matter as much as the positive one: wrongly suppressing a
+ * REAL doorbell press as an "echo" would be a worse bug than the one fixed.
+ */
+static void test_tx_echo_similarity(void)
+{
+    const uint8_t  tol_pct = 25;
+    const uint16_t tol_us  = 120;
+    const uint32_t idle_us = 8000;
+    rf_frame_t sent, echo, other;
+
+    CASE("tx echo: truncated echo of a synthesized frame is recognised");
+
+    rf_ev1527_build(0xA685Au, 0x8u, 350, &sent);
+    CHECK(sent.count == 50, "synth frame is 50 pulses, got %u", sent.count);
+    CHECK(rf_frame_level_at(&sent, 49) == 0 && sent.durations_us[49] == 350u * 31u,
+          "synth frame ends in the 10850 us sync low");
+
+    /* What the capture layer actually delivers when this frame is echoed: the
+     * trailing sync low exceeded the idle threshold, ended the reception, and
+     * was dropped — 49 pulses. */
+    slice_frame(&sent, 0, 49, &echo);
+
+    /* The old comparison can never match this — that is the bug on record. */
+    CHECK(!rf_frame_similar(&sent, &echo, tol_pct, tol_us),
+          "equal-count comparison must fail on the truncated echo (the bug)");
+    /* The echo-aware one must. */
+    CHECK(rf_frame_similar_tx_echo(&sent, &echo, tol_pct, tol_us, idle_us),
+          "truncated echo must be recognised as our own transmission");
+
+    /* An echo path re-times every pulse with its own oscillator. */
+    rng_seed(0xEC40);
+    for (unsigned trial = 0; trial < 20; trial++) {
+        rf_frame_t drifted = echo;
+        jitter_frame(&drifted, 5);
+        CHECK(rf_frame_similar_tx_echo(&sent, &drifted, tol_pct, tol_us, idle_us),
+              "5%%-jittered truncated echo must still match (trial %u)", trial);
+    }
+
+    /* A full-length echo (idle threshold above the sync low, e.g. a relaxed
+     * raw session with idle_us > 10.85 ms) still matches via the verbatim path. */
+    {
+        rf_frame_t full = sent;
+        jitter_frame(&full, 4);
+        CHECK(rf_frame_similar_tx_echo(&sent, &full, tol_pct, tol_us, 32000),
+              "untruncated echo must match verbatim");
+    }
+
+    CASE("tx echo: genuinely different frames are NOT suppressed");
+
+    /* Another transmitter's code, delivered in the same 49-pulse shape. False
+     * suppression here would swallow a real doorbell press. */
+    rf_ev1527_build(0x5A17Cu, 0x8u, 350, &other);
+    slice_frame(&other, 0, 49, &echo);
+    CHECK(!rf_frame_similar_tx_echo(&sent, &echo, tol_pct, tol_us, idle_us),
+          "a different id must never be treated as our echo");
+
+    /* Same transmitter id, different button: only 4 of the 24 bits can differ,
+     * so this is the closest a real foreign frame gets to ours. */
+    rf_ev1527_build(0xA685Au, 0x1u, 350, &other);
+    slice_frame(&other, 0, 49, &echo);
+    CHECK(!rf_frame_similar_tx_echo(&sent, &echo, tol_pct, tol_us, idle_us),
+          "same id, different button must never be treated as our echo");
+
+    /* One pulse short of a frame that does NOT end in a strippable gap: the
+     * real captured doorbell ends on a HIGH, so there is nothing the idle
+     * threshold could have truncated and the stripped form must be refused. */
+    {
+        rf_frame_t cap, short48;
+        load_real_doorbell(&cap);
+        slice_frame(&cap, 0, 48, &short48);
+        CHECK(!rf_frame_similar_tx_echo(&cap, &short48, tol_pct, tol_us, idle_us),
+              "a frame ending on HIGH has no gap to strip");
+        /* Its untruncated echo, though, matches as it always did. */
+        {
+            rf_frame_t same = cap;
+            jitter_frame(&same, 4);
+            CHECK(rf_frame_similar_tx_echo(&cap, &same, tol_pct, tol_us, idle_us),
+                  "replayed-capture echo must keep matching verbatim");
+        }
+    }
+
+    CASE("tx echo: the gap-vs-idle boundary");
+
+    /* Base 100 us: sync low 3100 us, nowhere near the 8000 us threshold even
+     * with tolerance — the receiver would never have truncated it, so a
+     * one-pulse-short arrival is some OTHER waveform and must not match. */
+    rf_ev1527_build(0xA685Au, 0x8u, 100, &sent);
+    slice_frame(&sent, 0, 49, &echo);
+    CHECK(!rf_frame_similar_tx_echo(&sent, &echo, tol_pct, tol_us, idle_us),
+          "a 3.1 ms trailing low cannot explain a truncated echo");
+
+    /* Base 250 us: sync low 7750 us, just UNDER the threshold — but inside the
+     * tolerance window, and the echoing device's drift can push it over, so
+     * the truncated form must still be accepted. */
+    rf_ev1527_build(0xA685Au, 0x8u, 250, &sent);
+    slice_frame(&sent, 0, 49, &echo);
+    CHECK(rf_frame_similar_tx_echo(&sent, &echo, tol_pct, tol_us, idle_us),
+          "a sync low within tolerance of the idle threshold must strip");
+
+    /* idle_us == 0 disables stripping outright. */
+    rf_ev1527_build(0xA685Au, 0x8u, 350, &sent);
+    slice_frame(&sent, 0, 49, &echo);
+    CHECK(!rf_frame_similar_tx_echo(&sent, &echo, tol_pct, tol_us, 0),
+          "idle_us 0 must disable the stripped form");
+
+    /* Degenerate inputs. */
+    CHECK(!rf_frame_similar_tx_echo(NULL, &echo, tol_pct, tol_us, idle_us),
+          "NULL sent");
+    CHECK(!rf_frame_similar_tx_echo(&sent, NULL, tol_pct, tol_us, idle_us),
+          "NULL heard");
+    CHECK(rf_frame_similar_tx_echo(&sent, &sent, tol_pct, tol_us, idle_us),
+          "a frame is its own echo");
+}
+
 static void test_noise_rejected(void)
 {
     unsigned decoded = 0;
@@ -1052,6 +1183,7 @@ int main(void)
     test_base_estimation_with_glitch();
     test_fingerprint();
     test_frame_similar();
+    test_tx_echo_similarity();
     test_noise_rejected();
     test_degenerate_frames();
 
