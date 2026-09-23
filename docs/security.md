@@ -39,19 +39,22 @@ moment a password is set); the web UI recommends the pair instead.
 ## The password
 
 * One credential, user hardcoded `admin`, password 1–64 characters,
-  write-only over the API, stored in the config partition.
+  write-only over the API, stored as a salted PBKDF2 hash in the config
+  partition — the plaintext is never written to flash.
 * It guards **every `/api` route on every transport** — LAN, softAP, and the
   recovery portal. Consistency is the point: a "recovery mode skips auth"
   exception would BE the vulnerability (walk near the house, jam the Wi-Fi
   until the box falls back, use the open portal).
 * Static files (the UI shell, so its login screen can render) and
   `GET /cert.pem` (see below) stay open; neither changes state.
-* Brute force: a wrong guess arms a box-wide ~300 ms lockout during which
-  every auth attempt — right, wrong or malformed — gets the same immediate
-  401 without being evaluated, capping guessing at roughly 3/s. The refusal
-  is instant rather than a worker-blocking sleep, so failures can never be
-  used to stall the server, and the compare itself is constant-time — timing
-  distinguishes nothing.
+* Brute force: verifying a candidate password means stretching it through
+  PBKDF2, which costs about **1 second** of real work — so every wrong guess
+  pays a full second and guessing is capped at roughly one attempt per
+  second, with no lockout window that could refuse the *right* password. A
+  successful verify is cached server-side: the first correct request after
+  boot pays the same ~1 s (the UI's login screen shows it as "Checking…"),
+  every later one is checked instantly against the cache with a
+  constant-time compare — timing distinguishes nothing.
 * The 401 carries **no `WWW-Authenticate` header**, so browsers never pop
   their native password dialog over the UI's own login screen. `curl -u`,
   scripts and Home Assistant send credentials preemptively and never need
@@ -120,9 +123,15 @@ https. That redirect is the **entire** enforcement, deliberately:
 
 The HTTPS server needs an identity to start. If the box ever finds itself
 with TLS enabled and *no producible identity* (in practice: stored pair
-corrupted **and** NVS too full to mint a new one), it serves **plain HTTP
-and says so** in the log and the event feed, rather than serving nothing —
-an unreachable box cannot even be told to turn TLS off. On the recovery
+corrupted **and** NVS too full to mint a new one), or the HTTPS server
+itself fails to start, it serves **plain HTTP and says so** in the log and
+the event feed, rather than serving nothing — an unreachable box cannot
+even be told to turn TLS off. The downgrade is never permanent: while the
+configuration says TLS and the fallback is what is running, the box retries
+the HTTPS start **every 60 seconds, forever** — you chose TLS, and a
+transient boot-time failure must not silently revoke that choice until the
+next power cycle. The event feed reports the fallback once when it happens
+and the recovery once when it succeeds, not every retry. On the recovery
 portal with TLS enabled, captive-portal sheets may balk at the self-signed
 redirect; opening `https://192.168.66.1` in a normal browser (and accepting
 the pin) always works.

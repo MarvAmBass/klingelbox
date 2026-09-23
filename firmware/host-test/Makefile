@@ -18,12 +18,19 @@
 #                    final. Wrong once in a way only an rc runner would ever
 #                    see, which is exactly the user no on-device test covers.
 #
-#   test_http_auth   the pure halves of the web security wave: the HTTP Basic
-#                    credential parser + constant-time compare (http_auth.c)
-#                    and the structural PEM preflight (pem_scan.c). Both files
-#                    are framework-free BY CONTRACT so this binary can link
-#                    them with no stubs at all — if either grows an IDF
+#   test_http_auth   the pure halves of the web security wave: the password
+#                    hashing primitives against their published vectors
+#                    (pw_hash.c: SHA-256/HMAC/PBKDF2 + the calibration
+#                    clamp), the HTTP Basic credential parser with its
+#                    per-boot verify cache and the change-during-verify
+#                    race rule (http_auth.c), and the structural PEM
+#                    preflight (pem_scan.c). All three files are
+#                    framework-free BY CONTRACT so this binary can link
+#                    them with no stubs at all — if any grows an IDF
 #                    dependency, this build breaks first, on purpose.
+#                    DB_HOSTTEST enables the mid-verify hook that lets a
+#                    single-threaded test land a password change inside
+#                    the slow verify window.
 #
 #   test_node_graph  the pieces of main/ that can destroy a user's data:
 #                    the frozen on-flash node layouts and their widening
@@ -89,9 +96,11 @@ test_version_cmp: test_version_cmp.c $(MAIN)/version_cmp.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(MAIN) -o $@ test_version_cmp.c
 
 test_http_auth: test_http_auth.c $(MAIN)/http_auth.c $(MAIN)/http_auth.h \
+        $(MAIN)/pw_hash.c $(MAIN)/pw_hash.h \
         $(MAIN)/pem_scan.c $(MAIN)/pem_scan.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(MAIN) -o $@ \
-	        test_http_auth.c $(MAIN)/http_auth.c $(MAIN)/pem_scan.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DDB_HOSTTEST -I$(MAIN) -o $@ \
+	        test_http_auth.c $(MAIN)/http_auth.c $(MAIN)/pw_hash.c \
+	        $(MAIN)/pem_scan.c
 
 test: $(BINS)
 	./test_rf_decode

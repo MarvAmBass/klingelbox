@@ -12,14 +12,27 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
 # ---- Flash & partition table ---------------------------------------------
-CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# 4MB is THE flash size, even though the dev board has 16 MB: one release image
+# must boot on every supported board, and the ESP32-S3 Zero (S3FH4R2) has 4 MB.
+# On a 16 MB chip the driver logs "Detected size larger than the size in the
+# binary image header" once at boot and clamps itself to 4 MB — the upper 12 MB
+# just go unused. Accepted cost of the one-image decision (see partitions.csv).
+#
+# Already-deployed boxes with the old 16 MB table are NOT affected by this
+# setting: the flash size a running system honours comes from the BOOTLOADER's
+# image header on flash (CONFIG_SPI_FLASH_SIZE_OVERRIDE stays off, so the app's
+# own header is never consulted at runtime). OTA replaces only the app, so
+# those boxes keep their 16 MB bootloader header, their 16 MB table, and their
+# storage partition at 0x420000 — all still reachable.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # ---- PSRAM: deliberately OFF ---------------------------------------------
-# This dev board HAS 8 MB octal PSRAM, but the eventual target (ESP32-S3 Zero)
-# has none — and enabling SPIRAM on a module without it HANGS AT BOOT. Nothing in
+# The dev board HAS 8 MB octal PSRAM, but the ESP32-S3 Zero this same image
+# boots on carries quad PSRAM — and an octal-configured SPIRAM init on the
+# wrong module HANGS AT BOOT. Nothing in
 # this firmware needs it (RF capture buffers are a few KB), so the portable
 # default wins. To use it on this board only, uncomment:
 #   CONFIG_SPIRAM=y

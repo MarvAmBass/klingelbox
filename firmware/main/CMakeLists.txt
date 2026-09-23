@@ -18,7 +18,8 @@ idf_component_register(
         "wifi_mgr.c"         # APSTA + Tasmota-style recovery portal
         "dns_server.c"       # captive DNS for the portal
         "http_api.c"         # REST + web UI serving
-        "http_auth.c"        # Basic-auth parse + constant-time compare (pure)
+        "http_auth.c"        # Basic-auth parse + verify cache (pure)
+        "pw_hash.c"          # SHA-256/HMAC/PBKDF2 password hashing (pure)
         "pem_scan.c"         # structural preflight of uploaded PEM (pure)
         "db_tls.c"           # the box's TLS identity (generate/upload/persist)
         "mqtt_bridge.c"      # MQTT + Home Assistant discovery
@@ -84,13 +85,22 @@ else()
     message(STATUS "Klingelbox: firmware/webui/ not found — using placeholder (main/www/)")
 endif()
 
+# The staging step also stamps PROJECT_VER over the UI's __DB_ASSET_V__
+# placeholder (index.html and app.js) BEFORE gzipping — that is what makes the
+# "app.js?v=<version>" immutable-cache scheme in http_api.c safe: a new
+# firmware version rewrites every asset URL and busts the cache by addressing.
+# gzip_webui.py FAILS THE BUILD if the UI links "?v=" URLs but the placeholder
+# substitutes zero times — a silently unsubstituted placeholder would be one
+# constant URL that browsers cache as immutable across every future OTA.
 set(WEBUI_STAGE "${CMAKE_BINARY_DIR}/webui-gz")
 idf_build_get_property(webui_python PYTHON)
+idf_build_get_property(webui_ver PROJECT_VER)
 add_custom_target(webui_gzip ALL
     COMMAND ${webui_python}
             "${CMAKE_CURRENT_LIST_DIR}/../tools/gzip_webui.py"
             "${WEBUI_DIR}" "${WEBUI_STAGE}"
-    COMMENT "Compressing web UI into ${WEBUI_STAGE}"
+            --version "${webui_ver}"
+    COMMENT "Compressing web UI into ${WEBUI_STAGE} (asset version ${webui_ver})"
     VERBATIM)
 
 spiffs_create_partition_image(storage "${WEBUI_STAGE}" FLASH_IN_PROJECT)

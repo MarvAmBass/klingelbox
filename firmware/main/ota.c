@@ -80,6 +80,17 @@ static void ota_task(void *arg)
         .url = s_url,
         .timeout_ms = 20000,
         .keep_alive_enable = true,
+        /* 2 KB header buffers, NOT the 512-byte default. The stored default
+         * URLs are GitHub /releases/latest/download/... assets, and that
+         * endpoint 302s to objects.githubusercontent.com with a SIGNED
+         * Location URL well over 1 KB. The default buffer can hold neither
+         * that header nor the follow-up request line, so the pull died on
+         * the redirect before a single image byte arrived — an OTA that
+         * "fails instantly" with no useful error. buffer_size is the RX
+         * header/body buffer, buffer_size_tx must grow WITH it because the
+         * redirected request line carries that same >1 KB URL back out. */
+        .buffer_size = 2048,
+        .buffer_size_tx = 2048,
     };
     /* HTTPS (e.g. GitHub release assets): verify against the ESP-IDF certificate
      * bundle. Attached only for https:// so plain-HTTP URLs (a local test server,
@@ -158,6 +169,11 @@ static void webui_ota_task(void *arg)
         .timeout_ms = 20000,
         .keep_alive_enable = true,
         /* Plain HTTP allowed, same policy as the app OTA (see db_ota_start). */
+        /* 2 KB both ways for GitHub's >1 KB signed redirect Location — the
+         * same trap as the app OTA above; the redirect loop below is exactly
+         * where the 512-byte default died. */
+        .buffer_size = 2048,
+        .buffer_size_tx = 2048,
     };
 #if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
     if (strncmp(s_url, "https://", 8) == 0)

@@ -1232,5 +1232,29 @@ window.KLINGELBOX_DE = {
   "There is no reset. Not over the API, not on the recovery portal — a back door for you would be a back door for anyone in Wi-Fi range, so the box does not have one. The only way back in is physical: a USB cable and a full-image reflash, which factory-resets the box — the password goes, and with it the Wi-Fi settings, every learned signal and the whole node graph.": "Es gibt keinen Reset. Nicht über die API, nicht über das Einrichtungs-Portal — eine Hintertür für dich wäre eine Hintertür für jeden in Funkreichweite, also hat die Box keine. Der einzige Weg zurück ist physisch: ein USB-Kabel und das Flashen des vollständigen Images, was die Box auf Werkszustand setzt — das Passwort ist weg, und mit ihm die Wi-Fi-Einstellungen, jedes gelernte Signal und der ganze Node-Graph.",
   "This browser stores the password when you sign in, so day to day you will not see the login screen. Everything else — another browser, curl, Home Assistant — sends it as HTTP Basic: user admin, your password. Removing the password needs it too: sign in, then clear it in the same settings section.": "Dieser Browser speichert das Passwort bei der Anmeldung, im Alltag siehst du die Anmeldemaske also nicht. Alles andere — ein anderer Browser, curl, Home Assistant — schickt es als HTTP Basic: Benutzer admin, dein Passwort. Auch zum Entfernen braucht es das Passwort: anmelden, dann im selben Einstellungs-Abschnitt löschen.",
   "Turning on TLS (HTTPS) encrypts the connection, which matters once a password exists: over plain HTTP that password crosses the network readable on every request. The box signs its own certificate — no public authority issues one for a box that lives only on your LAN — so the first https:// visit shows a browser warning. The warning does not mean something is wrong; it means the browser has never met this particular box.": "TLS (HTTPS) einzuschalten verschlüsselt die Verbindung — und das zählt, sobald ein Passwort existiert: Über einfaches HTTP läuft dieses Passwort bei jeder Anfrage lesbar durchs Netz. Die Box unterschreibt ihr Zertifikat selbst — keine öffentliche Stelle stellt eines für eine Box aus, die nur in deinem LAN lebt —, deshalb zeigt der erste https://-Besuch eine Browserwarnung. Die Warnung heißt nicht, dass etwas kaputt ist; sie heißt, dass der Browser genau diese Box noch nie getroffen hat.",
-  "You vouch for the box instead of an authority: fetch its certificate from /cert.pem — served over plain HTTP precisely so this first step needs no trust yet — and check the SHA-256 fingerprint against the one shown under Settings › Access & encryption. If they match, tell your client to trust exactly that certificate: curl --cacert, a certificate line in Home Assistant, or the browser's accept-the-risk button. From then on nothing between you and the box can impersonate it.": "Statt einer Autorität bürgst du selbst für die Box: Hol ihr Zertifikat von /cert.pem — absichtlich über einfaches HTTP ausgeliefert, damit dieser erste Schritt noch kein Vertrauen braucht — und vergleiche den SHA-256-Fingerprint mit dem unter Einstellungen › Zugang & Verschlüsselung angezeigten. Stimmen sie überein, sag deinem Client, genau diesem Zertifikat zu vertrauen: curl --cacert, eine certificate-Zeile in Home Assistant oder der Akzeptieren-Knopf des Browsers. Von da an kann sich nichts zwischen dir und der Box für sie ausgeben."
+  "You vouch for the box instead of an authority: fetch its certificate from /cert.pem — served over plain HTTP precisely so this first step needs no trust yet — and check the SHA-256 fingerprint against the one shown under Settings › Access & encryption. If they match, tell your client to trust exactly that certificate: curl --cacert, a certificate line in Home Assistant, or the browser's accept-the-risk button. From then on nothing between you and the box can impersonate it.": "Statt einer Autorität bürgst du selbst für die Box: Hol ihr Zertifikat von /cert.pem — absichtlich über einfaches HTTP ausgeliefert, damit dieser erste Schritt noch kein Vertrauen braucht — und vergleiche den SHA-256-Fingerprint mit dem unter Einstellungen › Zugang & Verschlüsselung angezeigten. Stimmen sie überein, sag deinem Client, genau diesem Zertifikat zu vertrauen: curl --cacert, eine certificate-Zeile in Home Assistant oder der Akzeptieren-Knopf des Browsers. Von da an kann sich nichts zwischen dir und der Box für sie ausgeben.",
+
+  /* --- v0.9.0: the firmware/UI skew notice and the Diagnostics uptime +
+         reset-reason line. Appended as one block for the same review-together
+         reason as the blocks above; keys sorted within it. The reset-reason
+         fragments complete the sentence "… letzter Neustart: {reason}." --- */
+  "Dismiss": "Ausblenden",
+  "JTAG reset": "JTAG-Reset",
+  "SDIO reset": "SDIO-Reset",
+  "This page was built for firmware {ui}, but the box is running {fw} — a web-UI update is probably still pending. Install it under Settings → Firmware & web UI update, then reload this page.": "Diese Seite wurde für Firmware {ui} gebaut, aber die Box läuft mit {fw} — vermutlich steht das Web-UI-Update noch aus. Installiere es unter Einstellungen → Update von Firmware & Web-Oberfläche und lade diese Seite danach neu.",
+  "USB reset": "USB-Reset",
+  "Up {d} — last restart: {reason}.": "Läuft seit {d} — letzter Neustart: {reason}.",
+  "Up {d}.": "Läuft seit {d}.",
+  "a CPU lockup": "eine blockierte CPU (Lockup)",
+  "a brownout — the supply voltage dipped": "ein Brownout — die Versorgungsspannung ist eingebrochen",
+  "a crash (panic)": "ein Absturz (Panic)",
+  "a power glitch": "ein kurzer Spannungsaussetzer",
+  "a task watchdog": "ein Task-Watchdog",
+  "a watchdog": "ein Watchdog",
+  "an eFuse error": "ein eFuse-Fehler",
+  "deep-sleep wake": "Aufwachen aus dem Tiefschlaf",
+  "external reset pin": "externer Reset-Pin",
+  "power-on": "Einschalten",
+  "software restart": "Software-Neustart",
+  "the interrupt watchdog": "der Interrupt-Watchdog"
 };

@@ -393,6 +393,20 @@ main {
 .note.ok   { border-left-color: var(--ok);   background: var(--ok-bg);   color: var(--text); }
 .note b { color: var(--text); }
 
+/* The firmware/UI skew notice (app.js renderSkewNotice): a .note.warn that
+   sits ABOVE the tab panes, on every tab, with a dismiss ✕. The ✕ is small
+   type but a full 2rem tap target; margin pulls it into the note's padding
+   so the banner stays one text-line tall at 360 px. */
+.skewnote { display: flex; align-items: flex-start; gap: .5rem; margin: 0 0 .75rem; }
+.skew-text { flex: 1 1 auto; min-width: 0; }
+.skew-x {
+  appearance: none; flex: none; border: 0; background: none; color: inherit;
+  font: inherit; font-size: .9rem; line-height: 1; cursor: pointer;
+  min-width: 2rem; min-height: 2rem; margin: -.35rem -.45rem 0 0;
+  border-radius: var(--r-sm);
+}
+.skew-x:hover { background: var(--sunk); }
+
 /* ------------------------------------------------------------------ chips -- */
 .chip {
   display: inline-flex; align-items: center; gap: .3rem;

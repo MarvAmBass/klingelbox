@@ -103,7 +103,7 @@ replays a real doorbell, and the replay rings the actual chime.
 | Page | What's in it |
 |---|---|
 | [Hardware](hardware.html) | Wiring, board choices, antenna and power notes. |
-| [Flashing](flashing.html) | Browser flasher, `idf.py`, OTA, the 4 MB ESP32-S3 Zero. |
+| [Flashing](flashing.html) | Browser flasher, `idf.py`, OTA — one image for every board. |
 | [Automations](automations.html) | The node graph: every node type and what it is for. |
 | [MQTT & Home Assistant](mqtt.html) | Topic map, payloads, discovery, recipes. |
 | [REST API](https://github.com/MarvAmBass/klingelbox/blob/main/docs/API.md) | The complete HTTP surface — the contract between firmware and web UI. |

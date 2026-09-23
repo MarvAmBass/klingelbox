@@ -46,7 +46,8 @@ replaced without recompiling the firmware.
 That is the one build step, it is three lines of CMake plus
 `firmware/tools/gzip_webui.py`, and it never touches these files — see **Size**
 below for why it exists and what the server does with a client that does not
-ask for gzip.
+ask for gzip. The same step substitutes the asset-version placeholder — see
+**Versioned assets** below.
 
 The product name is German, and now so is one of the two interface languages.
 
@@ -441,7 +442,7 @@ Five tabs, plus the recovery wizard that replaces the whole page.
 | ↳ *Access & encryption* | `/api/config` (`web.*`), `/api/tls/identity` (POST/DELETE), `/cert.pem` |
 | ↳ *Stored signals* | `/api/signals`, `/api/signals/{id}` (GET/POST/DELETE), `/api/signals/{id}/transmit`, `/api/graph` (to say who uses what) |
 | ↳ *Backup* — export/import | export: `/api/system`, `/api/radio`, `/api/signals`, `/api/signals/{id}`, `/api/graph`. import: `/api/signals/import`, `/api/graph/nodes` (POST/DELETE), `/api/graph/links`, `/api/signals/{id}` (DELETE), `/api/radio` (optional) |
-| **Diagnostics** | `/api/diagnostics` |
+| **Diagnostics** | `/api/diagnostics` (plus `/api/system` for the uptime + reset-reason line) |
 | **Recovery wizard** | `/api/system`, `/api/wifi/scan`, `/api/wifi` |
 | **Login screen** | `/api/system` (a raw probe with the candidate password — see **Auth & TLS**) |
 
@@ -522,7 +523,12 @@ its count, its last-seen age and its `detail` string, plus a short "what to do
 next" line per state and a plain-language verdict banner derived from which
 states have fired. The capture counters each carry an explanation of what a
 rising number means. This is the page someone reads when nothing works, so it
-is written to be read cold.
+is written to be read cold. Above the verdict sits a one-liner from
+`/api/system`: uptime and, when the firmware reports it, the reset reason —
+"how long has it been up" and "why did it last go down" are two halves of the
+same question. The everyday causes (power-on, software restart) stay a plain
+muted line; panic, watchdog and brownout get the warning tint, because a box
+that keeps crashing should say so on exactly this page.
 
 **Recovery wizard** replaces the entire page (the tab bars are hidden and the
 header badge turns amber) when `GET /api/system` reports
@@ -618,9 +624,13 @@ full-page overlay in `app.js` (`showLogin()`) is what every user sees, in
 their language, at 360 px, in dark mode. It probes `GET /api/system` with the
 candidate password via a **raw `fetch`** (not `api()`, which would attach the
 stored header and feed its own failure back into the 401 handler) and stores
-nothing until that probe answers 200. A wrong password is delayed ~300 ms by
-the firmware (brute-force damping); the overlay shows a spinner so the pause
-reads as checking, not hanging. On success it reloads the page — boot ran
+nothing until that probe answers 200. Expect that probe to take **about a
+second**: the firmware stores the password as a PBKDF2 hash, and stretching
+the candidate costs the same ~1 s whether it is right (first login after boot;
+later requests hit a server-side verify cache and are instant) or wrong —
+which is the brute-force damping. The overlay shows an indeterminate bar plus
+"Checking…" so that second reads as checking, not hanging. On success it
+reloads the page — boot ran
 without credentials, so the caches are error states, and a reload re-boots
 cleanly with the header attached.
 
@@ -828,6 +838,40 @@ Nothing is minified, on purpose: the comments explain *why* each non-obvious
 decision was made, and a future maintainer reading this off a microcontroller
 has no source map. Gzip makes minification unnecessary — comments compress
 extremely well.
+
+---
+
+## Versioned assets
+
+Browsers cache aggressively, and a box that just flashed a new `storage.bin`
+must not keep serving a stale `app.js` out of somebody's cache. The scheme is
+the classic immutable-asset one, split across the two build halves:
+
+* **These files carry the literal placeholder `__DB_ASSET_V__`.** The build
+  step replaces it with the firmware version in `index.html` **and** `app.js`,
+  before gzipping. Nothing in this directory ever contains a real version
+  string, so an unchanged UI still produces byte-identical output.
+* **`index.html` references every asset with `?v=__DB_ASSET_V__`** —
+  `style.css`, `lang-de.js`, `app.js`. After substitution the URLs change with
+  every release, so cached copies can live forever and are simply never asked
+  for again. `index.html` itself is the one **unversioned** file: it is the
+  revalidation point through which every update becomes visible.
+* **`app.js` holds the same placeholder once, as `ASSET_V`** — the UI's own
+  build stamp. Today no asset is loaded dynamically from code (`lang-de.js` is
+  a static `<script>` in `index.html`), so its only consumer is the **skew
+  notice**: the app and the web UI live in separate flash partitions, a deploy
+  can update one and not the other, and when the substituted `ASSET_V`
+  disagrees with `/api/system`'s `version` the UI shows a small dismissible
+  banner saying a web-UI update is probably pending. Dismissal is remembered
+  per pair in `sessionStorage`, so the same mismatch stays quiet for the
+  session but the next one speaks up. Any *future* dynamic asset load must
+  append the same `?v=` + `ASSET_V`.
+* **The placeholder must not leak into URLs.** A dev-served copy of this
+  directory never ran the substitution, so `assetVersion()` in `app.js` treats
+  a value still starting with `__` as "no version at all": dynamic URLs would
+  stay query-less and the skew notice stays silent. The static `?v=`
+  placeholders in a dev-served `index.html` are inert — a meaningless query
+  string the server ignores; it just never changes.
 
 ---
 

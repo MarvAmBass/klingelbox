@@ -281,7 +281,12 @@ static bool gh_fetch(gh_parse_t *p, char *err, size_t errsz)
         .timeout_ms = GH_TIMEOUT_MS,
         .keep_alive_enable = false,
         /* The response headers alone (rate-limit, caching, tracing) run past
-         * the 512-byte default and a short header buffer aborts the request. */
+         * the 512-byte default and a short header buffer aborts the request.
+         * 1 KB is enough HERE, unlike the 2 KB the OTA pulls need (ota.c):
+         * this talks to api.github.com, which answers the query directly —
+         * the >1 KB signed Location redirects live on the release-asset
+         * download path, never on the API. The redirect loop below is only
+         * for small same-host path moves. */
         .buffer_size = 1024,
         .buffer_size_tx = 1024,
 #if CONFIG_MBEDTLS_CERTIFICATE_BUNDLE

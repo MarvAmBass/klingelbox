@@ -83,12 +83,14 @@ curl -u admin:hunter2-but-better -X POST http://klingelbox.local/api/config \
 * It guards `/api` on **every** transport, the recovery portal included. A
   forgotten password is recovered by USB reflash, nothing less — see
   [`security.md`](security.md#lockout-recovery).
-* Wrong or missing credentials get the same immediate `401`, and a wrong
-  guess closes the auth gate box-wide for ~300 ms: any attempt inside that
-  window — the correct password included — is refused **unevaluated** with
-  the identical 401. That caps guessing at roughly 3/s without ever blocking
-  the server, and the comparison itself is constant-time — timing reveals
-  nothing.
+* Wrong and missing credentials get the identical `401`. The password is
+  stored as a salted **PBKDF2** hash, and verifying a candidate costs about
+  **1 second** of deliberate key stretching — that is the brute-force
+  damping: every wrong guess pays the full second, capping guessing at
+  roughly one attempt per second. A successful verify is cached server-side,
+  so only the **first** correct request after boot pays it; every later
+  request is checked instantly against the cache, with a constant-time
+  compare — timing reveals nothing.
 
 ### TLS
 
@@ -160,7 +162,9 @@ to be fetchable before any trust exists.
 ### `GET /api/system`
 ```json
 { "version": "0.1.0", "idf": "v5.3.1", "hostname": "doorbell",
-  "uptime_s": 1234, "free_heap": 210000, "partition": "ota_0",
+  "uptime_s": 1234, "free_heap": 210000,
+  "reset_reason": 1, "reset_reason_text": "power-on",
+  "partition": "ota_0",
   "wifi_mode": "normal|recovery|connecting",
   "sta_connected": true, "sta_ip": "192.168.1.42", "sta_ssid": "home",
   "ap_ip": "192.168.66.1", "ap_ssid": "Doorbell433",
@@ -168,6 +172,15 @@ to be fetchable before any trust exists.
 ```
 `wifi_mode == "recovery"` is the signal for the UI to replace the normal page
 with the first-run Wi-Fi wizard.
+
+`reset_reason` (since v0.9.0) + `uptime_s` together are the no-serial-cable
+crash report: a small uptime with `"panic"` (4), `"int-wdt"` (5),
+`"task-wdt"` (6) or `"brownout"` (9) means the box crashed or browned out
+and rebooted itself; `"software"` (3) is a deliberate reboot (restart
+button, OTA); `"power-on"` (1) is a power cycle. The number is
+`esp_reset_reason()`'s stable enum, the text a convenience. The UI shows it
+on the Diagnostics page next to the uptime — everyday values plain, panic /
+watchdog / brownout with a warning tint.
 
 ### `POST /api/system/hostname` — `{"hostname":"doorbell"}` (applies on reboot)
 ### `POST /api/restart` — `{}` → reboots

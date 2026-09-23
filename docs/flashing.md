@@ -26,7 +26,10 @@ Three ways to get firmware onto the box: your browser, `idf.py`, or OTA.
 | First flash, or a board in an unknown state | **[Browser flasher](flasher/)** — nothing to install. |
 | You are developing the firmware | **`idf.py`** — you need the build anyway. |
 | A working Klingelbox you want to update | **OTA** — keeps all configuration. |
-| A 4 MB ESP32-S3 Zero | Build it yourself, then browser flasher or `idf.py`. |
+
+The routes are the same for every supported board — the release image is one image
+that boots on the 16 MB dev board and the 4 MB ESP32-S3 Zero alike (see
+[one image, every board](#one-image-every-board)).
 
 A full-image flash **factory-resets** the device: Wi-Fi credentials, hostname, MQTT
 settings, the web password, the TLS certificate and key, every learned signal and the
@@ -120,19 +123,19 @@ The web UI lives in the `storage` SPIFFS partition and is built and flashed as a
 image. `idf.py flash` handles the app; the SPIFFS image is produced by the build and
 written the same way.
 
-### The 4 MB ESP32-S3 Zero
+### One image, every board
 
-```sh
-SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.4mb" idf.py build
-```
+There is exactly **one** partition layout (`partitions.csv`, sized for 4 MB flash) and
+one release image, and it boots on every supported board. On the ESP32-S3 Zero it fills
+the chip; on a 16 MB dev board it works identically and leaves the upper 12 MB unused.
+Nothing to build yourself, no variant to pick — the ESP32-S3 Zero uses the same browser
+flasher, the same release download and the same OTA as everything else.
 
-This selects `partitions-4mb.csv` (1.5 MB per app slot, 512 KB web-UI SPIFFS). **Keep the
-firmware inside 1.5 MB or that table stops fitting.**
-
-A 4 MB and a 16 MB build are not interchangeable — the partition table is baked into the
-image, and a 16 MB table on a 4 MB chip points past the end of the flash. If the release
-does not ship a 4 MB image, build it yourself and flash the merged result through the
-browser flasher's **local .bin** option at offset `0x0`, or with `idf.py`.
+Boxes that were **flashed before the unified layout** (v0.8.0 and earlier releases used
+a 16 MB table) are fine and need nothing: OTA never rewrites the partition table, so
+they keep their old table and simply keep working — the app update and the web-UI update
+land in their old partitions exactly as before. Do **not** re-flash a working box at
+`0x0` to "get the new table"; that is a factory reset and buys you nothing.
 
 ---
 
@@ -144,7 +147,9 @@ inactive one, reboots into it, and a bad image is rolled back on the next boot.
 
 The app and the web UI are **separate partitions and separate updates**. Updating the app
 leaves the old UI in place until you update the UI too — so after a release that changes
-both, do both.
+both, do both. Since v0.9.0 the web UI notices the drift itself: when the page was built
+for a different firmware version than the box reports, it shows a small dismissible
+banner suggesting the pending web-UI update.
 
 The examples below assume the out-of-the-box posture (no password, no TLS). If you set a
 **web password**, add `-u admin:PASSWORD` to every command (a `401` is what forgetting it
@@ -214,12 +219,29 @@ why. Hard-reload the page (`Ctrl`/`Cmd`+`Shift`+`R`) and try again.
 **It flashed fine and the board does nothing.**
 Check `BOOT` is not still held or jammed — see the warning above. Otherwise unplug and
 replug; the USB-Serial/JTAG port re-enumerates silently after a reset. If it still does
-nothing, attach a serial monitor at 115200 baud: a wrong image for the board (a 16 MB
-image on a 4 MB Zero) shows up there as a partition-table or SPIFFS mount failure.
+nothing, attach a serial monitor at 115200 baud: a wrong image at `0x0` (an app-only or
+SPIFFS image, or a truncated download) shows up there as a bootloader, partition-table
+or SPIFFS mount failure. (An old **16 MB-layout** release image — v0.8.0 or earlier — on
+a 4 MB Zero fails the same way; flash a current release, which fits every board.)
 
 **`klingelbox.local` does not resolve.**
 mDNS is not universal. Find the device's IP in your router's DHCP list and use that. Some
 Android versions and some corporate networks block mDNS entirely.
+
+**Is it running at all, and which version?** (no serial cable needed)
+The box advertises its firmware version in its mDNS service record, so on macOS/Linux one
+line answers "what is actually running?" even when the web server itself is the thing
+that died:
+
+```bash
+dns-sd -L Klingelbox _http._tcp     # macOS  (use _https._tcp when TLS is on)
+avahi-browse -r _http._tcp          # Linux
+```
+
+The TXT record shows `version=…`. If mDNS answers but the page will not load, the app is
+alive with a dead web server — check `GET /api/system`'s `reset_reason` once it is back,
+and see [security.md](security.md) for the TLS fallback behaviour. No mDNS answer plus no
+ping means the box is off the network entirely.
 
 **I flashed it and it never joins my Wi-Fi.**
 It falls back to the `Klingelbox-XXXX` recovery hotspot. Join that and re-enter the

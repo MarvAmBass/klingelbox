@@ -8,15 +8,17 @@
 #define AUTH_USER_PREFIX     "admin:"
 #define AUTH_USER_PREFIX_LEN 6
 
-/* Widest credential we ever compare: "admin:" + a DB_AUTH_PASS_MAX password.
- * Also the fixed width of the constant-time walk, so the compare cost does not
- * depend on the configured password's length either. */
+/* Widest credential we ever accept: "admin:" + a DB_AUTH_PASS_MAX password. */
 #define AUTH_CRED_MAX (AUTH_USER_PREFIX_LEN + DB_AUTH_PASS_MAX)
 
-/* Decoded base64 payload buffer: the credential plus slack, so an attacker
- * sending a slightly-too-long guess still gets the constant-time treatment
- * instead of a cheap length-based early out at the decode stage. */
+/* Decoded base64 payload buffer: the credential plus slack, so a guess a few
+ * bytes over the limit still decodes far enough to be REFUSED by the length
+ * rule below rather than erroring out of the decoder on capacity. */
 #define AUTH_DECODE_MAX (AUTH_CRED_MAX + 32)
+
+#ifdef DB_HOSTTEST
+void (*db_auth_test_after_derive)(void);
+#endif
 
 bool db_auth_ct_equal(const char *a, size_t alen,
                       const char *b, size_t blen, size_t width)
@@ -37,7 +39,8 @@ bool db_auth_ct_equal(const char *a, size_t alen,
 /* Strict base64: the RFC 4648 alphabet, optional trailing '='-padding, no
  * whitespace. Returns the decoded length, or -1 on any malformed input.
  * Strictness matters here: a lax decoder would give one guessed credential
- * several accepted spellings, which is free extra tries per rate-limit slot. */
+ * several accepted spellings, and the per-boot cache below depends on every
+ * accepted spelling decoding to exactly ONE byte sequence. */
 static int b64_decode(const char *in, size_t inlen, unsigned char *out, size_t outcap)
 {
     size_t outlen = 0;
@@ -72,17 +75,13 @@ static int b64_decode(const char *in, size_t inlen, unsigned char *out, size_t o
     return (int)outlen;
 }
 
-db_auth_result_t db_auth_basic_check(const char *authorization,
-                                     const char *password)
+/* Parse "Basic <b64>" into decoded credential bytes. Returns the decoded
+ * length, -1 = no header (MISSING), -2 = malformed (fast WRONG — the
+ * reasoning for the fast path is in http_auth.h). */
+static int parse_basic(const char *authorization, unsigned char *out,
+                       size_t outcap)
 {
-    /* Fail CLOSED on a caller bug: an empty password means "auth disabled",
-     * and that decision belongs to the caller's short-circuit, never to a
-     * string comparison that would then accept "admin:". */
-    if (!password || !password[0]) return DB_AUTH_WRONG;
-    size_t plen = strlen(password);
-    if (plen > DB_AUTH_PASS_MAX) return DB_AUTH_WRONG;
-
-    if (!authorization || !authorization[0]) return DB_AUTH_MISSING;
+    if (!authorization || !authorization[0]) return -1;
 
     /* Scheme: "Basic", case-insensitive (RFC 7617), then at least one space. */
     static const char scheme[] = "basic";
@@ -92,53 +91,121 @@ db_auth_result_t db_auth_basic_check(const char *authorization,
     for (; si < sizeof(scheme) - 1; si++, p++) {
         char c = *p;
         if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-        if (c != scheme[si]) return DB_AUTH_WRONG;
+        if (c != scheme[si]) return -2;
     }
-    if (*p != ' ' && *p != '\t') return DB_AUTH_WRONG;
+    if (*p != ' ' && *p != '\t') return -2;
     while (*p == ' ' || *p == '\t') p++;
-    if (!*p) return DB_AUTH_WRONG;
+    if (!*p) return -2;
 
-    unsigned char decoded[AUTH_DECODE_MAX];
-    int dlen = b64_decode(p, strlen(p), decoded, sizeof(decoded));
-    if (dlen < 0) return DB_AUTH_WRONG;
-
-    char expected[AUTH_CRED_MAX + 1];
-    memcpy(expected, AUTH_USER_PREFIX, AUTH_USER_PREFIX_LEN);
-    memcpy(expected + AUTH_USER_PREFIX_LEN, password, plen);
-    size_t elen = AUTH_USER_PREFIX_LEN + plen;
-
-    bool ok = db_auth_ct_equal((const char *)decoded, (size_t)dlen,
-                               expected, elen, sizeof(decoded));
-
-    /* The expected credential contains the live password — do not leave it
-     * on the stack for the next frame to read. (memset is fine here: the
-     * array is passed to a function above, so it cannot be elided.) */
-    memset(expected, 0, sizeof(expected));
-    memset(decoded, 0, sizeof(decoded));
-
-    return ok ? DB_AUTH_OK : DB_AUTH_WRONG;
+    int dlen = b64_decode(p, strlen(p), out, outcap);
+    return (dlen < 0) ? -2 : dlen;
 }
 
-db_auth_result_t db_auth_gate_check(const char *authorization,
-                                    const char *password,
-                                    int64_t now_ms,
-                                    int64_t *lockout_until_ms)
+void db_auth_cache_init(db_auth_cache_t *cache,
+                        const uint8_t nonce[DB_PW_HASH_LEN])
 {
-    /* Refuse in-window attempts WITHOUT evaluating them. Checking anyway and
-     * honouring a lucky hit would let a guesser fire at line rate and only
-     * pay the window after misses — the cap works because a failure buys
-     * silence, not because failures are slow. The window is short enough
-     * (300 ms) that no human retype ever lands inside it. */
-    if (now_ms < *lockout_until_ms)
-        return DB_AUTH_LOCKED;
+    memset(cache, 0, sizeof(*cache));
+    memcpy(cache->nonce, nonce, DB_PW_HASH_LEN);
+}
 
-    db_auth_result_t r = db_auth_basic_check(authorization, password);
+void db_auth_cache_invalidate(db_auth_cache_t *cache)
+{
+    cache->valid = false;
+    memset(cache->digest, 0, sizeof(cache->digest));
+    cache->generation++;
+}
 
-    /* Arm only on WRONG — an actual evaluated guess. MISSING must stay
-     * harmless (a header-less request is what any cross-origin page can loop,
-     * and it guesses nothing), and re-arming from inside the window is
-     * handled above by not reaching this line at all. See http_auth.h. */
-    if (r == DB_AUTH_WRONG)
-        *lockout_until_ms = now_ms + DB_AUTH_LOCKOUT_MS;
-    return r;
+db_auth_result_t db_auth_check(const char *authorization,
+                               const db_pw_rec_t *rec,
+                               db_auth_cache_t *cache)
+{
+    /* Fail CLOSED on a caller bug: an empty record means "auth disabled",
+     * and that decision belongs to the caller's short-circuit, never to a
+     * hash comparison down here. */
+    if (!rec || rec->iters == 0 || !cache) return DB_AUTH_WRONG;
+
+    unsigned char decoded[AUTH_DECODE_MAX];
+    int dlen = parse_basic(authorization, decoded, sizeof(decoded));
+    if (dlen == -1) return DB_AUTH_MISSING;
+    if (dlen < 0) return DB_AUTH_WRONG;
+
+    /* Shape gate: "admin:" plus 1..64 password bytes. Outside those PUBLIC
+     * bounds (API.md documents both) no credential can ever be correct, so
+     * this is the malformed class and fails fast — see http_auth.h. */
+    if (dlen < AUTH_USER_PREFIX_LEN + 1 || dlen > AUTH_CRED_MAX) {
+        memset(decoded, 0, sizeof(decoded));
+        return DB_AUTH_WRONG;
+    }
+
+    /* Snapshot the record: it lives in the mutable config, and the slow path
+     * below runs long enough for a concurrent password change to rewrite it
+     * mid-read. A torn record must not be verified against. */
+    db_pw_rec_t r = *rec;
+    if (r.iters == 0) {
+        memset(decoded, 0, sizeof(decoded));
+        return DB_AUTH_WRONG;
+    }
+
+    /* Fast path: SHA256(boot_nonce || credential) against the cached success.
+     * Constant-time and over the full credential (user AND password), so the
+     * cache introduces no oracle the slow path did not already lack. */
+    uint8_t nc[DB_PW_HASH_LEN + AUTH_CRED_MAX];
+    memcpy(nc, cache->nonce, DB_PW_HASH_LEN);
+    memcpy(nc + DB_PW_HASH_LEN, decoded, (size_t)dlen);
+    uint8_t digest[DB_PW_HASH_LEN];
+    db_pw_sha256(nc, DB_PW_HASH_LEN + (size_t)dlen, digest);
+    memset(nc, 0, sizeof(nc));
+
+    if (cache->valid &&
+        db_auth_ct_equal((const char *)digest, DB_PW_HASH_LEN,
+                         (const char *)cache->digest, DB_PW_HASH_LEN,
+                         DB_PW_HASH_LEN)) {
+        memset(decoded, 0, sizeof(decoded));
+        memset(digest, 0, sizeof(digest));
+        return DB_AUTH_OK;
+    }
+
+    /* Slow path: the full PBKDF2 derive (~1 s on the box, by calibration —
+     * pw_hash.h). Snapshot the generation FIRST: if a password change lands
+     * while we grind, our result describes a retired record and must neither
+     * be cached nor accepted. */
+    uint32_t gen = cache->generation;
+
+    uint8_t guess[DB_PW_HASH_LEN];
+    db_pw_pbkdf2(decoded + AUTH_USER_PREFIX_LEN,
+                 (size_t)dlen - AUTH_USER_PREFIX_LEN,
+                 r.salt, DB_PW_SALT_LEN, r.iters, guess);
+
+#ifdef DB_HOSTTEST
+    if (db_auth_test_after_derive) db_auth_test_after_derive();
+#endif
+
+    /* Fold the username in AFTER the derive, constant-time, so wrong-user
+     * and wrong-password cost identically and neither is timing-visible. */
+    bool user_ok = db_auth_ct_equal((const char *)decoded, AUTH_USER_PREFIX_LEN,
+                                    AUTH_USER_PREFIX, AUTH_USER_PREFIX_LEN,
+                                    AUTH_USER_PREFIX_LEN);
+    bool hash_ok = db_auth_ct_equal((const char *)guess, DB_PW_HASH_LEN,
+                                    (const char *)r.hash, DB_PW_HASH_LEN,
+                                    DB_PW_HASH_LEN);
+    bool ok = user_ok && hash_ok;
+
+    if (ok && cache->generation == gen) {
+        /* Only a verified-correct credential enters the cache, and only when
+         * no invalidation raced the derive. */
+        memcpy(cache->digest, digest, DB_PW_HASH_LEN);
+        cache->valid = true;
+    } else if (ok) {
+        /* Correct against the OLD record, but the password changed while we
+         * verified: the credential is retired, refuse it. The client retries
+         * with whatever the operator just set. */
+        ok = false;
+    }
+
+    memset(decoded, 0, sizeof(decoded));
+    memset(digest, 0, sizeof(digest));
+    memset(guess, 0, sizeof(guess));
+    memset(&r, 0, sizeof(r));
+
+    return ok ? DB_AUTH_OK : DB_AUTH_WRONG;
 }

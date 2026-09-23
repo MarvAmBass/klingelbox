@@ -35,6 +35,29 @@ Determinism: mtime is forced to 0 and the original filename is left out of the
 gzip header, so an unchanged UI produces a byte-identical storage.bin. That
 keeps release artefacts reproducible and stops `idf.py flash` from re-writing
 the storage partition when nothing actually changed.
+
+ASSET-VERSION SUBSTITUTION (--version <ver>)
+--------------------------------------------
+The UI links its assets as "app.js?v=__DB_ASSET_V__" (and app.js carries the
+same placeholder for anything it loads itself, plus the version-skew hint).
+Before gzipping, every occurrence of the literal `__DB_ASSET_V__` in *.html
+and *.js is replaced with the PROJECT_VER CMake hands over — so each firmware
+version links each asset under a NEW URL, and http_api.c may serve those
+`?v=`-tagged requests as `Cache-Control: immutable` (cached forever, busted by
+addressing). The two failure modes are both made LOUD instead of latent:
+
+  * placeholder present but --version missing/empty, or left unreplaced in a
+    file type we do not substitute -> build error. A literal `__DB_ASSET_V__`
+    reaching the flash image would be one constant version tag across every
+    future firmware: browsers would cache the first copy as immutable and
+    keep it across OTAs, permanently.
+  * the UI links "?v=" URLs but NO placeholder was found -> build error, for
+    the same reason: whatever constant is in that URL never changes again.
+
+A UI that does not use "?v=" links at all (the main/www fallback page) simply
+has nothing to substitute and builds as before — the server only sends the
+immutable header when a request carries "?v=", so such a UI keeps the safe
+ETag/no-cache behaviour throughout.
 """
 
 import gzip
@@ -42,6 +65,8 @@ import os
 import shutil
 import sys
 
+PLACEHOLDER = "__DB_ASSET_V__"
+SUBST_SUFFIXES = (".html", ".js", ".mjs")
 
 # Files that exist for the developer, not for the browser. README.md is 35 KB of
 # design notes that nothing ever fetches; it has no business on the flash chip.
@@ -53,10 +78,25 @@ def should_skip(name):
     return name in SKIP_NAMES or name.startswith(".") or name.endswith(SKIP_SUFFIXES)
 
 
-def compress(src_path, dst_path):
-    """Write src_path to dst_path.gz, deterministically (mtime 0, no filename)."""
+def compress(src_path, dst_path, version):
+    """Write src_path to dst_path.gz, deterministically (mtime 0, no filename).
+
+    Returns (raw_len, gz_len, substitutions, residual, links_versioned)."""
     with open(src_path, "rb") as fin:
         raw = fin.read()
+
+    subst = 0
+    name = os.path.basename(src_path)
+    if version and name.endswith(SUBST_SUFFIXES):
+        subst = raw.count(PLACEHOLDER.encode())
+        if subst:
+            raw = raw.replace(PLACEHOLDER.encode(), version.encode())
+    # After substitution NOTHING may still carry the placeholder — neither a
+    # substitutable file built without --version nor a file type (css, json)
+    # the substitution pass does not touch.
+    residual = raw.count(PLACEHOLDER.encode())
+    links_versioned = name.endswith(SUBST_SUFFIXES) and b"?v=" in raw
+
     # mtime=0 and an explicit empty filename keep the output reproducible. The
     # empty `filename` matters: given only a fileobj, GzipFile would take the
     # FNAME field from fileobj.name and stamp the build path's basename into
@@ -65,12 +105,22 @@ def compress(src_path, dst_path):
         with gzip.GzipFile(filename="", fileobj=fout, mode="wb",
                            compresslevel=9, mtime=0) as gz:
             gz.write(raw)
-    return len(raw), os.path.getsize(dst_path)
+    return len(raw), os.path.getsize(dst_path), subst, residual, links_versioned
 
 
 def main(argv):
+    version = None
+    if "--version" in argv:
+        i = argv.index("--version")
+        try:
+            version = argv[i + 1]
+        except IndexError:
+            sys.stderr.write("gzip_webui: --version needs a value\n")
+            return 2
+        del argv[i:i + 2]
     if len(argv) != 3:
-        sys.stderr.write("usage: gzip_webui.py <src-dir> <stage-dir>\n")
+        sys.stderr.write(
+            "usage: gzip_webui.py <src-dir> <stage-dir> [--version <ver>]\n")
         return 2
     src, stage = os.path.abspath(argv[1]), os.path.abspath(argv[2])
 
@@ -88,6 +138,9 @@ def main(argv):
     total_raw = 0
     total_gz = 0
     count = 0
+    total_subst = 0
+    residual_files = []
+    any_versioned_links = False
     for root, dirs, files in os.walk(src):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         rel = os.path.relpath(root, src)
@@ -97,19 +150,50 @@ def main(argv):
         for name in sorted(files):
             if should_skip(name):
                 continue
-            raw, packed = compress(os.path.join(root, name),
-                                   os.path.join(out_dir, name + ".gz"))
+            raw, packed, subst, residual, versioned = compress(
+                os.path.join(root, name),
+                os.path.join(out_dir, name + ".gz"), version)
             total_raw += raw
             total_gz += packed
             count += 1
+            total_subst += subst
+            any_versioned_links = any_versioned_links or versioned
+            if residual:
+                residual_files.append(os.path.join(rel, name))
 
     if not count:
         sys.stderr.write("gzip_webui: nothing to compress in %s\n" % src)
         return 1
 
+    # The loud failures the docstring promises. Silent non-substitution means
+    # every "?v=" asset URL is constant across firmware versions, and the
+    # server's immutable caching would then pin the FIRST shipped copy in
+    # every browser forever — a bug that only shows up one OTA later, on the
+    # user's machine. Refuse to build such an image.
+    if residual_files:
+        sys.stderr.write(
+            "gzip_webui: ERROR: %s survived into the staged image in: %s\n"
+            "  (built %s; the placeholder must be substituted, and may only\n"
+            "   appear in %s files)\n"
+            % (PLACEHOLDER, ", ".join(residual_files),
+               ("with --version " + version) if version else "WITHOUT --version",
+               "/".join(SUBST_SUFFIXES)))
+        return 1
+    if any_versioned_links and total_subst == 0:
+        sys.stderr.write(
+            "gzip_webui: ERROR: the UI links \"?v=\" asset URLs but the %s\n"
+            "placeholder was found 0 times — those URLs would never change\n"
+            "again and browsers would cache the assets as immutable, staying\n"
+            "stale across every future OTA. Version the links as\n"
+            "\"app.js?v=%s\" (index.html AND app.js).\n"
+            % (PLACEHOLDER, PLACEHOLDER))
+        return 1
+
     pct = (100.0 * total_gz / total_raw) if total_raw else 0.0
-    sys.stdout.write("gzip_webui: %d files, %d -> %d bytes (%.0f%%)\n"
-                     % (count, total_raw, total_gz, pct))
+    note = (", v=%s substituted %d times" % (version, total_subst)
+            if total_subst else "")
+    sys.stdout.write("gzip_webui: %d files, %d -> %d bytes (%.0f%%)%s\n"
+                     % (count, total_raw, total_gz, pct, note))
     return 0
 
 

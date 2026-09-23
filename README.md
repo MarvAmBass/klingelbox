@@ -84,9 +84,15 @@ Both sides are 3.3 V — no level shifter. Every pin lives in
 [`firmware/main/board_pins.h`](firmware/main/board_pins.h); porting to another
 board is one edit.
 
-Developed on an ESP32-S3-WROOM-1 (N16R8) and kept portable to the **ESP32-S3
-Zero**: PSRAM is deliberately unused, and a 4 MB partition table ships alongside
-the 16 MB one.
+Two boards are fully supported, and **one release image serves both**: the
+ESP32-S3-WROOM-1 dev board (N16R8, 16 MB flash) the project was developed on,
+and the tiny **Waveshare ESP32-S3-Zero** (ESP32-S3FH4R2, 4 MB flash). Same
+image, same browser flasher, same OTA — picking a board is purely a wiring
+question. The table above applies to both unchanged: all eight GPIOs are on the
+Zero's castellated edge headers, its onboard WS2812 (GPIO 21) is left alone,
+and GPIO 33–37 (not led out on the Zero) are unused. PSRAM is deliberately
+unused. The partition layout is sized for 4 MB flash so the one image boots
+everywhere; a 16 MB board simply leaves its upper 12 MB unused.
 
 **Optional wired button.** A physical button (your front door switch) can be
 wired to any free GPIO and added as a `source.gpio` node — configured *in the web
@@ -103,11 +109,8 @@ idf.py build
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
-ESP-IDF **v5.3.1**, target `esp32s3`. For a 4 MB board:
-
-```sh
-SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.4mb" idf.py build
-```
+ESP-IDF **v5.3.1**, target `esp32s3`. One build for every supported board —
+there are no per-board variants or extra defaults files to select.
 
 ---
 
@@ -188,9 +191,10 @@ your network, as it always was. Two opt-in layers tighten that
 
 * **Web password** (`web.http_password` in `POST /api/config`): every `/api`
   route then requires HTTP Basic auth as user `admin` — on the LAN, the
-  softAP and the recovery portal alike. Write-only, constant-time compared,
-  failures rate-limited; a forgotten password means USB reflash. Removing it
-  (empty string) reopens the API.
+  softAP and the recovery portal alike. Write-only, stored as a salted
+  PBKDF2 hash (never plaintext), constant-time compared; the ~1 s hash cost
+  is the brute-force rate limit. A forgotten password means USB reflash.
+  Removing it (empty string) reopens the API.
 * **TLS** (`web.tls_enabled`): the web server moves to `https://` on :443
   with an ECDSA certificate minted on the device; port 80 becomes a plain
   302 redirect (never HSTS — you can turn TLS off again). Clients pin the

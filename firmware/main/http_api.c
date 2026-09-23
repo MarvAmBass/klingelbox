@@ -115,6 +115,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mdns.h"               /* the service record follows the transport */
 #include "nvs.h"                /* ESP_ERR_NVS_NOT_ENOUGH_SPACE in status_for() */
 
 #include "board_pins.h"
@@ -162,6 +163,11 @@ static const char *TAG = "http_api";
 
 static db_config_t *s_cfg;   /* live config, owned by app_main */
 
+/* The web password's per-boot verify cache (http_auth.h): seeded with a
+ * random nonce in db_http_start, consulted by api_auth_ok, invalidated by
+ * the password-change path in api_config_post. */
+static db_auth_cache_t s_auth_cache;
+
 /* The web servers. `s_server` carries the whole API + UI, as plain HTTP on
  * :80 or as HTTPS on :443 depending on cfg->tls_enabled; `s_redirect` exists
  * only alongside the HTTPS personality and does nothing but 302 plain-HTTP
@@ -170,6 +176,14 @@ static httpd_handle_t s_server;
 static httpd_handle_t s_redirect;
 static bool s_tls_active;         /* which personality s_server has NOW */
 static volatile bool s_apply_pending;   /* a restart task is already queued */
+
+/* TLS-recovery state: true while the config says TLS but the running server
+ * is the plain-HTTP fallback. Drives the 60 s retry timer AND the once-per-
+ * transition event dedupe in start_servers — the operator hears about the
+ * downgrade when it happens and about the recovery when it happens, never
+ * sixty times an hour in between. */
+static bool s_tls_fallback;
+static esp_timer_handle_t s_tls_retry_timer;
 
 static void schedule_web_apply(void);
 
@@ -439,6 +453,31 @@ static esp_err_t api_system_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "hostname", s_cfg->hostname);
     cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
     cJSON_AddNumberToObject(root, "free_heap", (double)esp_get_free_heap_size());
+
+    /* Why the last boot happened — the no-serial-cable crash diagnosis (the
+     * design notes' §7 pairing with uptime_s: a small uptime plus "panic" or
+     * a watchdog code IS the crash report). Both spellings on purpose: the
+     * number is esp_reset_reason()'s stable enum for scripts, the text saves
+     * everyone the trip to the IDF headers. */
+    {
+        esp_reset_reason_t rr = esp_reset_reason();
+        const char *rrs;
+        switch (rr) {
+        case ESP_RST_POWERON:   rrs = "power-on";  break;
+        case ESP_RST_EXT:       rrs = "ext-reset"; break;
+        case ESP_RST_SW:        rrs = "software";  break;   /* incl. OTA reboot */
+        case ESP_RST_PANIC:     rrs = "panic";     break;   /* stack overflow &c. */
+        case ESP_RST_INT_WDT:   rrs = "int-wdt";   break;
+        case ESP_RST_TASK_WDT:  rrs = "task-wdt";  break;
+        case ESP_RST_WDT:       rrs = "wdt";       break;
+        case ESP_RST_DEEPSLEEP: rrs = "deepsleep"; break;
+        case ESP_RST_BROWNOUT:  rrs = "brownout";  break;   /* check the PSU */
+        case ESP_RST_SDIO:      rrs = "sdio";      break;
+        default:                rrs = "unknown";   break;
+        }
+        cJSON_AddNumberToObject(root, "reset_reason", (double)rr);
+        cJSON_AddStringToObject(root, "reset_reason_text", rrs);
+    }
 
     const esp_partition_t *run = esp_ota_get_running_partition();
     cJSON_AddStringToObject(root, "partition", run ? run->label : "?");
@@ -2311,7 +2350,7 @@ static esp_err_t api_config_get(httpd_req_t *req)
      * `fingerprint` is what a pinning client checks against /cert.pem. */
     {
         cJSON *web = cJSON_AddObjectToObject(root, "web");
-        cJSON_AddBoolToObject(web, "has_http_password", s_cfg->http_pass[0] != '\0');
+        cJSON_AddBoolToObject(web, "has_http_password", s_cfg->http_pw.iters != 0);
         cJSON_AddBoolToObject(web, "tls_enabled", s_cfg->tls_enabled);
         if (db_tls_ready()) {
             cJSON *tls = cJSON_AddObjectToObject(web, "tls");
@@ -2506,18 +2545,27 @@ static esp_err_t api_config_post(httpd_req_t *req)
          * disabling auth must be expressible, and unlike the Wi-Fi/MQTT
          * secrets this one guards the API itself, so a UI that wants to keep
          * it simply omits the field. Length was validated above. Applies on
-         * the very next request — no server restart involved. */
+         * the very next request — no server restart involved.
+         *
+         * Setting hashes: salt + calibrated PBKDF2 (db_config.h), which
+         * costs ~1 s ON THIS HANDLER — an accepted, rare-operation block,
+         * same reasoning as the cold-login verify in api_auth_ok. The
+         * success cache MUST be invalidated in the same breath: a credential
+         * this line just retired must not stay fast-path valid (and the
+         * generation bump is what tells a verify already in flight that its
+         * record is stale — http_auth.h). */
         if (json_str(web, "http_password", &s)) {
-            bool had = s_cfg->http_pass[0] != '\0';
+            bool had = s_cfg->http_pw.iters != 0;
             bool has = s[0] != '\0';
-            if (had != has || (has && strcmp(s, s_cfg->http_pass) != 0))
+            db_config_set_http_password(s_cfg, s);
+            db_auth_cache_invalidate(&s_auth_cache);
+            if (had || has)
                 db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
                                has ? (had ? "web password changed"
                                           : "web password set — /api now "
                                             "requires login (user admin)")
                                    : "web password removed — /api is open "
                                      "again");
-            strlcpy(s_cfg->http_pass, s, sizeof(s_cfg->http_pass));
         }
         if (json_bool(web, "tls_enabled", &b) && b != s_cfg->tls_enabled) {
             s_cfg->tls_enabled = b;   /* identity already ensured above */
@@ -3255,28 +3303,31 @@ static bool content_type_is(httpd_req_t *req, const char *want)
  * header preemptively and never needs the challenge. Do not "fix" this to be
  * RFC-polite; the omission is the feature.
  *
- * BRUTE FORCE IS CAPPED BY A NON-BLOCKING LOCKOUT, NOT A SLEEP. A wrong
- * password arms a box-wide "no auth attempt before this tick" window of
- * DB_AUTH_LOCKOUT_MS (300 ms); anything arriving inside it — the correct
- * password included — is refused with the same immediate uniform 401,
- * unevaluated. One evaluated guess per window is the same ~3/s cap the old
- * vTaskDelay(300) enforced, but the delay slept esp_http_server's ONE worker
- * task, so any unauthenticated peer (a hostile web page looping no-preflight
- * GETs at the box qualified) could keep that task asleep and stall the whole
- * UI and API for as long as it kept sending — the per-request bound this
- * comment once relied on said nothing about sustained hammering. Rejecting
- * instantly returns the worker to its select loop. Timing still
- * distinguishes nothing an attacker can use: outside the window every
- * failure runs the same constant-time compare (http_auth.c), inside it every
- * request takes the same short-circuit, and the 401 is identical throughout.
- * A missing Authorization header never ARMS the window (it carries no guess,
- * and it is the one request a cross-origin page can loop from a browser tab
- * — arming on it would let that tab lock the admin out); the arming rules
- * live with the state machine in db_auth_gate_check, host-tested.
+ * BRUTE FORCE IS CAPPED BY THE PBKDF2 COST ITSELF, NOT A LOCKOUT. The
+ * password is stored as a salted PBKDF2 hash whose iteration count was
+ * calibrated to ~1 s on this box (pw_hash.h), so every evaluated wrong
+ * guess costs the guesser a full second of this chip — box-wide, that is
+ * the guessing rate, and unlike the 300 ms lockout window this replaced it
+ * cannot be aimed at the admin: the old window refused the CORRECT password
+ * unevaluated after any wrong guess, so one hostile client interleaving
+ * misses 401'd the real login indefinitely. Cost-per-guess has no such
+ * lever — the admin's correct credential verifies once (~1 s, the accepted
+ * cold-login price; the httpd task blocks for it, which is fine for an
+ * operation that happens once per boot per client) and then rides the
+ * per-boot cache in http_auth.c at one SHA-256 per request. A wrong
+ * password NEVER enters that cache, so wrong always pays full price.
+ * Malformed headers (bad scheme/base64/shape — no actual guess) and
+ * header-less requests fail FAST on purpose: they rate-limit nothing, and
+ * burning ~1 s of the single worker task on junk any cross-origin page can
+ * loop would hand out a stall-the-UI primitive (the same reasoning that
+ * killed the old vTaskDelay ideas; the classification rules are host-tested
+ * in http_auth.c). Timing beyond fast-vs-slow distinguishes nothing: all
+ * compares are constant-time and the derive's duration depends only on the
+ * stored iteration count.
  */
 static bool api_auth_ok(httpd_req_t *req)
 {
-    if (!s_cfg->http_pass[0]) return true;   /* no password = auth disabled */
+    if (s_cfg->http_pw.iters == 0) return true;   /* no password = auth off */
 
     /* "Basic " + base64("admin:" + 64-char password) is ~102 bytes; anything
      * that does not fit here cannot be a valid credential for this box, and
@@ -3286,13 +3337,11 @@ static bool api_auth_ok(httpd_req_t *req)
                                     sizeof(authz)) != ESP_OK)
         authz[0] = '\0';
 
-    /* Single-writer by construction: every /api handler runs on the main
+    /* Single caller by construction: every /api handler runs on the main
      * server's one worker task (the :80 helper routes no /api traffic), so
-     * the lockout tick needs no lock. */
-    static int64_t s_lockout_until_ms;
-    if (db_auth_gate_check(authz, s_cfg->http_pass,
-                           esp_timer_get_time() / 1000,
-                           &s_lockout_until_ms) == DB_AUTH_OK)
+     * the cache needs no lock; the password-change race is handled by the
+     * generation counter inside db_auth_check (http_auth.h). */
+    if (db_auth_check(authz, &s_cfg->http_pw, &s_auth_cache) == DB_AUTH_OK)
         return true;
 
     send_error(req, "401 Unauthorized", "authentication required");
@@ -3305,8 +3354,8 @@ static bool api_auth_ok(httpd_req_t *req)
  * ORDER, DECIDED NOT INHERITED: Host first — it is one header compare, leaks
  * nothing, and a DNS-rebound request should not get to probe the auth gate at
  * all. Auth second, BEFORE Content-Type: an unauthenticated caller learns
- * nothing about what a route accepts, and the failure lockout must not be
- * skippable by omitting a header the CSRF check would reject faster. */
+ * nothing about what a route accepts, and a guess must not dodge its PBKDF2
+ * price by omitting a header the CSRF check would reject faster. */
 static bool api_request_allowed(httpd_req_t *req)
 {
     if (!host_is_this_box(req)) {
@@ -3598,10 +3647,26 @@ static esp_err_t static_router(httpd_req_t *req)
         }
     }
 
+    /* The query string never reaches SPIFFS: it is cut here, so /app.js and
+     * /app.js?v=0.9.0 open the same file — the "?v=" is purely a cache key
+     * (see versioned below). */
     char clean[192];
     strlcpy(clean, req->uri[0] ? req->uri : "/", sizeof(clean));
     char *q = strchr(clean, '?');
     if (q) *q = '\0';
+
+    /* Did the request carry a ?v= (or &v=) version tag? Checked on the raw
+     * URI, before the cut above. */
+    bool has_v = false;
+    {
+        const char *rq = strchr(req->uri, '?');
+        while (rq) {
+            rq++;                              /* past '?' or '&' */
+            if (rq[0] == 'v' && rq[1] == '=') { has_v = true; break; }
+            rq = strchr(rq, '&');
+        }
+    }
+
     if (strcmp(clean, "/") == 0) strlcpy(clean, "/index.html", sizeof(clean));
     if (strstr(clean, ".."))     /* no traversal out of /spiffs */
         return send_error(req, "400 Bad Request", "bad path");
@@ -3624,6 +3689,27 @@ static esp_err_t static_router(httpd_req_t *req)
         strlcpy(clean, "/index.html", sizeof(clean));
     }
 
+    /*
+     * CACHE POLICY, TWO TIERS (the design notes' scheme): index.html is the
+     * single revalidation point — always "no-cache" + ETag, so every page
+     * load costs one small conditional GET and an OTA'd UI appears without a
+     * hard refresh. Every OTHER asset is linked from index.html (and from
+     * app.js, for anything it loads itself) as "<name>?v=<version>", where
+     * the version is substituted into both files by the build
+     * (tools/gzip_webui.py). A request that carries that ?v= tag may be
+     * cached FOREVER — "public, max-age=31536000, immutable" — because a new
+     * firmware substitutes a new version and thereby a NEW URL: the cache is
+     * busted by addressing, not by revalidation, and a warm reload costs
+     * zero asset requests. A request without ?v= (deep link, curl, an old
+     * bookmark) keeps today's no-cache + ETag behaviour. The SPA fallback is
+     * deliberately OUTSIDE the immutable tier: it serves index.html bytes
+     * under some other URL, and immortalising those under /signals/3?v=...
+     * would pin a stale app shell forever.
+     */
+    bool versioned = has_v && strcmp(clean, "/index.html") != 0;
+    const char *cache_ctl = versioned ? "public, max-age=31536000, immutable"
+                                      : "no-cache";
+
     /* ETag = <per-boot token>-<size>. Size alone would be too weak (an edit can
      * preserve it); the boot token is what actually changes after an OTA. */
     long fsize = -1;
@@ -3637,7 +3723,7 @@ static esp_err_t static_router(httpd_req_t *req)
         fclose(f);
         httpd_resp_set_status(req, "304 Not Modified");
         httpd_resp_set_hdr(req, "ETag", etag);
-        httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+        httpd_resp_set_hdr(req, "Cache-Control", cache_ctl);
         httpd_resp_send(req, NULL, 0);
         return ESP_OK;
     }
@@ -3646,14 +3732,33 @@ static esp_err_t static_router(httpd_req_t *req)
     if (is_gz) httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     httpd_resp_set_hdr(req, "ETag", etag);
     /* "no-cache" is NOT "no-store": the browser may keep it, but must revalidate
-     * every time — which is what makes an OTA'd UI appear without a hard refresh. */
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+     * every time — which is what makes an OTA'd UI appear without a hard refresh.
+     * (Or the immutable tier — see above.) */
+    httpd_resp_set_hdr(req, "Cache-Control", cache_ctl);
 
-    char chunk[1024];
-    size_t r;
-    while ((r = fread(chunk, 1, sizeof(chunk), f)) > 0) {
-        if (httpd_resp_send_chunk(req, chunk, r) != ESP_OK) { fclose(f); return ESP_FAIL; }
+    /* 8 KB HEAP chunks, not a stack array. The chunk size sets the transfer
+     * rate: 1 KB stack chunks moved ~16 KB/s through httpd's chunked path,
+     * which made the ~110 KB gzipped app.js a seven-second load; 8 KB moves
+     * >200 KB/s. A buffer that size has no business on the 10 KB worker
+     * stack (design notes §2: heap-allocate big buffers), so it is malloc'd
+     * per request and freed on every exit path. */
+    enum { SERVE_CHUNK = 8192 };
+    char *chunk = malloc(SERVE_CHUNK);
+    if (!chunk) {
+        fclose(f);
+        return send_error(req, "503 Service Unavailable",
+                          "not enough free memory to serve this file right "
+                          "now — try again");
     }
+    size_t r;
+    while ((r = fread(chunk, 1, SERVE_CHUNK, f)) > 0) {
+        if (httpd_resp_send_chunk(req, chunk, r) != ESP_OK) {
+            free(chunk);
+            fclose(f);
+            return ESP_FAIL;
+        }
+    }
+    free(chunk);
     fclose(f);
     httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
@@ -3843,7 +3948,15 @@ static esp_err_t start_redirect_server(void)
      * This server takes +2. */
     hc.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 2;
     hc.max_open_sockets = 2;
-    hc.max_uri_handlers = 3;
+    /* THREE handlers are registered below (GET/POST/DELETE catch-alls), but the
+     * cap is 8, not 3, and the slack is deliberate. httpd checks this limit
+     * PER REGISTRATION: with the cap at the exact count, the next handler
+     * anyone adds fails to register with nothing but an easily-missed error
+     * return — the server runs, that one route 404s, and the failure looks
+     * like a routing bug instead of a full table. Headroom costs a few bytes
+     * of pointer table; count the routes when adding one and keep this
+     * comment honest. (Same rule as main_server_config's 8-for-4.) */
+    hc.max_uri_handlers = 8;
     hc.uri_match_fn = httpd_uri_match_wildcard;
     hc.lru_purge_enable = true;
     hc.stack_size = 4096;   /* it builds one Location header */
@@ -3887,20 +4000,116 @@ static void stop_servers(void)
     }
 }
 
+/*
+ * mDNS: the service record follows the transport. mdns_init/hostname live in
+ * app_main (they are network identity, set once at boot); the SERVICE is
+ * owned here because only this file knows which personality actually came
+ * up — and it can change at runtime through the apply path, so this runs
+ * after every (re)start, not just at boot. Two things the record carries:
+ *
+ *   - _https/443 vs _http/80, matching what the box really speaks, so
+ *     "browse, click" lands on a working scheme instead of a redirect (or,
+ *     during a TLS fallback, on a refused :443).
+ *   - a version TXT record: `dns-sd -L <instance> _http._tcp` then answers
+ *     "what firmware is actually running?" from across the room even when
+ *     the whole web server is the thing that died — the notes' cheapest
+ *     no-serial-cable diagnosis (docs/flashing.md, troubleshooting).
+ *
+ * Best-effort throughout: a box whose mDNS never came up still serves.
+ */
+static void update_mdns_service(void)
+{
+    /* Idempotence guard: the failed-TLS retry loop re-runs start_servers
+     * every minute, and re-announcing an UNCHANGED record each time would
+     * just be mDNS chatter (and would make a crash loop and a retry loop
+     * look alike to the notes' "periodic re-announcements" heuristic). */
+    static int adv = -1;   /* -1 never, 0 _http, 1 _https */
+    if (adv == (s_tls_active ? 1 : 0)) return;
+
+    const char *ver = esp_app_get_description()->version;
+    mdns_txt_item_t txt[] = { { "version", ver } };
+
+    /* Remove both spellings unconditionally — cheap, and it makes this
+     * function idempotent whatever was advertised before (ESP_ERR_NOT_FOUND
+     * on a fresh boot is expected and ignored). */
+    mdns_service_remove("_http", "_tcp");
+    mdns_service_remove("_https", "_tcp");
+
+    esp_err_t err = s_tls_active
+        ? mdns_service_add(NULL, "_https", "_tcp", 443, txt, 1)
+        : mdns_service_add(NULL, "_http", "_tcp", 80, txt, 1);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "mdns service update failed: %s", esp_err_to_name(err));
+        adv = -1;   /* try again on the next server (re)start */
+    } else {
+        adv = s_tls_active ? 1 : 0;
+    }
+}
+
+/*
+ * The TLS retry loop. The plain-HTTP fallback below keeps a box with a
+ * broken TLS start reachable — but the operator CHOSE TLS, and a one-shot
+ * fallback would leave that choice silently revoked until a power cycle
+ * even when the cause was transient (low heap at boot, NVS momentarily
+ * full). So: while config says TLS and the fallback is what's running,
+ * retry the HTTPS start every 60 s, forever, by scheduling the same
+ * stop-and-restart the config-change path uses. Each attempt is a ~1 s
+ * service blip on the fallback server, once a minute — acceptable on a
+ * management plane that is currently in a degraded state anyway. The timer
+ * only ever SCHEDULES (schedule_web_apply spawns the worker with the 8 KB
+ * stack that mbedTLS needs; the esp_timer task's own stack must not run
+ * it), and s_apply_pending already collapses a retry racing a config
+ * change into one restart.
+ */
+#define TLS_RETRY_PERIOD_US (60LL * 1000 * 1000)
+
+static void tls_retry_cb(void *arg)
+{
+    (void)arg;
+    if (s_tls_fallback && s_cfg->tls_enabled)
+        schedule_web_apply();
+}
+
+static void tls_retry_timer_arm(bool arm)
+{
+    if (arm && !s_tls_retry_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = tls_retry_cb,
+            .name = "db_tls_retry",
+        };
+        if (esp_timer_create(&args, &s_tls_retry_timer) != ESP_OK) {
+            ESP_LOGE(TAG, "could not create the TLS retry timer — TLS will "
+                          "only be retried at the next reboot/config change");
+            return;
+        }
+    }
+    if (!s_tls_retry_timer) return;
+    if (arm) {
+        if (!esp_timer_is_active(s_tls_retry_timer))
+            esp_timer_start_periodic(s_tls_retry_timer, TLS_RETRY_PERIOD_US);
+    } else {
+        esp_timer_stop(s_tls_retry_timer);   /* no-op when idle */
+    }
+}
+
 static esp_err_t start_servers(void)
 {
     bool want_tls = s_cfg->tls_enabled;
+    bool was_fallback = s_tls_fallback;   /* event dedupe across retries */
 
     /* ANTI-BRICK: a box whose TLS identity cannot be produced (NVS corrupt
      * AND full, say) must still serve — an unreachable box cannot even be
      * told to turn TLS off. Falling back to plain HTTP is loud in the log
-     * and the event feed, never silent. */
+     * and the event feed — once per DOWNGRADE, not once per retry — and
+     * never permanent: the retry timer above keeps trying to honour the
+     * operator's TLS choice. */
     if (want_tls && db_tls_ensure(s_cfg->hostname) != ESP_OK) {
         ESP_LOGE(TAG, "TLS is enabled but no identity could be produced — "
-                      "falling back to plain HTTP");
-        db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
-                       "TLS unavailable (no certificate could be stored) — "
-                       "serving plain HTTP instead");
+                      "falling back to plain HTTP (retrying every 60 s)");
+        if (!was_fallback)
+            db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                           "TLS unavailable (no certificate could be stored) — "
+                           "serving plain HTTP instead; retrying every minute");
         want_tls = false;
     }
 
@@ -3909,16 +4118,35 @@ static esp_err_t start_servers(void)
         err = start_tls_server();
         if (err == ESP_OK) {
             start_redirect_server();   /* best-effort, see above */
+            if (was_fallback)
+                db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                               "TLS recovered — the web UI is back on "
+                               "https:// as configured");
+            s_tls_fallback = false;
         } else {
-            ESP_LOGE(TAG, "HTTPS failed to start — falling back to plain HTTP");
-            db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
-                           "the HTTPS server failed to start — serving plain "
-                           "HTTP instead");
+            ESP_LOGE(TAG, "HTTPS failed to start — falling back to plain HTTP "
+                          "(retrying every 60 s)");
+            if (!was_fallback)
+                db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                               "the HTTPS server failed to start — serving "
+                               "plain HTTP instead; retrying every minute");
             err = start_plain_server();
+            s_tls_fallback = true;   /* even if the fallback ALSO failed:
+                                        the timer's stop+start retries both,
+                                        so a transient total failure heals
+                                        instead of leaving the box headless
+                                        until a power cycle */
         }
     } else {
         err = start_plain_server();
+        /* s_cfg->tls_enabled here means the identity failure above forced
+         * plain HTTP — still a fallback, still worth retrying. */
+        s_tls_fallback = s_cfg->tls_enabled;
     }
+
+    tls_retry_timer_arm(s_tls_fallback);
+    if (err == ESP_OK)
+        update_mdns_service();
     return err;
 }
 
@@ -3958,6 +4186,14 @@ esp_err_t db_http_start(db_config_t *cfg)
 {
     s_cfg = cfg;
     snprintf(s_asset_tag, sizeof(s_asset_tag), "%08" PRIx32, esp_random());
+
+    /* Per-boot auth nonce: what makes a cached login digest worthless off
+     * this device and after any reboot (http_auth.h). Drawn after Wi-Fi is
+     * up, so esp_fill_random is a true RNG here. */
+    uint8_t nonce[DB_PW_HASH_LEN];
+    esp_fill_random(nonce, sizeof(nonce));
+    db_auth_cache_init(&s_auth_cache, nonce);
+
     mount_spiffs();
 
     /* Load (never generate) any stored identity, so GET /cert.pem and the

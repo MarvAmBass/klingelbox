@@ -19,8 +19,9 @@
  * must not silently skew an old migration. Fields introduced after vN simply
  * keep their default value.
  *
- * v2 added the web-access fields (http_pass, tls_enabled); v1 is frozen below
- * and migrated per the recipe on migrate_blob().
+ * v2 added the web-access fields (http_pass, tls_enabled); v3 replaced the
+ * PLAINTEXT http_pass with the salted PBKDF2 record http_pw (pw_hash.h).
+ * v1 and v2 are frozen below and migrated per the recipe on migrate_blob().
  */
 #include "db_config.h"
 
@@ -28,6 +29,7 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "event_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -39,7 +41,7 @@ static const char *TAG = "db_cfg";
 
 #define DB_NS          "klingelbox"
 #define DB_BLOB_KEY    "cfg"
-#define DB_CFG_VERSION 2u
+#define DB_CFG_VERSION 3u
 
 /* A tiny header stamped in front of the blob so a layout change is detected. */
 typedef struct {
@@ -165,9 +167,50 @@ void db_config_defaults(db_config_t *cfg)
     cfg->tx_gap_us  = 8000u;
 
     /* Web access: open and plain out of the box, matching the trusted-LAN
-     * posture the box has always shipped with. Both are opt-in. */
-    cfg->http_pass[0] = '\0';
+     * posture the box has always shipped with. Both are opt-in. http_pw is
+     * already all-zero from the memset above — iters == 0 IS "no password". */
     cfg->tls_enabled  = false;
+}
+
+/* ---- web password hashing --------------------------------------------------
+ *
+ * The plaintext exists only in flight: in the POST body that sets it, in the
+ * Authorization header that presents it, and — once, during the v2->v3
+ * migration below — in the old stored blob. What persists is the pw_hash.h
+ * record. The iteration count is calibrated HERE, at set-time, by timing a
+ * short probe derive on this very box (pw_hash.h explains the target and the
+ * clamp); the count is stored in the record, so hashes written by an older,
+ * slower or differently-calibrated build keep verifying forever.
+ */
+#define DB_PW_PROBE_ITERS 200   /* ~10-30 ms: enough signal, negligible cost */
+
+static uint32_t calibrate_pw_iters(void)
+{
+    uint8_t salt[DB_PW_SALT_LEN] = { 0 };
+    uint8_t out[DB_PW_HASH_LEN];
+    int64_t t0 = esp_timer_get_time();
+    db_pw_pbkdf2("calibration-probe", 17, salt, sizeof(salt),
+                 DB_PW_PROBE_ITERS, out);
+    int64_t dt = esp_timer_get_time() - t0;
+    uint32_t iters = db_pw_pick_iterations(DB_PW_PROBE_ITERS,
+                                           (dt > 0) ? (uint64_t)dt : 0);
+    ESP_LOGI(TAG, "PBKDF2 calibration: %d iterations in %lld us -> %u chosen",
+             DB_PW_PROBE_ITERS, (long long)dt, (unsigned)iters);
+    return iters;
+}
+
+void db_config_set_http_password(db_config_t *cfg, const char *password)
+{
+    if (!password || !password[0]) {
+        /* Remove: zero the whole record so no stale salt/hash lingers in the
+         * blob (and so iters == 0 is unambiguous). */
+        memset(&cfg->http_pw, 0, sizeof(cfg->http_pw));
+        return;
+    }
+    uint8_t salt[DB_PW_SALT_LEN];
+    esp_fill_random(salt, sizeof(salt));
+    db_pw_rec_from_plaintext(&cfg->http_pw, password, salt,
+                             calibrate_pw_iters());
 }
 
 /* ---- migration chain -------------------------------------------------------
@@ -176,14 +219,14 @@ void db_config_defaults(db_config_t *cfg)
  * layout. Returns true if *cfg was populated from the old bytes (the caller then
  * re-saves it in the current layout), false to keep the factory defaults.
  *
- * ADDING v3 (the whole recipe, exactly as v2 followed it):
+ * ADDING v4 (the whole recipe, exactly as v2 and v3 followed it):
  *   1. Copy the CURRENT db_config_t verbatim into a frozen
- *      `typedef struct { ... } db_config_v2_t;` beside db_config_v1_t,
- *      commented "layout as shipped in DB_CFG_VERSION 2".
- *   2. Bump DB_CFG_VERSION to 3 and edit db_config_t / db_config_defaults().
- *   3. Add a `migrate_v2()` that calls db_config_defaults(cfg) and then copies
- *      every v2 field across one by one, and wire it into the switch below
- *      next to `case 1:`.
+ *      `typedef struct { ... } db_config_v3_t;` beside db_config_v2_t,
+ *      commented "layout as shipped in DB_CFG_VERSION 3".
+ *   2. Bump DB_CFG_VERSION to 4 and edit db_config_t / db_config_defaults().
+ *   3. Add a `migrate_v3()` that calls db_config_defaults(cfg) and then copies
+ *      every v3 field across one by one, and wire it into the switch below
+ *      next to `case 2:`.
  *
  * Migrations are chained through the current struct, not against each other:
  * every migrate_vN() lands directly on today's db_config_t, so an upgrade from
@@ -219,9 +262,44 @@ typedef struct {
     uint32_t tx_gap_us;
 } db_config_v1_t;
 
+/* Layout as shipped in DB_CFG_VERSION 2 — frozen verbatim; see the recipe.
+ * The distinguishing field is http_pass: v2 stored the web password as
+ * PLAINTEXT. migrate_v2() below is the one place that plaintext is ever read
+ * again, to hash it into the v3 record. */
+typedef struct {
+    char     hostname[DB_STR_HOSTNAME];
+    db_sta_net_t sta[DB_STA_MAX];
+    char     ap_ssid[DB_STR_SSID];
+    char     ap_pass[DB_STR_PASS];
+    uint8_t  ap_security;
+    uint8_t  ap_channel;
+    char     ap_ip[16];
+    bool     ap_enabled;
+    bool     ap_fallback_enabled;
+    char     recovery_ap_pass[DB_STR_PASS];
+    bool     mqtt_enabled;
+    char     mqtt_host[DB_STR_HOST];
+    uint16_t mqtt_port;
+    char     mqtt_user[DB_STR_NAME];
+    char     mqtt_pass[DB_STR_PASS];
+    char     mqtt_base_topic[DB_STR_TOPIC];
+    bool     mqtt_homeassistant;
+    char     mqtt_discovery_prefix[DB_STR_TOPIC];
+    char     ota_url[DB_STR_URL];
+    uint32_t radio_freq_hz;
+    uint8_t  radio_modulation;
+    uint32_t radio_datarate_bps;
+    uint32_t radio_bandwidth_hz;
+    int8_t   radio_tx_power_dbm;
+    uint8_t  tx_repeats;
+    uint32_t tx_gap_us;
+    char     http_pass[DB_STR_PASS];
+    bool     tls_enabled;
+} db_config_v2_t;
+
 /* Field by field over the current defaults, never memcpy — a future edit to
- * db_config_t must not silently skew this migration. The v2 additions
- * (http_pass, tls_enabled) keep their defaults: auth off, TLS off, exactly
+ * db_config_t must not silently skew this migration. The v2/v3 additions
+ * (web password, tls_enabled) keep their defaults: auth off, TLS off, exactly
  * the behaviour every v1 box already had. */
 static void migrate_v1(db_config_t *cfg, const db_config_v1_t *old)
 {
@@ -264,6 +342,67 @@ static void migrate_v1(db_config_t *cfg, const db_config_v1_t *old)
     cfg->tx_gap_us           = old->tx_gap_us;
 }
 
+/* v2 -> v3: everything is a straight field copy except the web password. A v2
+ * blob holds it as PLAINTEXT; this is the single place that plaintext is ever
+ * readable again, so it is hashed RIGHT HERE — through the same
+ * db_config_set_http_password path a POST takes, calibration included — and
+ * only the pw_hash record is ever written back. The upgrade contract: a v2 box
+ * with a password comes up with that same password still working. */
+static void migrate_v2(db_config_t *cfg, const db_config_v2_t *old)
+{
+    db_config_defaults(cfg);
+
+    strlcpy(cfg->hostname, old->hostname, sizeof(cfg->hostname));
+    for (int i = 0; i < DB_STA_MAX; i++) {
+        strlcpy(cfg->sta[i].ssid, old->sta[i].ssid, sizeof(cfg->sta[i].ssid));
+        strlcpy(cfg->sta[i].pass, old->sta[i].pass, sizeof(cfg->sta[i].pass));
+    }
+    strlcpy(cfg->ap_ssid, old->ap_ssid, sizeof(cfg->ap_ssid));
+    strlcpy(cfg->ap_pass, old->ap_pass, sizeof(cfg->ap_pass));
+    cfg->ap_security = old->ap_security;
+    cfg->ap_channel  = old->ap_channel;
+    strlcpy(cfg->ap_ip, old->ap_ip, sizeof(cfg->ap_ip));
+    cfg->ap_enabled          = old->ap_enabled;
+    cfg->ap_fallback_enabled = old->ap_fallback_enabled;
+    strlcpy(cfg->recovery_ap_pass, old->recovery_ap_pass,
+            sizeof(cfg->recovery_ap_pass));
+
+    cfg->mqtt_enabled = old->mqtt_enabled;
+    strlcpy(cfg->mqtt_host, old->mqtt_host, sizeof(cfg->mqtt_host));
+    cfg->mqtt_port = old->mqtt_port;
+    strlcpy(cfg->mqtt_user, old->mqtt_user, sizeof(cfg->mqtt_user));
+    strlcpy(cfg->mqtt_pass, old->mqtt_pass, sizeof(cfg->mqtt_pass));
+    strlcpy(cfg->mqtt_base_topic, old->mqtt_base_topic,
+            sizeof(cfg->mqtt_base_topic));
+    cfg->mqtt_homeassistant = old->mqtt_homeassistant;
+    strlcpy(cfg->mqtt_discovery_prefix, old->mqtt_discovery_prefix,
+            sizeof(cfg->mqtt_discovery_prefix));
+
+    strlcpy(cfg->ota_url, old->ota_url, sizeof(cfg->ota_url));
+
+    cfg->radio_freq_hz       = old->radio_freq_hz;
+    cfg->radio_modulation    = old->radio_modulation;
+    cfg->radio_datarate_bps  = old->radio_datarate_bps;
+    cfg->radio_bandwidth_hz  = old->radio_bandwidth_hz;
+    cfg->radio_tx_power_dbm  = old->radio_tx_power_dbm;
+    cfg->tx_repeats          = old->tx_repeats;
+    cfg->tx_gap_us           = old->tx_gap_us;
+
+    /* The plaintext-to-hash moment. A NUL-termination clamp first: these
+     * bytes come straight off flash, and a corrupted blob must not send
+     * strlen() off the end of the frozen struct. */
+    char pw[DB_STR_PASS];
+    strlcpy(pw, old->http_pass, sizeof(pw));
+    if (pw[0]) {
+        db_config_set_http_password(cfg, pw);
+        ESP_LOGI(TAG, "stored web password migrated from plaintext to a "
+                      "salted PBKDF2 hash");
+    }
+    memset(pw, 0, sizeof(pw));
+
+    cfg->tls_enabled = old->tls_enabled;
+}
+
 static bool migrate_blob(db_config_t *cfg, uint32_t version, uint32_t size,
                          const void *payload, size_t payload_len)
 {
@@ -273,6 +412,12 @@ static bool migrate_blob(db_config_t *cfg, uint32_t version, uint32_t size,
             payload_len != sizeof(db_config_v1_t)) break;
         migrate_v1(cfg, (const db_config_v1_t *)payload);
         ESP_LOGI(TAG, "config migrated v1 -> v%u", DB_CFG_VERSION);
+        return true;
+    case 2:
+        if (size != sizeof(db_config_v2_t) ||
+            payload_len != sizeof(db_config_v2_t)) break;
+        migrate_v2(cfg, (const db_config_v2_t *)payload);
+        ESP_LOGI(TAG, "config migrated v2 -> v%u", DB_CFG_VERSION);
         return true;
     default:
         break;

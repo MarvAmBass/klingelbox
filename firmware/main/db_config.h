@@ -36,6 +36,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "pw_hash.h"   /* db_pw_rec_t — the stored web-password hash (pure) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -121,16 +122,22 @@ typedef struct {
     uint8_t  tx_repeats;                 /* 6 */
     uint32_t tx_gap_us;                  /* 8000 — silence between repeats */
 
-    /* ---- web access (v2) ----
+    /* ---- web access (v2, storage reworked in v3) ----
      * Both default OFF and are fully independent: the password guards /api on
      * whatever transport is running, TLS changes the transport under whatever
      * auth is configured. The docs recommend TLS once a password is set (Basic
      * credentials on plain HTTP are sniffable on the LAN), but the firmware
-     * never couples them. http_pass is WRITE-ONLY over the API like every
-     * other secret; "" means auth is disabled. The username is always "admin"
-     * (http_auth.h). A forgotten password is recovered by USB reflash —
-     * docs/security.md, "Lockout recovery". */
-    char     http_pass[DB_STR_PASS];     /* "" = no auth (default) */
+     * never couples them.
+     *
+     * The password is WRITE-ONLY over the API like every other secret, and
+     * since v3 it is not even stored: http_pw holds a random salt, a
+     * calibrated iteration count and the PBKDF2-HMAC-SHA256 hash (pw_hash.h),
+     * so a flash dump no longer surrenders the plaintext. iters == 0 means
+     * auth is disabled. Set/clear ONLY through db_config_set_http_password()
+     * below — it owns the salt, the calibration and the hashing. The username
+     * is always "admin" (http_auth.h). A forgotten password is recovered by
+     * USB reflash — docs/security.md, "Lockout recovery". */
+    db_pw_rec_t http_pw;                 /* iters == 0 = no auth (default) */
     bool     tls_enabled;                /* false = plain HTTP on :80 (default) */
 } db_config_t;
 
@@ -165,6 +172,15 @@ esp_err_t db_config_save(const db_config_t *cfg);
 /* Number of non-empty STA slots. 0 = factory state -> the boot goes straight to
  * the recovery portal (wifi_mgr.c). */
 int db_config_sta_count(const db_config_t *cfg);
+
+/* Set ("" = remove) the web password in *cfg — RAM only; the caller decides
+ * when to db_config_save() and MUST db_auth_cache_invalidate() afterwards.
+ * Draws a fresh salt from the hardware RNG and calibrates the PBKDF2
+ * iteration count to ~1 s on THIS box (pw_hash.h), then derives the hash:
+ * expect the call itself to take on the order of a second. That cost lands
+ * on whatever task calls it (in practice the httpd worker, for the rare
+ * password-change POST) and is the accepted trade — see api_auth_ok. */
+void db_config_set_http_password(db_config_t *cfg, const char *password);
 
 #ifdef __cplusplus
 }

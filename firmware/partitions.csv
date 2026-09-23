@@ -1,32 +1,53 @@
-# doorbell433 partition table — 16 MB flash (this ESP32-S3-N16R8 dev board).
+# doorbell433 partition table — THE layout, sized for 4 MB flash.
+#
+# ONE table for every supported board. This used to be a 16 MB table with a
+# 4 MB sibling (partitions-4mb.csv) that only self-builders ever ran; since the
+# ESP32-S3 Zero became a first-class target the release ships ONE image that
+# every board can take, and the only way to get that is to make the smallest
+# supported flash the layout. On the 16 MB dev board the upper 12 MB simply sit
+# unused — accepted cost, decided deliberately: one image, one flasher click,
+# no self-builds. The price is app-slot headroom (see the arithmetic below);
+# release.yml carries a hard gate that fails the release before the app can
+# creep past ~90% of a slot.
 #
 # Dual OTA app slots make updates rollback-safe: the updater writes the inactive
 # slot, reboots, and app-rollback reverts a bad image on the next boot. `storage`
 # is a SPIFFS image carrying the web UI, so the UI can be re-flashed without
 # recompiling the firmware.
 #
-# NVS IS 80 KB (0x14000), NOT THE STOCK 24 KB. The store advertises 32 signals
-# and a raw capture is up to ~1 KB of frame blob, so 24 KB filled up after a
-# dozen long recordings and every save (config, graph, switch positions) then
-# failed. The extra pages come out of the gap that used to sit unused between
-# phy_init and ota_0: NVS grows IN PLACE at 0x9000 and only otadata/phy_init
-# slide up against the app, so ota_0/ota_1/storage do not move at all.
+# TWO SIZES ARE INVARIANTS — do not shrink either, ever:
 #
-# THE APP OFFSETS ARE A CONTRACT. OTA never rewrites the partition table, so a
-# box first flashed with the old 24 KB table keeps it (and its 24 KB NVS)
-# forever — the firmware handles that with a runtime free-space check
-# (signal_store.c) rather than by assuming this table. Re-flashing the full
-# merged image installs this table; NVS starting at the same 0x9000 means the
-# whole 0x9000..0x1d000 window stays reserved 0xFF in the merged image
-# (release.yml verifies that), exactly as the old 0x9000..0xf000 window was.
+#   * NVS IS 80 KB (0x14000), NOT THE STOCK 24 KB. The store advertises 32
+#     signals and a raw capture is up to ~1 KB of frame blob, so 24 KB filled up
+#     after a dozen long recordings and every save (config, graph, switch
+#     positions) then failed. This is the user's configuration space; the whole
+#     point of the unified layout is that nobody loses it.
+#   * storage IS 1 MB (0x100000), the same size the 16 MB table used. storage.bin
+#     is a SPIFFS image and SPIFFS images are exactly the partition size, so ONE
+#     storage.bin stays valid for EVERY box — including already-deployed ones,
+#     whose on-flash 16 MB table has its 1 MB storage at 0x420000 and receives
+#     the identical image via POST /api/ota/webui.
 #
-# For the ESP32-S3 Zero (4 MB, no PSRAM) use partitions-4mb.csv instead — see
-# sdkconfig.defaults.4mb and README "Porting to the ESP32-S3 Zero".
+# The arithmetic (total flash 0x400000):
+#     0x9000  nvs      0x14000   ->  0x1d000
+#     0x1d000 otadata  0x2000    ->  0x1f000
+#     0x1f000 phy_init 0x1000    ->  0x20000
+#     app area = 0x400000 - 0x20000 - 0x100000 (storage) = 0x2e0000
+#     per slot = 0x2e0000 / 2 = 0x170000  (1472 KB, 64 KB aligned)
+#
+# THE OFFSETS ARE A CONTRACT. OTA never rewrites the partition table, so a box
+# first flashed with an older table (the 24 KB-NVS one, or the 16 MB one with
+# its 2 MB slots) keeps that table forever and keeps working: the app image is
+# gated to fit the SMALLEST slot any table has, and the firmware probes NVS
+# free space at runtime (signal_store.c) instead of assuming this table.
+# Re-flashing the full merged image installs this table and factory-resets; NVS
+# starting at the same 0x9000 means the whole 0x9000..0x1d000 window stays
+# reserved 0xFF in the merged image (release.yml verifies that).
 #
 # Name,     Type, SubType,  Offset,    Size,     Flags
 nvs,        data, nvs,      0x9000,    0x14000,
 otadata,    data, ota,      0x1d000,   0x2000,
 phy_init,   data, phy,      0x1f000,   0x1000,
-ota_0,      app,  ota_0,    0x20000,   0x200000,
-ota_1,      app,  ota_1,    0x220000,  0x200000,
-storage,    data, spiffs,   0x420000,  0x100000,
+ota_0,      app,  ota_0,    0x20000,   0x170000,
+ota_1,      app,  ota_1,    0x190000,  0x170000,
+storage,    data, spiffs,   0x300000,  0x100000,

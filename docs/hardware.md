@@ -23,7 +23,7 @@ Two parts and eight wires.
 
 | Part | Notes |
 |---|---|
-| **ESP32-S3** dev board | Developed on an ESP32-S3-WROOM-1 **N16R8** (16 MB flash). Must expose the **native USB** port for the browser flasher. |
+| **ESP32-S3** board | Either of two fully supported boards, running the **same release image**: an ESP32-S3-WROOM-1 **N16R8** dev board (16 MB flash, what the project was developed on) or the tiny **Waveshare ESP32-S3-Zero** (4 MB) — see [below](#on-the-waveshare-esp32-s3-zero). Must expose the **native USB** port for the browser flasher. |
 | **CC1101 module, 433 MHz** | Developed with an **Ebyte E07-M1101D V2.0**. Any CC1101 breakout with the standard 8-pin header works. |
 | Antenna | A 433 MHz whip, or a 17.3 cm piece of wire (quarter wave). |
 | Jumper wires | Eight. |
@@ -63,6 +63,42 @@ Both sides are 3.3 V logic. **No level shifter, no resistors, nothing in between
 Every pin lives in one place —
 [`firmware/main/board_pins.h`](https://github.com/MarvAmBass/klingelbox/blob/main/firmware/main/board_pins.h).
 Porting to another board is one edit to that file.
+
+### On the Waveshare ESP32-S3-Zero
+
+The table above is not dev-board-only: `board_pins.h` was written so that every pin in it
+is free on the **Waveshare ESP32-S3-Zero** (ESP32-S3FH4R2: 4 MB flash, 2 MB PSRAM) as
+well. Same eight wires, same GPIO numbers — this table only adds where they sit on the
+Zero, using the board's `GP` silkscreen labels:
+
+| CC1101 (E07-M1101D V2.0) | ESP32-S3-Zero | `board_pins.h` macro |
+|---|---|---|
+| 1 GND | GND — left edge, beside the USB-C | |
+| 2 VCC | **3V3** — left edge, marked `3V3(OUT)` | |
+| 3 GDO0 | **GP4** — left edge | `DB_PIN_CC1101_GDO0` |
+| 4 CSN | **GP10** — right edge | `DB_PIN_CC1101_CS` |
+| 5 SCK | **GP12** — right edge | `DB_PIN_CC1101_SCK` |
+| 6 MOSI | **GP11** — right edge | `DB_PIN_CC1101_MOSI` |
+| 7 MISO | **GP13** — right edge | `DB_PIN_CC1101_MISO` |
+| 8 GDO2 | **GP5** — left edge | `DB_PIN_CC1101_GDO2` |
+
+All eight are on the castellated **edge** headers — none land on the Zero's three
+solder-only pads (GP14–GP16) or the pads on the underside — so ordinary pin headers or
+jumper wires reach everything.
+
+Zero-specific notes, all of them harmless here:
+
+- **`3V3(OUT)`** is the output of the Zero's onboard regulator. The CC1101's tens of
+  milliamps are well within it; power the Zero itself over its USB-C.
+- The onboard **WS2812 LED sits on GPIO 21**, which this firmware never touches
+  (`DB_PIN_STATUS_LED` is deliberately unset).
+- **GPIO 33–37 are not led out** on the Zero (reserved for the in-package PSRAM). The
+  firmware uses none of them.
+- The wired-button defaults **GPIO 6** (left edge) and **GPIO 7** (right edge) are on the
+  headers too — see [the optional wired button](#an-optional-wired-button).
+- The USB-C socket **is** the ESP32-S3's native USB, so the browser flasher talks to it —
+  and it flashes the same release image as every other board; see
+  [Board variants](#board-variants) below.
 
 ### Why GDO0 and not an interrupt on any pin
 
@@ -109,20 +145,24 @@ several times.
 
 ## Board variants
 
-| Board | Flash | Partition table | Notes |
+| Board | Flash | Image | Notes |
 |---|---|---|---|
-| ESP32-S3-WROOM-1 (N16R8) | 16 MB | `partitions.csv` | The development board. 2 MB per app slot, 1 MB web-UI SPIFFS. |
-| **ESP32-S3 Zero** | 4 MB | `partitions-4mb.csv` | Supported target. 1.5 MB per app slot, 512 KB web-UI SPIFFS. |
+| ESP32-S3-WROOM-1 (N16R8) | 16 MB | The one release image | The development board. Upper 12 MB of flash unused. |
+| **Waveshare ESP32-S3-Zero** (FH4R2) | 4 MB | The one release image | Fully supported — same image, same flasher, same OTA. |
 
-Both tables use **dual OTA app slots**, so an update is rollback-safe: the updater writes
+**One image serves both boards.** The single partition layout (`partitions.csv`) is sized
+for 4 MB flash — 0x170000 (~1.4 MB) per app slot, 1 MB web-UI SPIFFS, 80 KB NVS — so the
+release image boots on any supported board; a 16 MB board just leaves the rest of its
+flash unused. Picking a board is purely a wiring question, never a firmware one.
+
+The layout uses **dual OTA app slots**, so an update is rollback-safe: the updater writes
 the inactive slot, reboots, and a bad image is reverted on the next boot. The web UI lives
 in its own `storage` SPIFFS partition, so it can be replaced without recompiling the
 firmware.
 
-The two builds are **not interchangeable** — a 16 MB image flashed onto a 4 MB board has a
-partition table pointing past the end of the chip. See
-[Flashing](flashing.html#the-4-mb-esp32-s3-zero) for how to build and flash the 4 MB
-variant.
+Boxes flashed with an **older release** (v0.8.0 and earlier used a 16 MB-only table) need
+nothing: OTA never rewrites the partition table, so they keep their old layout and update
+exactly as before. See [Flashing](flashing.html#one-image-every-board).
 
 ## Bring-up: is the radio actually there?
 

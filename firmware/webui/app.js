@@ -195,13 +195,16 @@ function showLogin() {
     go.disabled = true;
     passIn.disabled = true;
     prog.classList.remove("hidden");
-    setMsg(msg, "");
+    /* Expect this probe to take about a second: the firmware stores the
+       password as a PBKDF2 hash, and stretching the candidate is deliberate
+       work — the same ~1 s whether the password is right (first login after
+       boot; later requests hit a server-side cache and are instant) or wrong
+       (which is the brute-force damping). The indeterminate bar plus this
+       line are what make that second read as "checking", not "hung". */
+    setMsg(msg, t("Checking…"));
     /* A raw fetch, NOT api(): api() would attach the stored (absent or wrong)
        header and feed its own failure back into onUnauthorized. Nothing is
-       stored until this probe has actually answered 200. A wrong password
-       answers instantly but closes the box's auth gate for ~300 ms
-       (brute-force damping) — far shorter than any human retype, so this
-       screen never needs to know about it. */
+       stored until this probe has actually answered 200. */
     fetch("/api/system", { headers: { "Authorization": basicAuth(p) } })
       .then(function (res) {
         if (res.ok) {
@@ -398,6 +401,36 @@ var OTA_DEFAULT_APP_URL = GH_RELEASE_ASSETS + "klingelbox.bin";
 var OTA_DEFAULT_WEBUI_URL = GH_RELEASE_ASSETS + "storage.bin";
 
 /* ======================================================================
+   ASSET_V — this file's own build stamp
+
+   The firmware build replaces the literal placeholder token (assigned below;
+   not named in prose because the substitution is a plain text replace that
+   would rewrite it here too) with the firmware version in index.html AND
+   here, before gzipping. index.html references every asset as e.g.
+   /app.js?v=<version> and is itself the only unversioned file (the
+   revalidation point), so browsers can cache the big files hard and still
+   pick up a new UI the moment index.html changes.
+
+   Any asset this file ever loads dynamically must append the same
+   "?v=" + ASSET_V (when substituted) so it joins that scheme. Today there is
+   none to append it to: lang-de.js is a static <script> in index.html — where
+   it IS versioned — and everything else the page fetches is /api or a
+   server-generated download (/cert.pem), neither of which is a build asset.
+
+   THE GUARD MATTERS: a dev-served copy of this directory never ran the
+   substitution, so a value still starting with "__" means "no version" —
+   assetVersion() answers null, dynamic URLs would stay query-less, and the
+   skew notice below stays silent rather than comparing a placeholder against
+   a real version string. */
+
+var ASSET_V = "__DB_ASSET_V__";
+
+/* The substituted build stamp, or null on an unsubstituted (dev) build. */
+function assetVersion() {
+  return (ASSET_V && ASSET_V.indexOf("__") !== 0) ? ASSET_V : null;
+}
+
+/* ======================================================================
    State
    ====================================================================== */
 
@@ -555,6 +588,7 @@ function rerenderForLang() {
   S.built = {};
   $$(".tabpane").forEach(function (p) { if (p.id !== "tab-recovery") clear(p); });
   renderHeader();
+  renderSkewNotice(true);   /* an up banner must switch language too */
   if (S.recovery) { if (S.sys) buildRecovery(S.sys); return; }
   stopTabPolls();
   onTabEnter(S.tab, true);
@@ -872,6 +906,7 @@ function loadSystem() {
     S.upAt = Date.now();
     if (sys.wifi_mode === "recovery" && !S.recovery) { enterRecovery(sys); return sys; }
     renderHeader();
+    renderSkewNotice();
     if (sys.radio && sys.radio.present === false) {
       S.txBlock = "No CC1101 radio detected. Transmitting is impossible until the module answers on SPI -- see Diagnostics.";
       S.txBlockKind = "radio";
@@ -1072,6 +1107,72 @@ function renderHeader(err) {
      blocking warnings if the Dashboard happens to be built. */
   renderStatusChips();
   renderDashNotes();
+}
+
+/* ======================================================================
+   Firmware/UI skew notice
+
+   The app and the web UI live in SEPARATE flash partitions, so a deploy can
+   update one and not the other — it has happened to us: an old UI cheerfully
+   reporting a new firmware version. ASSET_V (above) is this UI's own build
+   stamp; when it is substituted and /api/system reports a different version,
+   the two partitions have drifted, and the person most likely to be looking
+   at the page at that moment is the person mid-update.
+
+   So: one small dismissible banner above the panes, on every tab, blocking
+   nothing. Dismissing it remembers THE PAIR in sessionStorage — the same
+   mismatch stays dismissed for this tab's session, but a different one (the
+   next update) shows again. On a dev build assetVersion() is null and this
+   whole feature is silent, which is correct: an unsubstituted placeholder is
+   not a version and must not be compared against one.
+   ====================================================================== */
+
+var SKEW_KEY = "klingelbox-skew-dismissed";
+var skewNote = null;   /* the banner element while it is up, else null */
+
+/* The mismatched pair {ui, fw}, or null when there is nothing to say. */
+function skewPair() {
+  var ui = assetVersion();
+  var fw = S.sys && S.sys.version;
+  if (!ui || !fw) return null;
+  ui = String(ui).replace(/^v/i, "");
+  fw = String(fw).replace(/^v/i, "");
+  return (ui === fw) ? null : { ui: ui, fw: fw };
+}
+
+/* Called after every /api/system (cheap: usually one compare and out) and,
+   with force=true, from rerenderForLang so an up banner changes language. */
+function renderSkewNotice(force) {
+  var pair = skewPair();
+  var key = pair ? (pair.ui + "|" + pair.fw) : null;
+  var seen = null;
+  try { seen = sessionStorage.getItem(SKEW_KEY); } catch (e) { /* private mode */ }
+  if (!pair || seen === key || S.recovery) {
+    if (skewNote) { skewNote.remove(); skewNote = null; }
+    return;
+  }
+  /* Already showing exactly this — do not rebuild on every 10 s poll. */
+  if (skewNote && skewNote.__pair === key && !force) return;
+  if (skewNote) skewNote.remove();
+
+  var box = el("div", "note warn skewnote");
+  box.__pair = key;
+  add(box, el("div", "skew-text",
+    t("This page was built for firmware {ui}, but the box is running {fw} — a web-UI update "
+    + "is probably still pending. Install it under Settings → Firmware & web UI update, "
+    + "then reload this page.", { ui: pair.ui, fw: pair.fw })));
+  var x = el("button", "skew-x", "✕");
+  x.type = "button";
+  x.title = t("Dismiss");
+  x.setAttribute("aria-label", t("Dismiss"));
+  x.addEventListener("click", function () {
+    try { sessionStorage.setItem(SKEW_KEY, key); } catch (e) { /* shows again next load */ }
+    if (skewNote) { skewNote.remove(); skewNote = null; }
+  });
+  add(box, x);
+
+  var m = $("main");
+  if (m) { m.insertBefore(box, m.firstChild); skewNote = box; }
 }
 
 /* ======================================================================
@@ -7379,6 +7480,32 @@ var CAPTURE_HELP = {
   overruns: "Hardware capture overruns. Should stay at zero; a rising count points at interrupt starvation."
 };
 
+/* /api/system's reset_reason, mapped to a human sentence fragment and a
+   severity. The numeric codes are ESP-IDF's esp_reset_reason_t, which is why
+   they are stable enough to map here; the firmware sends its own text next to
+   the number, and an unmapped code falls back to showing THAT — untranslated,
+   like all firmware-authored prose — rather than hiding the information.
+   Only the ugly causes get the warning tint: a box that sits at "power-on"
+   or "software restart" is a box behaving normally, and a Diagnostics page
+   that cries wolf over those trains people to ignore it. */
+var RESET_REASONS = {
+  1:  { label: "power-on",                                 sev: "ok" },
+  2:  { label: "external reset pin",                       sev: "ok" },
+  3:  { label: "software restart",                         sev: "ok" },
+  4:  { label: "a crash (panic)",                          sev: "warn" },
+  5:  { label: "the interrupt watchdog",                   sev: "warn" },
+  6:  { label: "a task watchdog",                          sev: "warn" },
+  7:  { label: "a watchdog",                               sev: "warn" },
+  8:  { label: "deep-sleep wake",                          sev: "ok" },
+  9:  { label: "a brownout — the supply voltage dipped",   sev: "warn" },
+  10: { label: "SDIO reset",                               sev: "ok" },
+  11: { label: "USB reset",                                sev: "ok" },
+  12: { label: "JTAG reset",                               sev: "ok" },
+  13: { label: "an eFuse error",                           sev: "warn" },
+  14: { label: "a power glitch",                           sev: "warn" },
+  15: { label: "a CPU lockup",                             sev: "warn" }
+};
+
 var diagEls = {};
 
 function buildDiagnostics() {
@@ -7394,6 +7521,10 @@ function buildDiagnostics() {
     "RF box: a dead SPI bus, a mis-tuned radio, a noisy band, an unrecognised protocol, or a " +
     "transmit that never keyed the carrier. Each one shows up differently below.")));
   add(p, h);
+  /* Uptime and reset reason share one line: "how long has it been up" and
+     "why did it last go down" are the two halves of the same question. */
+  diagEls.sysline = el("div");
+  add(p, diagEls.sysline);
   diagEls.verdict = el("div");
   add(p, diagEls.verdict);
   add(root, p);
@@ -7476,8 +7607,41 @@ function renderRawPanel() {
   add(wrap, row);
 }
 
+/* The uptime + reset-reason one-liner. Fed by /api/system (S.sys), not by
+   /api/diagnostics — an old firmware without the field simply shows uptime
+   alone, and a box that is not answering shows nothing (the verdict below
+   already says the page is blind). The field is taken in either shape a
+   firmware might send: {code, text} as one object, or the pair of flat
+   fields next to each other. */
+function renderDiagSysline() {
+  if (!diagEls.sysline) return;
+  var line = clear(diagEls.sysline);
+  var up = uptimeNow();
+  if (up === null) return;
+  var sys = S.sys || {};
+  var rr = sys.reset_reason;
+  var code = null, fwText = null;
+  if (rr && typeof rr === "object") {
+    code = numOr(rr.code, null);
+    fwText = (typeof rr.text === "string" && rr.text) || null;
+  } else if (typeof rr === "number") {
+    code = rr;
+    fwText = (typeof sys.reset_reason_text === "string" && sys.reset_reason_text) || null;
+  } else if (typeof rr === "string" && rr) {
+    fwText = rr;
+    code = numOr(sys.reset_reason_code, null);
+  }
+  var meta = (code !== null && RESET_REASONS[code]) || null;
+  var reason = meta ? t(meta.label) : fwText;   /* firmware prose passes untranslated */
+  var text = reason
+    ? t("Up {d} — last restart: {reason}.", { d: durText(up), reason: reason })
+    : t("Up {d}.", { d: durText(up) });
+  add(line, el("div", (meta && meta.sev === "warn") ? "note warn" : "hint", text));
+}
+
 function renderDiagnostics(err) {
   if (!diagEls.states) return;
+  renderDiagSysline();
   var v = clear(diagEls.verdict);
 
   if (err || !S.diag) {

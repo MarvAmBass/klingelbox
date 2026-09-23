@@ -220,6 +220,11 @@ static void on_rf_event(const rf_event_t *ev, void *ctx)
 
 /* -------------------------------------------------------------------- mdns */
 
+/* Identity only — init + hostname + instance. The SERVICE record (_http/80
+ * vs _https/443, plus a firmware-version TXT for `dns-sd -L` diagnosis) is
+ * owned by http_api.c's update_mdns_service(): only the server startup knows
+ * which transport actually came up, and it can change at runtime through the
+ * TLS apply path, so advertising it here would go stale on the first toggle. */
 static void mdns_start(const db_config_t *cfg)
 {
     const char *host = cfg->hostname[0] ? cfg->hostname : "klingelbox";
@@ -230,8 +235,7 @@ static void mdns_start(const db_config_t *cfg)
     }
     mdns_hostname_set(host);
     mdns_instance_name_set("Klingelbox");
-    mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
-    ESP_LOGI(TAG, "mdns: http://%s.local", host);
+    ESP_LOGI(TAG, "mdns: %s.local (service record follows the web server)", host);
 }
 
 /* -------------------------------------------------------------------- main */

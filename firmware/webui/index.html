@@ -7,7 +7,15 @@
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#1a202a" media="(prefers-color-scheme: dark)">
 <title>Klingelbox</title>
-<link rel="stylesheet" href="/style.css">
+<!-- The ?v= query on every asset this file references is a literal
+     placeholder token the firmware build replaces with the firmware version
+     before gzipping (see README.md, "Versioned assets"), so browsers may
+     cache those files hard and still fetch fresh ones after an update.
+     index.html itself stays unversioned — it is the revalidation point. A
+     dev server that never ran the substitution still works: the query string
+     is inert, it just never changes. This comment names no token on purpose:
+     the substitution is a plain text replace and would rewrite it here too. -->
+<link rel="stylesheet" href="/style.css?v=__DB_ASSET_V__">
 </head>
 <!--
   Klingelbox web UI — mobile-first shell.
@@ -128,7 +136,7 @@
      diff in one place, with no JavaScript around it, and adding a language
      means adding a file rather than editing app.js. English needs no
      dictionary — the English strings ARE the lookup keys (see app.js). -->
-<script src="/lang-de.js"></script>
-<script src="/app.js"></script>
+<script src="/lang-de.js?v=__DB_ASSET_V__"></script>
+<script src="/app.js?v=__DB_ASSET_V__"></script>
 </body>
 </html>

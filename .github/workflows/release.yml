@@ -6,11 +6,14 @@ name: Release
 # re-cut assets after a CI hiccup without moving the tag).
 #
 # Produces and attaches to the GitHub Release (ESP-IDF v5.3.1, target esp32s3,
-# 16 MB layout — partitions.csv):
+# THE unified layout — partitions.csv, sized for 4 MB flash so ONE image boots
+# on every supported board, 16 MB dev board and 4 MB ESP32-S3 Zero alike):
 #
 #   klingelbox-esp32s3-full.bin — MERGED image, flashed at offset 0x0. This is what
 #       the browser flasher (docs/flasher/) and a bench `esptool.py write_flash 0x0`
 #       write. Contains bootloader + partition table + otadata + app + web-UI SPIFFS.
+#       The name is a contract: flasher-sync mirrors exactly this asset name and the
+#       flasher manifest points at it — do not rename it.
 #   klingelbox.bin              — the app image ALONE, for POST /api/ota. Must never
 #       be flashed at offset 0x0; it is not a bootable flash image.
 #   storage.bin                 — the web-UI SPIFFS image, for POST /api/ota/webui.
@@ -95,16 +98,60 @@ jobs:
           restore-keys: |
             idf-${{ env.IDF_VERSION }}-components-
 
-      # Release images are the 16 MB layout only (partitions.csv, the default
-      # sdkconfig.defaults). The 4 MB ESP32-S3 Zero layout is a build-from-source
-      # configuration and is verified on every push by ci.yml, not shipped here —
-      # the two would need different merged images and different flasher entries.
-      - name: Build firmware (ESP-IDF ${{ env.IDF_VERSION }}, esp32s3, 16 MB)
+      # ONE image for every supported board: partitions.csv is sized for 4 MB
+      # flash, and a 16 MB chip simply leaves its upper 12 MB unused. There is no
+      # per-board variant anymore — that was the point (one image, one flasher
+      # click, no self-builds), and the headroom gate below is what that decision
+      # traded the 2 MB app slots for.
+      - name: Build firmware (ESP-IDF ${{ env.IDF_VERSION }}, esp32s3, unified layout)
         uses: espressif/esp-idf-ci-action@v1
         with:
           esp_idf_version: ${{ env.IDF_VERSION }}
           target: esp32s3
           path: firmware
+
+      # -----------------------------------------------------------------------
+      # THE HEADROOM GATE — the safety net the one-image decision traded slot
+      # size for. The unified layout's 0x170000 app slots replaced the old 16 MB
+      # table's 0x200000 ones, so the app sits much closer to its ceiling now.
+      # ESP-IDF only fails at 100%; shipping a release that close would mean the
+      # NEXT feature cannot ship at all. Failing loudly at 90% keeps a whole
+      # release cycle of margin. The slot size is parsed from partitions.csv, not
+      # hard-coded, so a layout edit cannot silently invalidate the gate.
+      # -----------------------------------------------------------------------
+      - name: Headroom gate — refuse to release an app past 90% of its slot
+        working-directory: firmware
+        run: |
+          python3 - <<'PY'
+          import os, sys
+
+          slot = None
+          with open("partitions.csv") as fh:
+              for line in fh:
+                  cols = [c.strip() for c in line.split("#", 1)[0].split(",")]
+                  if len(cols) >= 5 and cols[0] == "ota_0":
+                      slot = int(cols[4], 0)
+          if not slot:
+              sys.exit("could not parse the ota_0 slot size from partitions.csv")
+
+          app = os.path.getsize("build/klingelbox.bin")
+          pct = 100.0 * app / slot
+          print(f"app image: {app:#x} ({app}) of {slot:#x} ({slot}) per slot "
+                f"— {pct:.1f}% used, {slot - app} bytes free")
+          if pct > 90.0:
+              sys.exit(
+                  f"::error::the app fills {pct:.1f}% of a {slot:#x} OTA slot — "
+                  "past the 90% release gate. This slot size is the accepted cost "
+                  "of shipping ONE image for every board (see partitions.csv); the "
+                  "gate exists so a release never lands close enough to the "
+                  "ceiling that the next fix cannot ship. Do NOT raise the "
+                  "threshold. Shrink the image instead: check build/klingelbox.map "
+                  "for what grew, drop unused IDF features in sdkconfig.defaults, "
+                  "or move rarely-used functionality out. If the firmware has "
+                  "genuinely outgrown 4 MB flash, that is a decision to unmake "
+                  "deliberately — per-board images again — not to squeeze past.")
+          print("headroom gate passed")
+          PY
 
       # esptool ships inside the ESP-IDF container, but this step runs on the runner
       # itself, so install it via pip.
@@ -124,8 +171,13 @@ jobs:
       # segment).
       #
       # --flash_size/--flash_mode/--flash_freq make merge_bin stamp the bootloader
-      # header here, on the build host (16 MB / DIO / 80 MHz), so the flasher can write
-      # with "keep" and never re-stamp it.
+      # header here, on the build host (4 MB / DIO / 80 MHz), so the flasher can write
+      # with "keep" and never re-stamp it. The 4 MB stamp is correct for the 16 MB
+      # dev board too: the runtime clamps itself to the header size and leaves the
+      # upper 12 MB unused (esp_flash logs one "Detected size larger..." warning at
+      # boot — expected, benign). Already-deployed boxes never see this stamp at
+      # all: OTA replaces only the app, so their 16 MB bootloader header and 16 MB
+      # partition table stay in place and keep working.
       #
       # CRITICAL: the merge must NEVER include an nvs segment. Nothing is listed at
       # 0x9000, so merge_bin leaves 0x9000..0x1d000 (the whole NVS partition —
@@ -154,7 +206,7 @@ jobs:
               0x8000:   "partition_table/partition-table.bin",
               0x1d000:  "ota_data_initial.bin",
               0x20000:  "klingelbox.bin",
-              0x420000: "storage.bin",
+              0x300000: "storage.bin",
           }
           if recorded != expected:
               sys.exit("flasher_args.json disagrees with the explicit merge list:\n"
@@ -164,12 +216,12 @@ jobs:
           print("flasher_args.json offsets match the explicit merge list")
           PY
           esptool.py --chip esp32s3 merge_bin -o ../dist/klingelbox-esp32s3-full.bin \
-            --flash_mode dio --flash_freq 80m --flash_size 16MB \
+            --flash_mode dio --flash_freq 80m --flash_size 4MB \
             0x0      "$BUILD/bootloader/bootloader.bin" \
             0x8000   "$BUILD/partition_table/partition-table.bin" \
             0x1d000  "$BUILD/ota_data_initial.bin" \
             0x20000  "$BUILD/klingelbox.bin" \
-            0x420000 "$BUILD/storage.bin"
+            0x300000 "$BUILD/storage.bin"
           # App-only image for POST /api/ota, and the web-UI image for
           # POST /api/ota/webui. Stable names — the on-device updater and the docs
           # link to releases/latest/download/<name>.
@@ -184,6 +236,8 @@ jobs:
           python3 - <<'PY'
           import sys
           # The FULL nvs partition from partitions.csv (0x9000, size 0x14000) —
+          # deliberately unchanged by the unified 4 MB layout: the 80 KB NVS is
+          # the user's configuration space and every layout revision keeps it —
           # not merely the gap up to the next merged segment. Checking the whole
           # window is what catches a partition-table edit that quietly slides
           # otadata into what the flasher believes is reserved NVS space.
@@ -238,7 +292,9 @@ jobs:
               "tag": os.environ["TAG"],
               "target": "esp32s3",
               "idf_version": os.environ.get("IDF_VERSION", "v5.3.1"),
-              "flash": {"size": "16MB", "mode": "dio", "freq": "80m"},
+              # 4MB is what the merged image is stamped with (the unified layout);
+              # boards with more flash clamp to it at boot and leave the rest unused.
+              "flash": {"size": "4MB", "mode": "dio", "freq": "80m"},
               # Deliberately left as 0xFF in the merged image so the browser flasher
               # can inject a generated NVS config seed there before writing. Matches
               # the nvs partition in partitions.csv (grown from 0x6000 in v0.6.x).
