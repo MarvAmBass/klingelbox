@@ -2354,11 +2354,22 @@ static esp_err_t api_config_get(httpd_req_t *req)
         cJSON_AddBoolToObject(web, "tls_enabled", s_cfg->tls_enabled);
         if (db_tls_ready()) {
             cJSON *tls = cJSON_AddObjectToObject(web, "tls");
+            /* While a rejected upload is shadowed (db_tls.h) `source` still
+             * says "generated" ON PURPOSE: source describes what is being
+             * SERVED, and that is the on-device fallback — a client that
+             * pins by this object must pin the real thing. The shadowing
+             * itself rides in `custom_rejected`, present only when true,
+             * like every tls field that is only sometimes meaningful. */
             cJSON_AddStringToObject(tls, "source",
                 db_tls_source() == DB_TLS_PROVIDED ? "provided" : "generated");
             char fp[65];
             if (db_tls_get_fingerprint(fp, sizeof(fp)) == ESP_OK)
                 cJSON_AddStringToObject(tls, "fingerprint", fp);
+            char why[DB_TLS_REJECT_REASON_MAX];
+            if (db_tls_custom_rejected(why, sizeof(why))) {
+                cJSON_AddBoolToObject(tls, "custom_rejected", true);
+                cJSON_AddStringToObject(tls, "rejected_reason", why);
+            }
         } else {
             cJSON_AddNullToObject(web, "tls");
         }
@@ -2665,16 +2676,12 @@ static esp_err_t api_tls_identity_post(httpd_req_t *req)
 
     esp_err_t err = db_tls_set_identity(cert, strlen(cert), key, strlen(key));
     cJSON_Delete(j);
+    /* The two verdict sentences live in db_tls.h because the load-time
+     * shadow path (rejected_reason) tells the same story with them. */
     if (err == ESP_ERR_INVALID_ARG)
-        return send_error(req, "400 Bad Request",
-                          "the pair did not validate: a certificate or the key "
-                          "failed to parse, or the key does not match the "
-                          "(first) certificate — the chain must be leaf-first");
+        return send_error(req, "400 Bad Request", DB_TLS_MSG_PAIR_INVALID);
     if (err == ESP_ERR_NOT_SUPPORTED)
-        return send_error(req, "400 Bad Request",
-                          "the private key is too weak for a TLS server: the "
-                          "floor is 2048 bits for RSA and 255 bits for EC "
-                          "(P-256 and up)");
+        return send_error(req, "400 Bad Request", DB_TLS_MSG_KEY_WEAK);
     if (err == ESP_ERR_INVALID_SIZE)
         return send_error(req, "413 Payload Too Large",
                           "the certificate must stay under 6 KB and the key "
@@ -4111,6 +4118,19 @@ static esp_err_t start_servers(void)
                            "TLS unavailable (no certificate could be stored) — "
                            "serving plain HTTP instead; retrying every minute");
         want_tls = false;
+    }
+
+    /* SHADOWING (db_tls.h): the ensure above just minted the stand-in for a
+     * stored-but-rejected upload. One feed entry per boot, not per server
+     * restart — the state cannot change without going through a path (upload,
+     * delete, reboot) that resets or re-announces it anyway; the full reason
+     * sentence is too long for the ring and lives in GET /api/config. */
+    static bool s_shadow_announced;
+    if (want_tls && db_tls_custom_rejected(NULL, 0) && !s_shadow_announced) {
+        s_shadow_announced = true;
+        db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                       "uploaded TLS certificate rejected — serving the "
+                       "generated one");
     }
 
     esp_err_t err;

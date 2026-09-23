@@ -5692,9 +5692,10 @@ function sectionAp() {
    is allowed their password without the certificate-warning ceremony.
 
    GET /api/config carries `web: { has_http_password, tls_enabled, tls:
-   { source, fingerprint } }`; the password itself is write-only, exactly
-   like the MQTT and Wi-Fi secrets. A firmware without `web` predates the
-   feature, and the section says so instead of offering dead controls. */
+   { source, fingerprint, custom_rejected?, rejected_reason? } }`; the
+   password itself is write-only, exactly like the MQTT and Wi-Fi secrets. A
+   firmware without `web` predates the feature, and the section says so
+   instead of offering dead controls. */
 
 function sectionAccess() {
   var s = section(t("Access & encryption"),
@@ -5850,6 +5851,21 @@ function renderAccess(body, flash) {
   var fsC = el("fieldset");
   add(fsC, el("legend", null, t("Certificate")));
   var tls = web.tls || null;
+  /* SHADOWING (custom_rejected): the stored upload failed validation at boot
+     and the box serves its own generated certificate instead — `source` below
+     honestly says "generated" because that IS what is served. The stored pair
+     is still on the box; this note is the one place that says so, with the
+     firmware's reason sentence verbatim (server prose, never translated —
+     same policy as every {"error": ...} sentence). */
+  if (tls && tls.custom_rejected) {
+    var rj = el("div", "note warn");
+    add(rj, el("div", null,
+      t("The certificate you uploaded was rejected when the box last started:")));
+    add(rj, el("div", "mono", tls.rejected_reason || ""));
+    add(rj, el("div", null,
+      t("The box is serving a certificate it generated itself instead — HTTPS stays on. Your uploaded pair is still stored, untouched: install a fixed pair below to replace it, or delete it.")));
+    add(fsC, rj);
+  }
   if (!tls || !tls.fingerprint) {
     add(fsC, el("div", "hint",
       t("No certificate exists yet. The box generates one of its own the first time TLS is switched on.")));
@@ -5917,12 +5933,20 @@ function renderAccess(body, flash) {
     });
   });
   add(cFoot, up);
-  if (tls && tls.source === "provided") {
-    var rev = el("button", "btn danger", t("Back to the generated certificate"));
+  /* The delete button also shows while a rejected upload is shadowed: the
+     pair being stored-but-not-served is exactly when "delete it" must stay
+     reachable, and `source` is "generated" then, so the source test alone
+     would hide it. */
+  if (tls && (tls.source === "provided" || tls.custom_rejected)) {
+    var rev = el("button", "btn danger", tls.custom_rejected
+      ? t("Delete the rejected certificate")
+      : t("Back to the generated certificate"));
     rev.type = "button";
     rev.addEventListener("click", function () {
       confirmSheet(t("Discard the uploaded certificate?"),
-        [t("The box returns to the certificate it generated itself. Browsers that trusted the uploaded one will warn again.")],
+        [tls.custom_rejected
+          ? t("The stored (rejected) pair is deleted from the box. The box keeps serving the certificate it generated itself.")
+          : t("The box returns to the certificate it generated itself. Browsers that trusted the uploaded one will warn again.")],
         t("Discard it"), true).then(function (ok) {
         if (!ok) return;
         setMsg(cMsg, t("Saving…"));

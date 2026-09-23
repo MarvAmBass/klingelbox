@@ -47,6 +47,11 @@ esp_err_t nvs_get_blob(nvs_handle_t handle, const char *key,
                        void *out_value, size_t *length);
 esp_err_t nvs_erase_key(nvs_handle_t handle, const char *key);
 esp_err_t nvs_commit(nvs_handle_t handle);
+/* u8 pair added for db_tls.c's `src` marker; stored as a 1-byte item in the
+ * same fake table, which is faithful enough — nothing under test depends on
+ * NVS distinguishing value types. */
+esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t value);
+esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *out_value);
 esp_err_t nvs_find_key(nvs_handle_t handle, const char *key,
                        nvs_type_t *out_type);
 

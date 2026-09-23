@@ -115,7 +115,13 @@ curl --cacert klingelbox.pem https://klingelbox.local/api/system
   "fingerprint":"<64 hex>"}` once an identity exists, `null` before the first
   enable (identities are minted lazily, not at boot). The fingerprint is the
   SHA-256 of the certificate's DER — what `openssl x509 -fingerprint -sha256`
-  prints, minus the colons.
+  prints, minus the colons. When a **stored uploaded pair failed validation
+  at boot** (see [security.md](security.md), "Fallbacks, stated honestly")
+  the object additionally carries `"custom_rejected": true` and
+  `"rejected_reason": "<one sentence naming the problem>"` — absent
+  otherwise. `source` is `"generated"` then: the box is serving its own
+  self-signed stand-in while the rejected pair stays stored, untouched,
+  until you re-upload a fixed pair or `DELETE /api/tls/identity`.
 * The generated certificate is self-signed (browsers warn once; pin or
   install it), CN = the box's hostname, validity fixed 2026–2056 because the
   box has **no clock** — see `db_tls.h`.
@@ -146,7 +152,9 @@ Drops the stored identity. With TLS enabled a **fresh self-signed one** is
 minted and served immediately (the response carries its fingerprint); with
 TLS off the slate is wiped and the next enable mints lazily. Either way every
 pinned client must re-pair — on a *generated* identity this doubles as
-deliberate key rotation.
+deliberate key rotation. This is also one of the two ways out of the
+`custom_rejected` shadow state (the other being a successful new upload):
+deleting the stored pair is the explicit "give it up".
 
 ### `GET /cert.pem`
 
@@ -1054,7 +1062,9 @@ succeeded and the key was dropped.) Reads report only `has_pass`.
 write-only and takes `""` as **remove** (its one documented exception to the
 empty-string rule); `tls_enabled` applies live — the servers restart onto the
 other transport right after the response; `web.tls` is `null` until the first
-enable mints an identity.
+enable mints an identity, and gains `custom_rejected`/`rejected_reason` while
+a stored uploaded pair is being shadowed (see
+[Authentication & TLS](#authentication--tls)).
 
 `mqtt.base_topic` and `mqtt.discovery_prefix` are validated on write by the same
 rule as a node's `topic` — see [Topic validation](#topic-validation). A bad value

@@ -34,6 +34,18 @@
  * generated one and is validated COMPLETELY before anything is persisted, so
  * a bad upload can never take the HTTPS server down. DELETE reverts to a
  * fresh on-device identity.
+ *
+ * SHADOWING. A STORED provided pair can still fail validation at load — the
+ * concrete case from our own history is a pair accepted under an older
+ * firmware's rules that a newer strength floor refuses (v0.8.0 took RSA-1024;
+ * v0.9.0's floor does not). That pair is the operator's property: it is NEVER
+ * discarded and NEVER served. Instead the module acts as if no identity
+ * existed, db_tls_ensure() mints the usual self-signed fallback (TLS stays
+ * on — no downgrade), and db_tls_custom_rejected() reports the shadowing plus
+ * a one-sentence reason so the API and UI can say what happened. The stored
+ * blobs stay byte-identical in NVS for inspection; a successful new upload or
+ * an explicit DELETE ends the state. A stored GENERATED pair that fails the
+ * same check is simply discarded and re-minted — nothing user-owned is lost.
  */
 #ifndef DB_TLS_H
 #define DB_TLS_H
@@ -53,10 +65,26 @@ typedef enum {
     DB_TLS_PROVIDED  = 1,   /* uploaded via POST /api/tls/identity           */
 } db_tls_source_t;
 
+/* The two mbedTLS-verdict sentences, defined once so the upload 400 in
+ * http_api.c and the load-time rejected_reason use the SAME words — the
+ * person who reads one at upload time recognizes the other at boot time. */
+#define DB_TLS_MSG_PAIR_INVALID \
+    "the pair did not validate: a certificate or the key failed to parse, " \
+    "or the key does not match the (first) certificate — the chain must " \
+    "be leaf-first"
+#define DB_TLS_MSG_KEY_WEAK \
+    "the private key is too weak for a TLS server: the floor is 2048 bits " \
+    "for RSA and 255 bits for EC (P-256 and up)"
+
+/* Longest reason is a pem_scan sentence (~140 bytes of UTF-8), with room. */
+#define DB_TLS_REJECT_REASON_MAX 192
+
 /* Load the stored identity from NVS if one exists. Never generates. Returns
  * ESP_OK whether or not an identity was found — check db_tls_ready(). A
- * stored pair that no longer validates is discarded (anti-brick), so a
- * corrupt blob degrades to "no identity yet", never to a dead HTTPS server. */
+ * stored pair that no longer validates degrades to "no identity yet", never
+ * to a dead HTTPS server (anti-brick): a GENERATED one is discarded outright,
+ * a PROVIDED one is left untouched in NVS and merely shadowed — see the file
+ * header and db_tls_custom_rejected(). */
 esp_err_t db_tls_load(void);
 
 /* True once a certificate + key are in RAM (loaded, generated or installed). */
@@ -103,13 +131,34 @@ esp_err_t db_tls_get_fingerprint(char *out, size_t out_sz);
 esp_err_t db_tls_set_identity(const char *cert_pem, size_t cert_len,
                               const char *key_pem, size_t key_len);
 
-/* Which identity is active (meaningful only while db_tls_ready()). */
+/* Which identity is active (meaningful only while db_tls_ready()). While a
+ * rejected upload is shadowed this reports DB_TLS_GENERATED — that IS what is
+ * being served; the shadowing itself is db_tls_custom_rejected()'s to tell. */
 db_tls_source_t db_tls_source(void);
+
+/* True while a STORED provided pair failed load-time validation and the
+ * generated fallback is standing in for it (see the file header). When true
+ * and reason_out is non-NULL, copies the one-sentence human reason (at most
+ * DB_TLS_REJECT_REASON_MAX bytes including the NUL) — either a pem_scan.c
+ * structural sentence or one of the DB_TLS_MSG_* verdicts above. Takes the
+ * module lock; safe from any task. Cleared by a successful
+ * db_tls_set_identity() (the re-upload) or by db_tls_clear() (the deliberate
+ * delete) — never by a reboot, which merely re-detects it. */
+bool db_tls_custom_rejected(char *reason_out, size_t reason_sz);
 
 /* Drop the stored identity (provided or generated) from NVS and RAM. The next
  * db_tls_ensure() mints a fresh self-signed one — which BREAKS existing pins,
- * so the API warns in its response and docs/security.md explains re-pairing. */
+ * so the API warns in its response and docs/security.md explains re-pairing.
+ * Also ends any shadowing: deleting the stored pair is the explicit "give it
+ * up" the shadow state exists to wait for. */
 esp_err_t db_tls_clear(void);
+
+#ifdef DB_HOSTTEST
+/* Host tests only (host-test/Makefile defines DB_HOSTTEST): forget the
+ * resident state so db_tls_load() can run again, simulating a reboot against
+ * whatever the fake flash holds. Does not exist in a device build. */
+void db_tls_hosttest_reset(void);
+#endif
 
 #ifdef __cplusplus
 }

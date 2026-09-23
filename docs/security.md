@@ -131,7 +131,25 @@ configuration says TLS and the fallback is what is running, the box retries
 the HTTPS start **every 60 seconds, forever** — you chose TLS, and a
 transient boot-time failure must not silently revoke that choice until the
 next power cycle. The event feed reports the fallback once when it happens
-and the recovery once when it succeeds, not every retry. On the recovery
+and the recovery once when it succeeds, not every retry.
+
+One failure is *not* transient and gets its own shape: a **stored uploaded
+pair that fails validation at boot** (the concrete case: a pair accepted
+under an older firmware's rules that a newer key-strength floor refuses).
+Retrying that forever would leave the box headless over bytes that will
+never start validating, and discarding it would destroy the operator's
+property. So the box **shadows** it instead: the stored pair stays in flash
+byte-for-byte untouched, a self-signed identity is minted and served in its
+place — **TLS stays on, no downgrade** — and the state is flagged loudly:
+one event-feed entry at boot, and `GET /api/config` → `web.tls` carries
+`custom_rejected: true` plus a `rejected_reason` sentence naming the actual
+problem. `source` still reads `"generated"` because that is what is being
+served. The shadow identity is deliberately *not* persisted (persisting it
+would overwrite the stored pair), so its fingerprint changes every boot —
+nothing should pin it. The state ends only by an explicit act of yours:
+upload a fixed pair, or `DELETE /api/tls/identity` the stored one.
+
+On the recovery
 portal with TLS enabled, captive-portal sheets may balk at the self-signed
 redirect; opening `https://192.168.66.1` in a normal browser (and accepting
 the pin) always works.

@@ -14,6 +14,12 @@ static inline SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t *b
 {
     return (SemaphoreHandle_t)buf;
 }
+static inline SemaphoreHandle_t xSemaphoreCreateMutex(void)
+{
+    /* Per-TU static is fine: the handle only ever needs to be non-NULL. */
+    static StaticSemaphore_t dummy;
+    return (SemaphoreHandle_t)&dummy;
+}
 static inline BaseType_t xSemaphoreTake(SemaphoreHandle_t h, TickType_t wait)
 {
     (void)h; (void)wait; return pdTRUE;

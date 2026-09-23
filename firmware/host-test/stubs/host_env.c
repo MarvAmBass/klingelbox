@@ -226,6 +226,18 @@ esp_err_t nvs_commit(nvs_handle_t handle)
     return ESP_OK;
 }
 
+/* u8 as a 1-byte blob in the same table — see the stub header. */
+esp_err_t nvs_set_u8(nvs_handle_t handle, const char *key, uint8_t value)
+{
+    return nvs_set_blob(handle, key, &value, 1);
+}
+
+esp_err_t nvs_get_u8(nvs_handle_t handle, const char *key, uint8_t *out_value)
+{
+    size_t len = 1;
+    return nvs_get_blob(handle, key, out_value, &len);
+}
+
 esp_err_t nvs_find_key(nvs_handle_t handle, const char *key, nvs_type_t *out_type)
 {
     const char *ns = ns_of_handle(handle);
@@ -330,6 +342,13 @@ uint32_t esp_random(void)
     static uint32_t x = 0x12345678u;
     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
     return x;
+}
+
+void esp_fill_random(void *buf, size_t len)
+{
+    uint8_t *p = (uint8_t *)buf;
+    for (size_t i = 0; i < len; i++)
+        p[i] = (uint8_t)esp_random();
 }
 
 void host_log(const char *tag, const char *fmt, ...)

@@ -30,6 +30,13 @@
  *    and the store-full budget refuses an add while every other save on the
  *    box still has room to keep working.
  *
+ * 4. THE TLS IDENTITY'S LOAD-PATH DECISIONS (db_tls.c, with mbedTLS replaced
+ *    by the content-driven fake in stubs/host_mbedtls.c): a stored UPLOADED
+ *    pair that fails boot-time validation is shadowed — never served, never
+ *    erased, its NVS bytes provably byte-identical afterwards — while the
+ *    box's own generated pair in the same situation is discarded and
+ *    re-minted. The destroyable user data here is the uploaded pair itself.
+ *
  * None of this needs ESP-IDF: everything is compiled against the stubs in
  * stubs/ rather than the framework. If a source file here ever needs a stub
  * that is not a fair model of the real thing, that is the moment to stop and
@@ -41,6 +48,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "db_tls.h"
 #include "esp_err.h"
 #include "host_env.h"
 #include "mqtt_topic.h"
@@ -1280,6 +1288,268 @@ static void test_graph_delete_survives_failed_links_write(void)
     CHECK(db_graph_node_count() == 0, "graph empty again");
 }
 
+/* ---- 4. the TLS identity's load-path decisions --------------------------- */
+
+/*
+ * db_tls.c against the same fake NVS, with mbedTLS replaced by the
+ * content-driven fake in stubs/host_mbedtls.c. What is under test is the
+ * boot-time decision tree for a STORED pair that fails validation:
+ *
+ *   - PROVIDED (uploaded by the operator): SHADOWED — served never, erased
+ *     never. The property pinned hardest here is that the stored bytes stay
+ *     byte-identical through detection, shadow generation and reboots,
+ *     because the concrete bug this guards against is v0.9.0's key-strength
+ *     floor silently destroying a pair uploaded under v0.8.0.
+ *   - GENERATED (the box's own): discarded and re-minted, nothing user-owned
+ *     is lost.
+ *
+ * Plus the only two exits from the shadow state: a successful re-upload and
+ * an explicit delete.
+ */
+
+/* PEM-shaped fixtures in the fake's grammar (stubs/mbedtls/pk.h). ALPHA is a
+ * matched pair; ALPHA_WEAK_KEY is the same keypair as an RSA-1024 export —
+ * parses fine, matches fine, and sits below the v0.9.0 strength floor:
+ * exactly the "old firmware accepted it" shape. */
+static const char TLS_ALPHA_CERT[] =
+    "-----BEGIN CERTIFICATE-----\npair=alpha\n-----END CERTIFICATE-----\n";
+static const char TLS_ALPHA_KEY[] =
+    "-----BEGIN PRIVATE KEY-----\npair=alpha\n-----END PRIVATE KEY-----\n";
+static const char TLS_ALPHA_WEAK_KEY[] =
+    "-----BEGIN RSA PRIVATE KEY-----\npair=alpha\ntype=rsa\nbits=1024\n"
+    "-----END RSA PRIVATE KEY-----\n";
+static const char TLS_BETA_CERT[] =
+    "-----BEGIN CERTIFICATE-----\npair=beta\n-----END CERTIFICATE-----\n";
+static const char TLS_BETA_KEY[] =
+    "-----BEGIN PRIVATE KEY-----\npair=beta\n-----END PRIVATE KEY-----\n";
+
+/* Write a pair into the db_tls namespace the way persist() would have — the
+ * test standing in for the OLDER firmware that stored it (blobs carry their
+ * NUL, exactly like persist()). */
+static void tls_seed_stored(const char *cert, const char *key, uint8_t src)
+{
+    nvs_handle_t h;
+    CHECK(nvs_open("db_tls", NVS_READWRITE, &h) == ESP_OK, "open db_tls ns");
+    CHECK(nvs_set_blob(h, "cert", cert, strlen(cert) + 1) == ESP_OK, "seed cert");
+    CHECK(nvs_set_blob(h, "key", key, strlen(key) + 1) == ESP_OK, "seed key");
+    CHECK(nvs_set_u8(h, "src", src) == ESP_OK, "seed src");
+    CHECK(nvs_commit(h) == ESP_OK, "commit seed");
+    nvs_close(h);
+}
+
+/* Read one stored blob back; returns its length, 0 when absent. */
+static size_t tls_stored(const char *key, char *out, size_t cap)
+{
+    nvs_handle_t h;
+    if (nvs_open("db_tls", NVS_READONLY, &h) != ESP_OK) return 0;
+    size_t len = cap;
+    esp_err_t err = nvs_get_blob(h, key, out, &len);
+    nvs_close(h);
+    return err == ESP_OK ? len : 0;
+}
+
+static void test_tls_valid_provided_pair_activates(void)
+{
+    CASE("a valid stored provided pair simply activates");
+    host_nvs_reset();
+    db_tls_hosttest_reset();
+    tls_seed_stored(TLS_ALPHA_CERT, TLS_ALPHA_KEY, 1 /* DB_TLS_PROVIDED */);
+
+    CHECK(db_tls_load() == ESP_OK, "load reports OK");
+    CHECK(db_tls_ready(), "identity is ready");
+    CHECK(db_tls_source() == DB_TLS_PROVIDED, "and provided");
+    CHECK(!db_tls_custom_rejected(NULL, 0), "nothing rejected");
+
+    const char *pem = NULL;
+    size_t len = 0;
+    CHECK(db_tls_get_cert_pem(&pem, &len) == ESP_OK, "cert readable");
+    CHECK(pem && strcmp(pem, TLS_ALPHA_CERT) == 0, "and is the stored one");
+}
+
+static void test_tls_shadow_keeps_stored_bytes(void)
+{
+    CASE("rejected provided pair: shadowed, stored bytes byte-identical");
+    host_nvs_reset();
+    db_tls_hosttest_reset();
+    tls_seed_stored(TLS_ALPHA_CERT, TLS_ALPHA_WEAK_KEY, 1);
+
+    /* Load: the pair fails the strength floor. NOT discarded, NOT served. */
+    CHECK(db_tls_load() == ESP_OK, "load still reports OK (anti-brick)");
+    CHECK(!db_tls_ready(), "the bad pair is not serving");
+    char reason[DB_TLS_REJECT_REASON_MAX] = "";
+    CHECK(db_tls_custom_rejected(reason, sizeof(reason)), "flagged rejected");
+    CHECK(strstr(reason, "too weak for a TLS server") != NULL,
+          "reason is the weak-key sentence, got: %s", reason);
+
+    /* Ensure: the generated fallback serves — TLS stays possible. */
+    CHECK(db_tls_ensure("testbox") == ESP_OK, "ensure mints the stand-in");
+    CHECK(db_tls_ready(), "stand-in is ready");
+    CHECK(db_tls_source() == DB_TLS_GENERATED,
+          "source is generated — that IS what serves");
+    CHECK(db_tls_custom_rejected(NULL, 0), "still flagged while shadowed");
+    char fp[65];
+    CHECK(db_tls_get_fingerprint(fp, sizeof(fp)) == ESP_OK, "fingerprint works");
+
+    /* THE property: detection + shadow generation left the stored upload
+     * byte-for-byte intact — cert, key AND source marker. */
+    char blob[512];
+    size_t len = tls_stored("cert", blob, sizeof(blob));
+    CHECK(len == sizeof(TLS_ALPHA_CERT) &&
+          memcmp(blob, TLS_ALPHA_CERT, len) == 0,
+          "stored cert bytes untouched");
+    len = tls_stored("key", blob, sizeof(blob));
+    CHECK(len == sizeof(TLS_ALPHA_WEAK_KEY) &&
+          memcmp(blob, TLS_ALPHA_WEAK_KEY, len) == 0,
+          "stored key bytes untouched");
+    len = tls_stored("src", blob, sizeof(blob));
+    CHECK(len == 1 && blob[0] == 1, "stored source still 'provided'");
+
+    /* And the stand-in never overwrote them: what serves is not what is
+     * stored (the RAM-only shadow — persisting it would be the overwrite). */
+    const char *pem = NULL;
+    CHECK(db_tls_get_cert_pem(&pem, NULL) == ESP_OK &&
+          strcmp(pem, TLS_ALPHA_CERT) != 0,
+          "served cert is the stand-in, not the stored upload");
+}
+
+static void test_tls_shadow_survives_reboot(void)
+{
+    CASE("a reboot re-detects the shadow from the same stored bytes");
+    /* Continues the flash state of the previous test on purpose: this is the
+     * next boot of that box. */
+    char fp_before[65];
+    CHECK(db_tls_get_fingerprint(fp_before, sizeof(fp_before)) == ESP_OK,
+          "fingerprint before the reboot");
+
+    db_tls_hosttest_reset();   /* the reboot */
+    CHECK(db_tls_load() == ESP_OK, "boot load");
+    char reason[DB_TLS_REJECT_REASON_MAX] = "";
+    CHECK(db_tls_custom_rejected(reason, sizeof(reason)), "rejected again");
+    CHECK(strstr(reason, "too weak") != NULL, "same verdict, same words");
+    CHECK(db_tls_ensure("testbox") == ESP_OK, "stand-in minted again");
+
+    /* The RAM-only stand-in is re-minted per boot, so its fingerprint moves —
+     * the documented cost of never persisting over the stored pair. Nothing
+     * should pin the stand-in, and a changing print says so. */
+    char fp_after[65];
+    CHECK(db_tls_get_fingerprint(fp_after, sizeof(fp_after)) == ESP_OK &&
+          strcmp(fp_before, fp_after) != 0,
+          "per-boot stand-in fingerprint changed");
+
+    char blob[512];
+    size_t len = tls_stored("key", blob, sizeof(blob));
+    CHECK(len == sizeof(TLS_ALPHA_WEAK_KEY) &&
+          memcmp(blob, TLS_ALPHA_WEAK_KEY, len) == 0,
+          "stored key still byte-identical after a second boot");
+}
+
+static void test_tls_failed_reupload_keeps_shadow(void)
+{
+    CASE("a re-upload that fails validation changes nothing");
+    /* Still the shadowed box. A mismatched pair must bounce at the gate. */
+    CHECK(db_tls_set_identity(TLS_BETA_CERT, strlen(TLS_BETA_CERT),
+                              TLS_ALPHA_KEY, strlen(TLS_ALPHA_KEY))
+              == ESP_ERR_INVALID_ARG,
+          "mismatched pair refused");
+    CHECK(db_tls_custom_rejected(NULL, 0), "still shadowed");
+    char blob[512];
+    size_t len = tls_stored("cert", blob, sizeof(blob));
+    CHECK(len == sizeof(TLS_ALPHA_CERT) &&
+          memcmp(blob, TLS_ALPHA_CERT, len) == 0,
+          "stored cert still untouched");
+}
+
+static void test_tls_good_reupload_clears_shadow(void)
+{
+    CASE("a successful new upload is one exit from the shadow state");
+    /* Still the shadowed box; the operator uploads a fixed pair. */
+    CHECK(db_tls_set_identity(TLS_BETA_CERT, strlen(TLS_BETA_CERT),
+                              TLS_BETA_KEY, strlen(TLS_BETA_KEY)) == ESP_OK,
+          "fixed pair accepted");
+    CHECK(!db_tls_custom_rejected(NULL, 0), "shadow released");
+    CHECK(db_tls_ready() && db_tls_source() == DB_TLS_PROVIDED,
+          "the new upload serves");
+    char blob[512];
+    size_t len = tls_stored("cert", blob, sizeof(blob));
+    CHECK(len == sizeof(TLS_BETA_CERT) &&
+          memcmp(blob, TLS_BETA_CERT, len) == 0,
+          "the new pair is what is stored now — replaced by its OWNER");
+
+    /* And the state is ordinary again after a reboot. */
+    db_tls_hosttest_reset();
+    CHECK(db_tls_load() == ESP_OK && db_tls_ready(), "boots clean");
+    CHECK(db_tls_source() == DB_TLS_PROVIDED && !db_tls_custom_rejected(NULL, 0),
+          "provided, no flag");
+}
+
+static void test_tls_delete_clears_shadow(void)
+{
+    CASE("an explicit delete is the other exit from the shadow state");
+    host_nvs_reset();
+    db_tls_hosttest_reset();
+    tls_seed_stored(TLS_ALPHA_CERT, TLS_ALPHA_WEAK_KEY, 1);
+    CHECK(db_tls_load() == ESP_OK && db_tls_custom_rejected(NULL, 0),
+          "shadow engaged");
+    CHECK(db_tls_ensure("testbox") == ESP_OK, "stand-in serving");
+
+    CHECK(db_tls_clear() == ESP_OK, "DELETE keeps its meaning: remove it");
+    CHECK(!db_tls_custom_rejected(NULL, 0), "shadow released");
+    char blob[512];
+    CHECK(tls_stored("cert", blob, sizeof(blob)) == 0 &&
+          tls_stored("key", blob, sizeof(blob)) == 0,
+          "the stored pair is gone — deliberately, this time");
+
+    /* The next ensure mints AND persists: no shadow left to protect. */
+    CHECK(db_tls_ensure("testbox") == ESP_OK, "fresh identity");
+    CHECK(db_tls_source() == DB_TLS_GENERATED, "generated");
+    CHECK(tls_stored("cert", blob, sizeof(blob)) > 0,
+          "and persisted like any normal generated identity");
+}
+
+static void test_tls_generated_corruption_is_discarded(void)
+{
+    CASE("a corrupt GENERATED pair keeps the old discard-and-remint");
+    host_nvs_reset();
+    db_tls_hosttest_reset();
+    /* Flash corruption shape: the cert blob no longer parses. src = 0, the
+     * box's own identity — nothing user-owned in it. */
+    tls_seed_stored("garbage, not PEM\n", TLS_ALPHA_KEY, 0 /* GENERATED */);
+
+    CHECK(db_tls_load() == ESP_OK, "load reports OK");
+    CHECK(!db_tls_ready(), "corrupt pair not served");
+    CHECK(!db_tls_custom_rejected(NULL, 0),
+          "no shadow for our own identity — discard is the right move");
+    char blob[512];
+    CHECK(tls_stored("cert", blob, sizeof(blob)) == 0,
+          "the corrupt blobs were erased");
+
+    CHECK(db_tls_ensure("testbox") == ESP_OK, "re-minted");
+    CHECK(db_tls_ready() && db_tls_source() == DB_TLS_GENERATED, "generated");
+    CHECK(tls_stored("cert", blob, sizeof(blob)) > 0, "and persisted");
+}
+
+static void test_tls_shadow_reason_is_structural_when_it_can_be(void)
+{
+    CASE("the reason prefers pem_scan's structural sentence");
+    host_nvs_reset();
+    db_tls_hosttest_reset();
+    /* A truncated key blob — the paste-gone-wrong/corruption shape pem_scan
+     * exists to name better than "did not parse". */
+    tls_seed_stored(TLS_ALPHA_CERT, "-----BEGIN PRIV", 1);
+
+    CHECK(db_tls_load() == ESP_OK, "load reports OK");
+    char reason[DB_TLS_REJECT_REASON_MAX] = "";
+    CHECK(db_tls_custom_rejected(reason, sizeof(reason)), "flagged rejected");
+    CHECK(strstr(reason, "private-key block") != NULL,
+          "reason names the structural problem, got: %s", reason);
+
+    char blob[512];
+    size_t len = tls_stored("key", blob, sizeof(blob));
+    CHECK(len == sizeof("-----BEGIN PRIV") &&
+          memcmp(blob, "-----BEGIN PRIV", len) == 0,
+          "even a truncated stored key stays untouched for inspection");
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 int main(void)
@@ -1322,6 +1592,15 @@ int main(void)
 
     test_graph_mutation_rollback();
     test_graph_delete_survives_failed_links_write();
+
+    test_tls_valid_provided_pair_activates();
+    test_tls_shadow_keeps_stored_bytes();
+    test_tls_shadow_survives_reboot();
+    test_tls_failed_reupload_keeps_shadow();
+    test_tls_good_reupload_clears_shadow();
+    test_tls_delete_clears_shadow();
+    test_tls_generated_corruption_is_discarded();
+    test_tls_shadow_reason_is_structural_when_it_can_be();
 
     printf("---------------------\n");
     printf("%d checks passed, %d failed\n", g_pass, g_fail);

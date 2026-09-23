@@ -62,6 +62,13 @@ static size_t s_key_len;
 static bool   s_ready;
 static db_tls_source_t s_source = DB_TLS_GENERATED;
 
+/* SHADOW state (db_tls.h): a stored PROVIDED pair failed load-time
+ * validation; its NVS blobs are untouched, the generated fallback serves in
+ * its place, and the reason sentence tells the API/UI why. RAM-only on
+ * purpose — a reboot re-detects it from the same stored bytes. */
+static bool s_custom_rejected;
+static char s_rejected_reason[DB_TLS_REJECT_REASON_MAX];
+
 /*
  * WHY A LOCK, when nearly everything here runs on the main server's one
  * httpd task: GET /cert.pem is ALSO served by the :80 redirect helper, a
@@ -237,12 +244,49 @@ esp_err_t db_tls_load(void)
     s_key_len = strlen(s_key_pem);
     if (s_cert_len == 0 || s_key_len == 0) return ESP_OK;
 
-    /* Anti-brick: a stored pair that no longer validates (flash corruption)
-     * must NOT be served — the HTTPS server would refuse to start with no
-     * recovery path. Discard it so db_tls_ensure() regenerates instead. */
-    if (validate_pair(s_cert_pem, s_cert_len, s_key_pem, s_key_len) != ESP_OK) {
-        ESP_LOGE(TAG, "stored TLS identity failed validation — discarding it");
-        db_tls_clear();
+    /* Anti-brick: a stored pair that no longer validates must NOT be served —
+     * the HTTPS server would refuse to start with no recovery path. What
+     * happens to the pair depends on who owns it:
+     *
+     *  - PROVIDED is the operator's property, uploaded once and possibly the
+     *    only copy they still have. It also fails for a reason worth reading
+     *    (the concrete one from our own history: a pair accepted under
+     *    v0.8.0's rules refused by v0.9.0's key-strength floor). So it is
+     *    SHADOWED, never destroyed: the NVS blobs stay byte-identical for
+     *    inspection/re-upload, we record the why, and fall through as if no
+     *    identity existed so db_tls_ensure() serves the generated fallback —
+     *    TLS stays on, no downgrade, and no 60 s retry loop banging its head
+     *    against bytes that will never start validating.
+     *
+     *  - GENERATED is ours (flash corruption is the only way it gets here):
+     *    discarding and re-minting loses nothing anyone owns. */
+    esp_err_t verr = validate_pair(s_cert_pem, s_cert_len, s_key_pem, s_key_len);
+    if (verr != ESP_OK) {
+        if (src == DB_TLS_PROVIDED) {
+            /* Best reason first: pem_scan names a structural wound (truncated
+             * block, wrong label) in a sentence; otherwise reuse the exact
+             * verdict sentence the upload 400 would have used. */
+            const char *why = db_pem_scan_pair(s_cert_pem, s_cert_len,
+                                               s_key_pem, s_key_len);
+            if (!why)
+                why = (verr == ESP_ERR_NOT_SUPPORTED) ? DB_TLS_MSG_KEY_WEAK
+                                                      : DB_TLS_MSG_PAIR_INVALID;
+            state_lock();
+            s_custom_rejected = true;
+            snprintf(s_rejected_reason, sizeof(s_rejected_reason), "%s", why);
+            state_unlock();
+            ESP_LOGE(TAG, "stored uploaded TLS identity failed validation — "
+                          "shadowing it with a generated one (%s)", why);
+        } else {
+            ESP_LOGE(TAG, "stored generated TLS identity failed validation — "
+                          "discarding it");
+            db_tls_clear();
+        }
+        /* Either way the bad private key must not linger in RAM; for the
+         * shadowed pair NVS still holds it, which is the whole point. */
+        s_cert_len = s_key_len = 0;
+        memset(s_key_pem, 0, sizeof(s_key_pem));
+        memset(s_cert_pem, 0, sizeof(s_cert_pem));
         return ESP_OK;
     }
 
@@ -356,8 +400,15 @@ static esp_err_t generate_identity(const char *hostname)
     s_cert_len = strlen(s_cert_pem);
 
     /* Must goto, not return: an early return would skip the cleanup label and
-     * leak the pk/drbg/entropy/crt contexts. */
-    ret = persist(DB_TLS_GENERATED);
+     * leak the pk/drbg/entropy/crt contexts.
+     *
+     * While a rejected upload is being shadowed the fallback lives in RAM
+     * ONLY: persist() writes the db_tls namespace, so persisting here would
+     * overwrite the operator's stored pair — the destruction shadowing exists
+     * to prevent. The cost is a fingerprint that changes at every boot in
+     * this (flagged, degraded) state, which is honest: it is not their
+     * certificate, and nothing should pin it. */
+    ret = s_custom_rejected ? ESP_OK : persist(DB_TLS_GENERATED);
     if (ret != ESP_OK) goto out;
 
     /* Same publication pattern as db_tls_load: generation only ever runs
@@ -382,6 +433,19 @@ out:
 bool db_tls_ready(void) { return s_ready; }
 
 db_tls_source_t db_tls_source(void) { return s_source; }
+
+bool db_tls_custom_rejected(char *reason_out, size_t reason_sz)
+{
+    /* Under the lock like every cross-task read: the reason buffer is
+     * written by db_tls_load and cleared by set/clear on the main task,
+     * while GET /api/config may read it from either httpd task. */
+    state_lock();
+    bool rejected = s_custom_rejected;
+    if (rejected && reason_out && reason_sz)
+        snprintf(reason_out, reason_sz, "%s", s_rejected_reason);
+    state_unlock();
+    return rejected;
+}
 
 esp_err_t db_tls_ensure(const char *hostname)
 {
@@ -497,6 +561,10 @@ esp_err_t db_tls_set_identity(const char *cert_pem, size_t cert_len,
     }
     s_source = DB_TLS_PROVIDED;
     s_ready = true;
+    /* A validated, persisted upload is the happy end of any shadowing: the
+     * rejected pair was just overwritten by its owner, deliberately. */
+    s_custom_rejected = false;
+    s_rejected_reason[0] = '\0';
     state_unlock();
 
     char fp[65];
@@ -513,6 +581,10 @@ esp_err_t db_tls_clear(void)
     s_cert_len = s_key_len = 0;
     memset(s_key_pem, 0, sizeof(s_key_pem));
     memset(s_cert_pem, 0, sizeof(s_cert_pem));
+    /* DELETE keeps its meaning while shadowing: remove the stored pair
+     * deliberately — which is also the explicit release of the shadow. */
+    s_custom_rejected = false;
+    s_rejected_reason[0] = '\0';
     state_unlock();
 
     nvs_handle_t h;
@@ -525,3 +597,24 @@ esp_err_t db_tls_clear(void)
     nvs_close(h);
     return err;
 }
+
+/* ---- host-test hook ------------------------------------------------------- */
+
+#ifdef DB_HOSTTEST
+/* Compiled ONLY into host-test/test_node_graph (its Makefile defines
+ * DB_HOSTTEST; no device build does). Forgetting the resident state — but
+ * not the fake flash — is what lets one test binary reboot: the shadow
+ * decision only ever runs inside db_tls_load(), so proving that a rejection
+ * is re-detected (and the stored bytes still untouched) requires dying and
+ * coming back. */
+void db_tls_hosttest_reset(void)
+{
+    s_ready = false;
+    s_source = DB_TLS_GENERATED;
+    s_cert_len = s_key_len = 0;
+    memset(s_cert_pem, 0, sizeof(s_cert_pem));
+    memset(s_key_pem, 0, sizeof(s_key_pem));
+    s_custom_rejected = false;
+    s_rejected_reason[0] = '\0';
+}
+#endif
