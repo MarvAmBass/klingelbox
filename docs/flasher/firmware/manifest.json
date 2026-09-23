@@ -1,7 +1,17 @@
 {
-  "generated": "2026-09-23T12:59:57Z",
+  "generated": "2026-09-23T19:24:15Z",
   "keep": 3,
   "releases": [
+    {
+      "version": "v0.9.2",
+      "date": "2026-09-23T19:23:55Z",
+      "full": {
+        "path": "v0.9.2/klingelbox-esp32s3-full.bin",
+        "size": 4194304,
+        "sha256": "016849a31d0dbf6e53cfa0712b4632d47d1a42831c29ced32853cb2157b6f565"
+      },
+      "notes_url": "https://github.com/MarvAmBass/klingelbox/releases/tag/v0.9.2"
+    },
     {
       "version": "v0.9.1",
       "date": "2026-09-23T12:59:40Z",
@@ -21,16 +31,6 @@
         "sha256": "46ad067b56b162a1bee2daca1d99fbb73c8c00bf5e288c2fa9776f2c610105d1"
       },
       "notes_url": "https://github.com/MarvAmBass/klingelbox/releases/tag/v0.9.0"
-    },
-    {
-      "version": "v0.8.0",
-      "date": "2026-09-23T09:57:38Z",
-      "full": {
-        "path": "v0.8.0/klingelbox-esp32s3-full.bin",
-        "size": 5373952,
-        "sha256": "1172e1837c61729d923e2ee7abf39afdb67dcb0efe38f7903dd190dbd1e85c06"
-      },
-      "notes_url": "https://github.com/MarvAmBass/klingelbox/releases/tag/v0.8.0"
     }
   ]
 }
