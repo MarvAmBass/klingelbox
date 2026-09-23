@@ -117,11 +117,22 @@ function syncLogoutBtn() {
   if (b) b.classList.toggle("hidden", !authPass);
 }
 
+/* True while POST /api/config is setting, changing or removing the web
+   password. The firmware enforces the new credential on the VERY NEXT request,
+   but this UI only adopts it when the POST's response arrives — so a
+   background poll firing in that gap goes out with the outgoing credential
+   and 401s even though the change SUCCEEDED. Suppressing onUnauthorized for
+   the duration keeps that race from throwing the login overlay over a user
+   who just typed the password; the poll simply fails one tick and sails
+   through on the next, with the adopted credential attached. */
+var credChangeInFlight = false;
+
 /* The box said 401. Whatever password we hold (possibly none) does not work,
    so: forget it, stop every poll (a wall of failing requests helps nobody),
    and put the login screen up. Idempotent on purpose — a tab poll, the system
    poll and a user click can all 401 in the same second. */
 function onUnauthorized() {
+  if (credChangeInFlight) return;   /* a poll racing a password change, not a bad credential */
   if (loginBox) return;
   setAuthPass(null);
   stopTabPolls();
@@ -187,10 +198,10 @@ function showLogin() {
     setMsg(msg, "");
     /* A raw fetch, NOT api(): api() would attach the stored (absent or wrong)
        header and feed its own failure back into onUnauthorized. Nothing is
-       stored until this probe has actually answered 200. The firmware delays
-       a wrong password by ~300 ms on purpose (brute-force damping), so the
-       spinner is not decoration — it makes that pause read as checking
-       rather than as a hang. */
+       stored until this probe has actually answered 200. A wrong password
+       answers instantly but closes the box's auth gate for ~300 ms
+       (brute-force damping) — far shorter than any human retype, so this
+       screen never needs to know about it. */
     fetch("/api/system", { headers: { "Authorization": basicAuth(p) } })
       .then(function (res) {
         if (res.ok) {
@@ -5621,6 +5632,13 @@ function renderAccess(body, flash) {
     web.has_http_password
       ? t("A password is set. Every page load and every API call must present it — username admin.")
       : t("No password is set. Anyone who can reach this address can operate the box and change every setting.")));
+  /* The one warning that must be read BEFORE the password exists, because
+     afterwards it is too late by definition — see the handbook's access
+     section, which this line exists to point at. */
+  add(fsP, el("div", "hint",
+    t("A forgotten password cannot be reset — recovery is a USB reflash that erases everything " +
+    "on the box. The Handbook section “Password, TLS and getting locked out” has the details; " +
+    "export a backup under Settings › Backup first.")));
   var userIn = inputEl("text", "admin");
   userIn.readOnly = true;
   userIn.tabIndex = -1;
@@ -5643,15 +5661,25 @@ function renderAccess(body, flash) {
     if (p !== p2.value) { setMsg(pMsg, t("The two fields do not match."), "err"); return; }
     pSave.disabled = true;
     setMsg(pMsg, t("Saving…"));
+    /* Guarded by credChangeInFlight until well AFTER the response: the box
+       enforces the new password on its very next request, so a background
+       poll that left before setAuthPass below lands as a 401 that must not
+       throw the login overlay — changing the password must never be the
+       thing that logs you out. Cleared only after loadConfig has completed
+       a full round trip on the new credential, by which point any request
+       that raced the POST has long since resolved (the box serves them one
+       at a time). */
+    credChangeInFlight = true;
     postJSON("/api/config", { web: { http_password: p } }).then(function () {
       /* Adopt the new credential BEFORE the next request goes out, so the
-         session continues seamlessly — changing the password must never be
-         the thing that logs you out. */
+         session continues seamlessly. */
       setAuthPass(p);
       return loadConfig().then(function () {
         renderAccess(body, t("Password saved. This browser is signed in and stays signed in."));
       });
-    }).catch(function (e) { pSave.disabled = false; setMsg(pMsg, e.message, "err"); });
+    }).catch(function (e) { pSave.disabled = false; setMsg(pMsg, e.message, "err"); })
+      .then(function () { credChangeInFlight = false; },
+            function () { credChangeInFlight = false; });
   });
   add(pFoot, pSave);
   if (web.has_http_password) {
@@ -5665,13 +5693,19 @@ function renderAccess(body, flash) {
         if (!ok) return;
         setMsg(pMsg, t("Saving…"));
         /* Empty string is the contract's "remove it" — the same write-only
-           key, never a separate endpoint. */
+           key, never a separate endpoint. Same race guard as the save path:
+           a poll still carrying the credential the box just forgot is fine
+           (extra auth on an open box is ignored), but the mirror-image
+           mid-flight timing must not throw the overlay either. */
+        credChangeInFlight = true;
         postJSON("/api/config", { web: { http_password: "" } }).then(function () {
           setAuthPass(null);
           return loadConfig().then(function () {
             renderAccess(body, t("Password removed. The box is open again."));
           });
-        }).catch(function (e) { setMsg(pMsg, e.message, "err"); });
+        }).catch(function (e) { setMsg(pMsg, e.message, "err"); })
+          .then(function () { credChangeInFlight = false; },
+                function () { credChangeInFlight = false; });
       });
     });
     add(pFoot, pDel);
@@ -8426,6 +8460,56 @@ function buildHandbook() {
     "particular antenna, and the new one may not be the same build. Tick the box only if you " +
     "meant to copy them.")));
   add(root, s8);
+
+  /* --------------------------- 9. password, TLS and lockout recovery --
+     The offline mirror of docs/security.md's practical half. It MUST be in
+     here: the person staring at a certificate warning, or locked out on the
+     box's own AP, is in exactly the no-internet situation this handbook
+     exists for. */
+  var s9 = hbSection("access", t("Password, TLS and getting locked out"),
+    t("The optional login, the certificate warning, and why a backup comes first."));
+  var b9 = s9.bodyEl;
+
+  add(b9, hbH(t("The password")));
+  hbPs(b9, [
+    t("Settings › Access & encryption can put a password on this box. Once one is set, every " +
+    "page load and every API call must present it — on your Wi-Fi, on the box's own hotspot " +
+    "and on the recovery portal alike. The username is always admin; only the password is " +
+    "yours to choose."),
+    t("This browser stores the password when you sign in, so day to day you will not see the " +
+    "login screen. Everything else — another browser, curl, Home Assistant — sends it as " +
+    "HTTP Basic: user admin, your password. Removing the password needs it too: sign in, " +
+    "then clear it in the same settings section.")
+  ]);
+
+  add(b9, hbH(t("The certificate warning")));
+  hbPs(b9, [
+    t("Turning on TLS (HTTPS) encrypts the connection, which matters once a password exists: " +
+    "over plain HTTP that password crosses the network readable on every request. The box " +
+    "signs its own certificate — no public authority issues one for a box that lives only on " +
+    "your LAN — so the first https:// visit shows a browser warning. The warning does not " +
+    "mean something is wrong; it means the browser has never met this particular box."),
+    t("You vouch for the box instead of an authority: fetch its certificate from /cert.pem — " +
+    "served over plain HTTP precisely so this first step needs no trust yet — and check the " +
+    "SHA-256 fingerprint against the one shown under Settings › Access & encryption. If they " +
+    "match, tell your client to trust exactly that certificate: curl --cacert, a certificate " +
+    "line in Home Assistant, or the browser's accept-the-risk button. From then on nothing " +
+    "between you and the box can impersonate it.")
+  ]);
+
+  add(b9, hbH(t("If the password is lost")));
+  add(b9, hbP(
+    t("There is no reset. Not over the API, not on the recovery portal — a back door for you " +
+    "would be a back door for anyone in Wi-Fi range, so the box does not have one. The only " +
+    "way back in is physical: a USB cable and a full-image reflash, which factory-resets the " +
+    "box — the password goes, and with it the Wi-Fi settings, every learned signal and the " +
+    "whole node graph.")));
+  add(b9, hbNote(
+    t("So export a backup BEFORE setting a password, and again whenever the graph has grown — " +
+    "Settings › Backup, one file. A forgotten password then costs a reflash and a restore " +
+    "instead of teaching the box every remote again. The backup holds no passwords, so it " +
+    "cannot leak the one you lose."), "warn"));
+  add(root, s9);
 }
 
 /* ======================================================================

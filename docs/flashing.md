@@ -29,8 +29,10 @@ Three ways to get firmware onto the box: your browser, `idf.py`, or OTA.
 | A 4 MB ESP32-S3 Zero | Build it yourself, then browser flasher or `idf.py`. |
 
 A full-image flash **factory-resets** the device: Wi-Fi credentials, hostname, MQTT
-settings, every learned signal and the whole node graph are wiped. Only OTA preserves
-them.
+settings, the web password, the TLS certificate and key, every learned signal and the
+whole node graph are wiped. Only OTA preserves them. (That wipe is also the one and only
+recovery from a forgotten web password — see
+[security.md](security.md#lockout-recovery).)
 
 ---
 
@@ -143,6 +145,13 @@ inactive one, reboots into it, and a bad image is rolled back on the next boot.
 The app and the web UI are **separate partitions and separate updates**. Updating the app
 leaves the old UI in place until you update the UI too — so after a release that changes
 both, do both.
+
+The examples below assume the out-of-the-box posture (no password, no TLS). If you set a
+**web password**, add `-u admin:PASSWORD` to every command (a `401` is what forgetting it
+looks like). If **TLS** is enabled, target `https://klingelbox.local` and give curl the
+pinned certificate (`--cacert klingelbox.pem`, or `-k` to skip verification) — plain-HTTP
+POSTs are refused with a `403` pointing at port 443. Details in
+[API.md — Authentication & TLS](API.md#authentication--tls).
 
 ```sh
 # app image

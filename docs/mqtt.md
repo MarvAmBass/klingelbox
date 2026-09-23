@@ -365,8 +365,8 @@ That is the availability topic doing its job: the box is not currently connected
 come back on its own.
 
 **A press fires twice.**
-Almost certainly a `source.any_rf` node *and* a `source.button` node both reaching the same
-sink. A recognised burst legitimately fires both — see
+Almost certainly a `source.any_rf` node *and* a matching `signal.rx` node both reaching the
+same sink. A recognised burst legitimately fires both — see
 [the note in Automations](automations.html#sourceany_rf).
 
 **The bell used to re-ring on every reconnect.**

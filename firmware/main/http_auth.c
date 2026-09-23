@@ -118,3 +118,27 @@ db_auth_result_t db_auth_basic_check(const char *authorization,
 
     return ok ? DB_AUTH_OK : DB_AUTH_WRONG;
 }
+
+db_auth_result_t db_auth_gate_check(const char *authorization,
+                                    const char *password,
+                                    int64_t now_ms,
+                                    int64_t *lockout_until_ms)
+{
+    /* Refuse in-window attempts WITHOUT evaluating them. Checking anyway and
+     * honouring a lucky hit would let a guesser fire at line rate and only
+     * pay the window after misses — the cap works because a failure buys
+     * silence, not because failures are slow. The window is short enough
+     * (300 ms) that no human retype ever lands inside it. */
+    if (now_ms < *lockout_until_ms)
+        return DB_AUTH_LOCKED;
+
+    db_auth_result_t r = db_auth_basic_check(authorization, password);
+
+    /* Arm only on WRONG — an actual evaluated guess. MISSING must stay
+     * harmless (a header-less request is what any cross-origin page can loop,
+     * and it guesses nothing), and re-arming from inside the window is
+     * handled above by not reaching this line at all. See http_auth.h. */
+    if (r == DB_AUTH_WRONG)
+        *lockout_until_ms = now_ms + DB_AUTH_LOCKOUT_MS;
+    return r;
+}

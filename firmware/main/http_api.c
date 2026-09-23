@@ -2578,8 +2578,9 @@ static esp_err_t api_config_post(httpd_req_t *req)
  * structural paste mistakes (swapped fields, encrypted key, truncated block)
  * in a sentence, then db_tls_set_identity() has mbedTLS prove the pair —
  * certificates parse, key parses, key matches the LEAF (chains are accepted
- * leaf-first). NOTHING persists until both pass, so a bad upload can never
- * take a running HTTPS server down.
+ * leaf-first) and clears the strength floor (RSA >= 2048, EC >= 255 bits).
+ * NOTHING persists until both pass, so a bad upload can never take a running
+ * HTTPS server down.
  *
  * The ceiling is its own, above BODY_MAX: a leaf + intermediate chain plus an
  * RSA key is ~6-8 KB of PEM. Still bounded, because read_json_max() holds the
@@ -2621,6 +2622,11 @@ static esp_err_t api_tls_identity_post(httpd_req_t *req)
                           "the pair did not validate: a certificate or the key "
                           "failed to parse, or the key does not match the "
                           "(first) certificate — the chain must be leaf-first");
+    if (err == ESP_ERR_NOT_SUPPORTED)
+        return send_error(req, "400 Bad Request",
+                          "the private key is too weak for a TLS server: the "
+                          "floor is 2048 bits for RSA and 255 bits for EC "
+                          "(P-256 and up)");
     if (err == ESP_ERR_INVALID_SIZE)
         return send_error(req, "413 Payload Too Large",
                           "the certificate must stay under 6 KB and the key "
@@ -3249,12 +3255,24 @@ static bool content_type_is(httpd_req_t *req, const char *want)
  * header preemptively and never needs the challenge. Do not "fix" this to be
  * RFC-polite; the omission is the feature.
  *
- * THE FAILURE PATH BURNS ~300 ms, UNIFORMLY. Wrong password, malformed
- * header and missing header all cost the same single vTaskDelay, so timing
- * distinguishes nothing. esp_http_server runs every handler on ONE task, so
- * this also caps online guessing at ~3/s box-wide — and because it is one
- * bounded delay (never a loop, never proportional to anything the client
- * sent) it can wedge that task for at most the 300 ms itself.
+ * BRUTE FORCE IS CAPPED BY A NON-BLOCKING LOCKOUT, NOT A SLEEP. A wrong
+ * password arms a box-wide "no auth attempt before this tick" window of
+ * DB_AUTH_LOCKOUT_MS (300 ms); anything arriving inside it — the correct
+ * password included — is refused with the same immediate uniform 401,
+ * unevaluated. One evaluated guess per window is the same ~3/s cap the old
+ * vTaskDelay(300) enforced, but the delay slept esp_http_server's ONE worker
+ * task, so any unauthenticated peer (a hostile web page looping no-preflight
+ * GETs at the box qualified) could keep that task asleep and stall the whole
+ * UI and API for as long as it kept sending — the per-request bound this
+ * comment once relied on said nothing about sustained hammering. Rejecting
+ * instantly returns the worker to its select loop. Timing still
+ * distinguishes nothing an attacker can use: outside the window every
+ * failure runs the same constant-time compare (http_auth.c), inside it every
+ * request takes the same short-circuit, and the 401 is identical throughout.
+ * A missing Authorization header never ARMS the window (it carries no guess,
+ * and it is the one request a cross-origin page can loop from a browser tab
+ * — arming on it would let that tab lock the admin out); the arming rules
+ * live with the state machine in db_auth_gate_check, host-tested.
  */
 static bool api_auth_ok(httpd_req_t *req)
 {
@@ -3268,10 +3286,15 @@ static bool api_auth_ok(httpd_req_t *req)
                                     sizeof(authz)) != ESP_OK)
         authz[0] = '\0';
 
-    if (db_auth_basic_check(authz, s_cfg->http_pass) == DB_AUTH_OK)
+    /* Single-writer by construction: every /api handler runs on the main
+     * server's one worker task (the :80 helper routes no /api traffic), so
+     * the lockout tick needs no lock. */
+    static int64_t s_lockout_until_ms;
+    if (db_auth_gate_check(authz, s_cfg->http_pass,
+                           esp_timer_get_time() / 1000,
+                           &s_lockout_until_ms) == DB_AUTH_OK)
         return true;
 
-    vTaskDelay(pdMS_TO_TICKS(300));
     send_error(req, "401 Unauthorized", "authentication required");
     return false;
 }
@@ -3282,8 +3305,8 @@ static bool api_auth_ok(httpd_req_t *req)
  * ORDER, DECIDED NOT INHERITED: Host first — it is one header compare, leaks
  * nothing, and a DNS-rebound request should not get to probe the auth gate at
  * all. Auth second, BEFORE Content-Type: an unauthenticated caller learns
- * nothing about what a route accepts, and the 300 ms failure delay must not
- * be skippable by omitting a header the CSRF check would reject faster. */
+ * nothing about what a route accepts, and the failure lockout must not be
+ * skippable by omitting a header the CSRF check would reject faster. */
 static bool api_request_allowed(httpd_req_t *req)
 {
     if (!host_is_this_box(req)) {
@@ -3518,17 +3541,28 @@ static FILE *open_asset(const char *base, bool gz_ok, bool *is_gz)
  */
 static esp_err_t serve_cert_pem(httpd_req_t *req)
 {
-    const char *pem;
-    size_t len;   /* includes the NUL — see db_tls_get_cert_pem */
-    if (db_tls_get_cert_pem(&pem, &len) != ESP_OK)
+    /* A heap COPY, not the live buffer: this handler also runs on the :80
+     * helper's own httpd task, concurrently with POST/DELETE /api/tls/identity
+     * rewriting that buffer on the main server's task — streaming the
+     * original could hand a pinning client a chimera of old and new PEM at
+     * exactly the trust-on-first-use moment. See db_tls_dup_cert_pem. */
+    char *pem;
+    size_t len;   /* excludes the NUL — see db_tls_dup_cert_pem */
+    esp_err_t err = db_tls_dup_cert_pem(&pem, &len);
+    if (err == ESP_ERR_INVALID_STATE)
         return send_error(req, "404 Not Found",
                           "no TLS identity exists yet — enable TLS once, or "
                           "install one with POST /api/tls/identity");
+    if (err != ESP_OK)
+        return send_error(req, "503 Service Unavailable",
+                          "not enough free memory to serve the certificate "
+                          "right now — try again");
     httpd_resp_set_type(req, "application/x-pem-file");
     /* no-store: DELETE /api/tls/identity rotates the certificate, and a
      * cached stale pem is precisely the wrong thing to pin. */
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    httpd_resp_send(req, pem, (ssize_t)(len - 1));
+    httpd_resp_send(req, pem, (ssize_t)len);
+    free(pem);
     return ESP_OK;
 }
 

@@ -11,8 +11,9 @@ written against this document; neither may invent endpoints.
 
 * Base: `http://<hostname>.local/` (also reachable on the softAP IP). With
   TLS enabled it becomes `https://<hostname>.local/` on port 443, and port 80
-  answers every GET with a plain `302` to the same path on https (never an
-  HSTS header — TLS can be turned off again).
+  answers every GET — except `GET /cert.pem`, served directly for TOFU
+  pinning — with a plain `302` to the same path on https (never an HSTS
+  header — TLS can be turned off again).
 * **No auth and no TLS by default** — the out-of-the-box posture is still the
   trusted-LAN appliance. Both are **opt-in and independent**: see
   [Authentication & TLS](#authentication--tls).
@@ -82,8 +83,12 @@ curl -u admin:hunter2-but-better -X POST http://klingelbox.local/api/config \
 * It guards `/api` on **every** transport, the recovery portal included. A
   forgotten password is recovered by USB reflash, nothing less — see
   [`security.md`](security.md#lockout-recovery).
-* Wrong or missing credentials cost a uniform ~300 ms before the 401, and the
-  comparison is constant-time — guessing is slow and timing reveals nothing.
+* Wrong or missing credentials get the same immediate `401`, and a wrong
+  guess closes the auth gate box-wide for ~300 ms: any attempt inside that
+  window — the correct password included — is refused **unevaluated** with
+  the identical 401. That caps guessing at roughly 3/s without ever blocking
+  the server, and the comparison itself is constant-time — timing reveals
+  nothing.
 
 ### TLS
 
@@ -113,7 +118,9 @@ curl --cacert klingelbox.pem https://klingelbox.local/api/system
   install it), CN = the box's hostname, validity fixed 2026–2056 because the
   box has **no clock** — see `db_tls.h`.
 * While TLS is on, port 80 answers GETs with `302 Found` to
-  `https://<same host><same path>` and refuses writes with a pointer to :443.
+  `https://<same host><same path>` and refuses writes with a pointer to :443
+  — with one carve-out: `GET /cert.pem` is answered directly on plain :80,
+  because the pin must be fetchable before any trust exists (see below).
   **No HSTS, ever**: TLS may be disabled again later, and a browser that was
   promised HTTPS-forever would then refuse the box outright.
 
@@ -123,11 +130,12 @@ curl --cacert klingelbox.pem https://klingelbox.local/api/system
 "source":"provided","restarting":<bool>}`
 
 The pair is validated **completely before anything persists**: both must
-parse, and the key must match the **first** certificate (chains are accepted
-leaf-first, ~6 KB cert / 4 KB key ceilings, 10 KB body cap). A rejected
-upload is a **400 naming the actual mistake** (swapped fields, encrypted key,
-truncated block, key/leaf mismatch...) and leaves the active identity
-untouched. **507** when the box's NVS partition genuinely has no room. If TLS
+parse, the key must match the **first** certificate (chains are accepted
+leaf-first, ~6 KB cert / 4 KB key ceilings, 10 KB body cap), and the key must
+meet the strength floor — **RSA ≥ 2048 bits, EC ≥ 255 bits** (P-256 and up);
+no other key types. A rejected upload is a **400 naming the actual mistake**
+(swapped fields, encrypted key, truncated block, key/leaf mismatch, key below
+the floor...) and leaves the active identity untouched. **507** when the box's NVS partition genuinely has no room. If TLS
 is running, the servers restart onto the new identity immediately.
 
 ### `DELETE /api/tls/identity`

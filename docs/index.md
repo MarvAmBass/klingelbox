@@ -79,7 +79,7 @@ graph LR
   S --> G{node graph}
   GPIO[wired button] --> G
   MQTTIN[MQTT trigger] --> G
-  G --> TX[sink.transmit -> CC1101 TX]
+  G --> TX[signal.tx -> CC1101 TX]
   G --> MQ[sink.mqtt -> broker / Home Assistant]
 ```
 
@@ -107,6 +107,7 @@ replays a real doorbell, and the replay rings the actual chime.
 | [Automations](automations.html) | The node graph: every node type and what it is for. |
 | [MQTT & Home Assistant](mqtt.html) | Topic map, payloads, discovery, recipes. |
 | [REST API](https://github.com/MarvAmBass/klingelbox/blob/main/docs/API.md) | The complete HTTP surface — the contract between firmware and web UI. |
+| [Security](security.html) | Threat model, the optional password and TLS, certificate pinning, lockout recovery. |
 
 ## A finding worth repeating
 
@@ -137,6 +138,8 @@ captures per minute to **zero**, with real presses unaffected.
   username fixed to `admin`, the web UI brings its own login screen) and optional HTTPS
   with a device-generated or your own certificate. They are independent, but turn TLS on
   if you set a password: Basic credentials on plain HTTP are readable to anyone on the
-  LAN. Even with both on, do not expose the box to the public internet.
+  LAN. Even with both on, do not expose the box to the public internet. The full
+  reasoning — threat model, pinning, lockout recovery — is on the
+  [Security](security.html) page.
 - 433 MHz is a licence-free ISM band, but transmit power and duty cycle limits are
   regional. The default TX power is deliberately modest.

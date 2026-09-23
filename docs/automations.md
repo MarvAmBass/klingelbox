@@ -438,7 +438,7 @@ chains.
 | Nodes per graph | 24 | Comfortably more than a house needs; keeps traversal bounded. |
 | Traversal depth | 8 | Bounds the blast radius of a mis-wired graph — a cycle cannot run away. |
 | Node name | 32 characters | |
-| Topic suffix | 48 characters | |
+| Topic suffix | 47 characters | The 48-byte field includes the terminator. |
 | Window | 1–6000 seconds | |
 
 Every node has an `enabled` flag. Turning a node off is the right way to test a hypothesis

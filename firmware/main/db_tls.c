@@ -14,7 +14,11 @@
 #include "db_tls.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #include "esp_log.h"
 #include "esp_random.h"
@@ -57,6 +61,29 @@ static size_t s_cert_len;
 static size_t s_key_len;
 static bool   s_ready;
 static db_tls_source_t s_source = DB_TLS_GENERATED;
+
+/*
+ * WHY A LOCK, when nearly everything here runs on the main server's one
+ * httpd task: GET /cert.pem is ALSO served by the :80 redirect helper, a
+ * second httpd instance with its own task, while POST/DELETE
+ * /api/tls/identity mutate these buffers on the first. Without it a TOFU
+ * client whose transfer straddles a rotation receives a chimera of old and
+ * new PEM bytes — a torn pin at exactly the moment pinning matters. The
+ * cross-task reader (db_tls_dup_cert_pem) and every state mutation take it;
+ * created in db_tls_load, which db_http_start calls before any server task
+ * exists, so lazy creation cannot race. Held only across memcpy/memset and
+ * the NVS write of an install — never across keygen, never across a send.
+ */
+static SemaphoreHandle_t s_lock;
+
+static void state_lock(void)
+{
+    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+}
+static void state_unlock(void)
+{
+    if (s_lock) xSemaphoreGive(s_lock);
+}
 
 /* mbedTLS entropy callback backed by the ESP hardware RNG. The trailing olen
  * out-parameter is part of mbedtls_entropy_f_source_ptr; esp_fill_random
@@ -125,6 +152,33 @@ static esp_err_t validate_pair(const char *cert, size_t clen,
         ESP_LOGW(TAG, "private key does not match the leaf certificate");
         goto out;
     }
+
+    /* STRENGTH FLOOR. mbedTLS parses (and would happily serve) an RSA-512
+     * key: its 2048-bit x509 profile floor governs CHAIN VERIFICATION only,
+     * never the server's own key. A factorable key lets a LAN attacker
+     * impersonate the box to every pinned client and harvest the Basic
+     * credentials TLS is recommended to protect — so the same gate that
+     * keeps a broken upload from killing the server also refuses a weak one:
+     * RSA below 2048 bits, EC below 255 bits (P-256 and up; our own
+     * generated identity is P-256 = 256), any other key type. Distinct
+     * error code so the API can name the floor instead of blaming a parse. */
+    {
+        mbedtls_pk_type_t kt = mbedtls_pk_get_type(&pk);
+        size_t bits = mbedtls_pk_get_bitlen(&pk);
+        bool weak;
+        if (kt == MBEDTLS_PK_RSA)
+            weak = bits < 2048;
+        else if (kt == MBEDTLS_PK_ECKEY || kt == MBEDTLS_PK_ECDSA)
+            weak = bits < 255;
+        else
+            weak = true;   /* nothing else belongs in a TLS server key */
+        if (weak) {
+            ESP_LOGW(TAG, "key too weak for a TLS server: type %d, %u bits "
+                          "(floor: RSA 2048, EC 255)", (int)kt, (unsigned)bits);
+            ret = ESP_ERR_NOT_SUPPORTED;
+            goto out;
+        }
+    }
     ret = ESP_OK;
 
 out:
@@ -161,6 +215,8 @@ static esp_err_t persist(db_tls_source_t source)
 
 esp_err_t db_tls_load(void)
 {
+    if (!s_lock) s_lock = xSemaphoreCreateMutex();   /* see the comment at s_lock */
+
     nvs_handle_t h;
     if (nvs_open(DB_TLS_NS, NVS_READONLY, &h) != ESP_OK)
         return ESP_OK;   /* nothing stored — normal on every box without TLS */
@@ -190,8 +246,13 @@ esp_err_t db_tls_load(void)
         return ESP_OK;
     }
 
+    /* The flip under the lock, though the buffer fill above was bare: nothing
+     * reads the buffers while !s_ready, and releasing the lock is what
+     * publishes their contents to the reader on the other httpd task. */
+    state_lock();
     s_source = (src == DB_TLS_PROVIDED) ? DB_TLS_PROVIDED : DB_TLS_GENERATED;
     s_ready = true;
+    state_unlock();
 
     char fp[65];
     if (db_tls_get_fingerprint(fp, sizeof(fp)) == ESP_OK)
@@ -299,8 +360,12 @@ static esp_err_t generate_identity(const char *hostname)
     ret = persist(DB_TLS_GENERATED);
     if (ret != ESP_OK) goto out;
 
+    /* Same publication pattern as db_tls_load: generation only ever runs
+     * while !s_ready, so the buffers were private until this flip. */
+    state_lock();
     s_source = DB_TLS_GENERATED;
     s_ready = true;
+    state_unlock();
     ESP_LOGI(TAG, "generated ECDSA P-256 identity in %lld ms, valid to 2056",
              (esp_timer_get_time() - t0) / 1000);
 
@@ -344,6 +409,35 @@ esp_err_t db_tls_get_key_pem(const char **pem, size_t *len)
     return ESP_OK;
 }
 
+esp_err_t db_tls_dup_cert_pem(char **pem, size_t *len)
+{
+    /* A per-request heap copy rather than the borrowed pointer of
+     * db_tls_get_cert_pem: this is the ONE read that happens on another
+     * httpd task (:80's GET /cert.pem), and streaming the live buffer there
+     * races the install/clear paths above. Copying under the lock and
+     * serving the copy costs at most DB_TLS_CERT_MAX bytes of heap for the
+     * duration of one send; holding the lock across the send instead would
+     * let one slow client block a certificate rotation. */
+    if (!pem) return ESP_ERR_INVALID_ARG;
+    *pem = NULL;
+
+    state_lock();
+    if (!s_ready) {
+        state_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    char *copy = malloc(s_cert_len + 1);
+    if (copy) {
+        memcpy(copy, s_cert_pem, s_cert_len + 1);
+        if (len) *len = s_cert_len;
+    }
+    state_unlock();
+
+    if (!copy) return ESP_ERR_NO_MEM;
+    *pem = copy;
+    return ESP_OK;
+}
+
 esp_err_t db_tls_get_fingerprint(char *out, size_t out_sz)
 {
     if (!s_ready) return ESP_ERR_INVALID_STATE;
@@ -380,7 +474,12 @@ esp_err_t db_tls_set_identity(const char *cert_pem, size_t cert_len,
     if (rc != ESP_OK) return rc;
 
     /* Only now touch the live buffers: a rejected upload must leave the
-     * active identity byte-for-byte intact. */
+     * active identity byte-for-byte intact. Under the lock from the first
+     * mutated byte to the final state flip — s_ready stays TRUE across an
+     * install (the old identity keeps serving :443 until the restart), so
+     * this is exactly the window a concurrent /cert.pem fetch on the :80
+     * helper would otherwise read half-swapped. */
+    state_lock();
     memcpy(s_cert_pem, cert_pem, cert_len);
     s_cert_pem[cert_len] = '\0';
     s_cert_len = cert_len;
@@ -393,10 +492,12 @@ esp_err_t db_tls_set_identity(const char *cert_pem, size_t cert_len,
         /* RAM now disagrees with flash; drop RAM so nothing serves a pair
          * that will vanish at reboot. The caller reports the store error. */
         s_ready = false;
+        state_unlock();
         return rc;
     }
     s_source = DB_TLS_PROVIDED;
     s_ready = true;
+    state_unlock();
 
     char fp[65];
     db_tls_get_fingerprint(fp, sizeof(fp));
@@ -407,10 +508,12 @@ esp_err_t db_tls_set_identity(const char *cert_pem, size_t cert_len,
 
 esp_err_t db_tls_clear(void)
 {
+    state_lock();
     s_ready = false;
     s_cert_len = s_key_len = 0;
     memset(s_key_pem, 0, sizeof(s_key_pem));
     memset(s_cert_pem, 0, sizeof(s_cert_pem));
+    state_unlock();
 
     nvs_handle_t h;
     esp_err_t err = nvs_open(DB_TLS_NS, NVS_READWRITE, &h);

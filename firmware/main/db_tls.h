@@ -70,9 +70,20 @@ bool db_tls_ready(void);
 esp_err_t db_tls_ensure(const char *hostname);
 
 /* Borrowed pointers, valid until the next set/clear/ensure. NUL-terminated;
- * *len INCLUDES the NUL, which is what esp_https_server wants for PEM. */
+ * *len INCLUDES the NUL, which is what esp_https_server wants for PEM.
+ * MAIN-SERVER-TASK ONLY (server start/restart): the buffers behind these
+ * pointers are mutated by set/clear on that same task, so any OTHER task
+ * must go through db_tls_dup_cert_pem instead. */
 esp_err_t db_tls_get_cert_pem(const char **pem, size_t *len);
 esp_err_t db_tls_get_key_pem(const char **pem, size_t *len);
+
+/* Heap COPY of the certificate PEM, taken under the module lock — the one
+ * certificate read that is safe from any task (the :80 redirect helper
+ * serves GET /cert.pem on its own httpd task while the main task may be
+ * installing or clearing an identity). *len EXCLUDES the NUL; the caller
+ * free()s *pem. ESP_ERR_INVALID_STATE when no identity exists,
+ * ESP_ERR_NO_MEM when the copy cannot be allocated. */
+esp_err_t db_tls_dup_cert_pem(char **pem, size_t *len);
 
 /* Lowercase hex SHA-256 of the DER certificate — the value a client pins.
  * Needs out_sz >= 65. */
@@ -81,10 +92,13 @@ esp_err_t db_tls_get_fingerprint(char *out, size_t out_sz);
 /*
  * Install an operator-supplied certificate + private key (both PEM). The pair
  * is FULLY validated before anything is persisted — certificate(s) parse, key
- * parses, and the key matches the LEAF certificate's public key — so a
+ * parses, the key matches the LEAF certificate's public key, and the key
+ * meets the strength floor (RSA >= 2048 bits, EC >= 255 bits) — so a
  * rejected upload leaves the active identity untouched. A multi-certificate
  * PEM (leaf first, then chain) is accepted. Returns ESP_ERR_INVALID_ARG when
- * validation fails, ESP_ERR_NVS_NOT_ENOUGH_SPACE when NVS is full.
+ * parsing/matching fails, ESP_ERR_NOT_SUPPORTED when the key is below the
+ * floor (or of a type no TLS server key should be), and
+ * ESP_ERR_NVS_NOT_ENOUGH_SPACE when NVS is full.
  */
 esp_err_t db_tls_set_identity(const char *cert_pem, size_t cert_len,
                               const char *key_pem, size_t key_len);

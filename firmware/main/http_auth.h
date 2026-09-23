@@ -18,14 +18,15 @@
  * one byte at a time from response timing. The compare below always walks the
  * full width of the credential buffer and folds every difference into one
  * accumulator, so a first-byte mismatch and a last-byte mismatch cost the
- * same. (The ~300 ms uniform failure delay in http_api.c is the second half
- * of the defense — it blunts throughput, this removes the oracle.)
+ * same. (The non-blocking failure lockout in db_auth_gate_check is the second
+ * half of the defense — it blunts throughput, this removes the oracle.)
  */
 #ifndef DB_HTTP_AUTH_H
 #define DB_HTTP_AUTH_H
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,10 +36,16 @@ extern "C" {
  * DB_STR_PASS in db_config.h without dragging that header in here). */
 #define DB_AUTH_PASS_MAX 64
 
+/* How long one failed guess closes the auth gate for, and therefore the
+ * online guessing cap: one EVALUATED guess per window, ~3/s box-wide. */
+#define DB_AUTH_LOCKOUT_MS 300
+
 typedef enum {
     DB_AUTH_OK = 0,        /* header present, credentials correct        */
     DB_AUTH_MISSING,       /* no Authorization header / empty value      */
     DB_AUTH_WRONG,         /* malformed scheme, bad base64, or bad creds */
+    DB_AUTH_LOCKED,        /* inside the failure lockout window — the
+                              credential was NOT evaluated at all        */
 } db_auth_result_t;
 
 /*
@@ -59,6 +66,38 @@ typedef enum {
  */
 db_auth_result_t db_auth_basic_check(const char *authorization,
                                      const char *password);
+
+/*
+ * db_auth_basic_check plus the brute-force lockout, in one call. This is the
+ * gate http_api.c actually uses; the state is one caller-owned tick.
+ *
+ * Inside the window (`now_ms < *lockout_until_ms`) NOTHING is evaluated —
+ * every request, the correct password included, is DB_AUTH_LOCKED. Outside
+ * it the credential is checked, and a WRONG result (bad password, bad
+ * base64, bad scheme — anything that presented a header) re-arms the window
+ * to now + DB_AUTH_LOCKOUT_MS. That caps online guessing at one evaluated
+ * guess per window without ever sleeping: the old implementation burned the
+ * same 300 ms as a vTaskDelay on esp_http_server's single worker task, which
+ * handed any unauthenticated peer a free stall-the-whole-UI primitive.
+ *
+ * Two deliberate asymmetries, both reasoned rather than inherited:
+ *
+ *  - MISSING does not arm the window. A request without an Authorization
+ *    header carries no guess to rate-limit — and it is exactly what any
+ *    hostile cross-origin page can fire in a loop (a no-preflight GET cannot
+ *    set the header), so letting it arm the window would let such a page
+ *    lock the real admin out of the API from a browser tab.
+ *  - In-window refusals do not EXTEND the window. A hammering client gets
+ *    exactly one evaluated guess per window; extension would evaluate none
+ *    of theirs but also none of the admin's, forever.
+ *
+ * `now_ms` is any monotonic millisecond clock (esp_timer on the device, a
+ * plain integer in the host tests); `*lockout_until_ms` starts at 0.
+ */
+db_auth_result_t db_auth_gate_check(const char *authorization,
+                                    const char *password,
+                                    int64_t now_ms,
+                                    int64_t *lockout_until_ms);
 
 /*
  * Constant-time equality of two byte strings, exposed for the test suite and

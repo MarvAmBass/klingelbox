@@ -12,6 +12,12 @@
  *     (a lax parser would hand an attacker several tries per rate-limit slot);
  *   - malformed base64, wrong scheme, wrong user, wrong password and a missing
  *     header are all refused, and MISSING vs WRONG is classified correctly;
+ *   - the brute-force lockout state machine (db_auth_gate_check): who arms
+ *     the window, who does not, that NOTHING inside it is evaluated, that
+ *     in-window traffic never extends it, and the resulting evaluated-guess
+ *     cap under sustained hammering — all with a simulated clock, because
+ *     the whole point of the non-blocking design is that no real time is
+ *     ever slept;
  *   - the constant-time comparator's CONTRACT (equality only; the timing
  *     property itself is by construction and reviewed, not measurable here);
  *   - each pem_scan error sentence fires on the paste mistake it names, and a
@@ -197,6 +203,76 @@ static void test_auth_refuses(void)
     CHECK(db_auth_basic_check(hdr, pw65) == DB_AUTH_WRONG, "65-char pw accepted");
 }
 
+/* ---- the lockout gate ----------------------------------------------------- */
+
+static void test_auth_gate(void)
+{
+    CASE("auth gate");
+    char good[512], bad[512];
+    make_header("admin", "secret", good, sizeof(good));
+    make_header("admin", "nope", bad, sizeof(bad));
+    int64_t until = 0;
+
+    /* A correct credential passes and never arms the window. */
+    CHECK(db_auth_gate_check(good, "secret", 1000, &until) == DB_AUTH_OK,
+          "correct credential refused");
+    CHECK(until == 0, "OK armed the window: until=%lld", (long long)until);
+
+    /* A wrong guess is evaluated, refused, and arms now + lockout. */
+    CHECK(db_auth_gate_check(bad, "secret", 1000, &until) == DB_AUTH_WRONG,
+          "wrong guess not WRONG");
+    CHECK(until == 1000 + DB_AUTH_LOCKOUT_MS, "window not armed: %lld",
+          (long long)until);
+
+    /* Inside the window NOTHING is evaluated — the correct password
+       included, or the cap would only apply to misses. */
+    CHECK(db_auth_gate_check(good, "secret", 1001, &until) == DB_AUTH_LOCKED,
+          "correct pw evaluated in-window");
+    CHECK(db_auth_gate_check(bad, "secret", 1150, &until) == DB_AUTH_LOCKED,
+          "wrong pw evaluated in-window");
+    CHECK(db_auth_gate_check(NULL, "secret", 1299, &until) == DB_AUTH_LOCKED,
+          "missing header evaluated in-window");
+    /* ...and none of that EXTENDED the window. */
+    CHECK(until == 1300, "in-window traffic moved the window: %lld",
+          (long long)until);
+
+    /* The boundary tick is open again (now < until is the gate). */
+    CHECK(db_auth_gate_check(good, "secret", 1300, &until) == DB_AUTH_OK,
+          "boundary attempt refused");
+
+    /* A missing header outside the window is MISSING — and never arms:
+       a cross-origin page can loop header-less requests, and they must not
+       be able to lock the real admin out. */
+    CHECK(db_auth_gate_check(NULL, "secret", 2000, &until) == DB_AUTH_MISSING,
+          "NULL not MISSING through the gate");
+    CHECK(db_auth_gate_check("", "secret", 2001, &until) == DB_AUTH_MISSING,
+          "\"\" not MISSING through the gate");
+    CHECK(until == 1300, "MISSING armed the window: %lld", (long long)until);
+    CHECK(db_auth_gate_check(good, "secret", 2002, &until) == DB_AUTH_OK,
+          "correct pw refused right after MISSING traffic");
+
+    /* Anything that PRESENTED a header is a guess and arms — malformed
+       schemes and junk base64 included (one spelling, one slot). */
+    CHECK(db_auth_gate_check("Bearer abc", "secret", 3000, &until) == DB_AUTH_WRONG,
+          "Bearer not WRONG");
+    CHECK(until == 3000 + DB_AUTH_LOCKOUT_MS, "malformed header did not arm");
+
+    /* The brute-force math the firmware comment promises: hammering one
+       request every 10 ms for 10 simulated seconds gets exactly one
+       evaluated guess per window — 1000/DB_AUTH_LOCKOUT_MS per second. */
+    until = 0;
+    int evaluated = 0, locked = 0;
+    for (int64_t t = 100000; t < 110000; t += 10) {
+        db_auth_result_t r = db_auth_gate_check(bad, "secret", t, &until);
+        if (r == DB_AUTH_WRONG) evaluated++;
+        else if (r == DB_AUTH_LOCKED) locked++;
+        else CHECK(0, "unexpected result %d at t=%lld", (int)r, (long long)t);
+    }
+    CHECK(evaluated == 10000 / DB_AUTH_LOCKOUT_MS + 1,
+          "cap broken: %d guesses evaluated in 10 s", evaluated);
+    CHECK(locked == 1000 - evaluated, "count mismatch: %d locked", locked);
+}
+
 /* ---- the constant-time comparator's contract ------------------------------ */
 
 static void test_ct_equal(void)
@@ -284,6 +360,7 @@ int main(void)
 {
     test_auth_accepts();
     test_auth_refuses();
+    test_auth_gate();
     test_ct_equal();
     test_pem_scan_accepts();
     test_pem_scan_refuses();

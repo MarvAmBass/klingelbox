@@ -46,10 +46,12 @@ moment a password is set); the web UI recommends the pair instead.
   until the box falls back, use the open portal).
 * Static files (the UI shell, so its login screen can render) and
   `GET /cert.pem` (see below) stay open; neither changes state.
-* Brute force: failures burn a uniform ~300 ms each — wrong password,
-  malformed header and missing header are indistinguishable by timing (the
-  compare itself is constant-time) — and the single-threaded server caps
-  guessing at roughly 3/s box-wide.
+* Brute force: a wrong guess arms a box-wide ~300 ms lockout during which
+  every auth attempt — right, wrong or malformed — gets the same immediate
+  401 without being evaluated, capping guessing at roughly 3/s. The refusal
+  is instant rather than a worker-blocking sleep, so failures can never be
+  used to stall the server, and the compare itself is constant-time — timing
+  distinguishes nothing.
 * The 401 carries **no `WWW-Authenticate` header**, so browsers never pop
   their native password dialog over the UI's own login screen. `curl -u`,
   scripts and Home Assistant send credentials preemptively and never need
@@ -95,7 +97,10 @@ the box.
 
 Your own certificate (from a home CA, or a real one if the box has a real
 name) can replace the generated identity via `POST /api/tls/identity`; it is
-fully validated before it is stored, so a bad upload cannot kill the server.
+fully validated before it is stored — including a key-strength floor of
+RSA 2048 / EC 255 bits, because a factorable server key would hand a LAN
+attacker exactly the impersonation pinning exists to prevent — so a bad
+upload cannot kill the server.
 
 ### Why no HSTS — and no forced HTTPS
 
