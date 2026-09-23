@@ -35,17 +35,23 @@
  * a bad upload can never take the HTTPS server down. DELETE reverts to a
  * fresh on-device identity.
  *
- * SHADOWING. A STORED provided pair can still fail validation at load — the
- * concrete case from our own history is a pair accepted under an older
- * firmware's rules that a newer strength floor refuses (v0.8.0 took RSA-1024;
- * v0.9.0's floor does not). That pair is the operator's property: it is NEVER
- * discarded and NEVER served. Instead the module acts as if no identity
- * existed, db_tls_ensure() mints the usual self-signed fallback (TLS stays
- * on — no downgrade), and db_tls_custom_rejected() reports the shadowing plus
- * a one-sentence reason so the API and UI can say what happened. The stored
- * blobs stay byte-identical in NVS for inspection; a successful new upload or
- * an explicit DELETE ends the state. A stored GENERATED pair that fails the
- * same check is simply discarded and re-minted — nothing user-owned is lost.
+ * REPLACEMENT + NOTICE. A STORED provided pair can still fail validation at
+ * load — the concrete case from our own history is a pair accepted under an
+ * older firmware's rules that a newer strength floor refuses (v0.8.0 took
+ * RSA-1024; v0.9.0's floor does not). That pair is REPLACED: erased, and the
+ * next db_tls_ensure() mints and persists the usual self-signed identity
+ * (TLS stays on — no downgrade, and the generated fingerprint is stable
+ * across boots, so it can be pinned). Erasing the operator's upload is
+ * honest, not rude: this system has no retrieval path for it — /cert.pem
+ * serves the ACTIVE certificate and the API never returns private keys — so
+ * keeping the bytes could never help anyone, and the uploader still has the
+ * originals (the full why sits at the decision point in db_tls.c). What
+ * survives instead is a small persisted NOTICE — db_tls_custom_rejected()'s
+ * flag plus a one-sentence reason — so the API and UI can say what happened
+ * boots later. A successful new upload or an explicit acknowledge
+ * (db_tls_ack_rejection) ends the notice; a reboot does not. A stored
+ * GENERATED pair that fails the same check is simply discarded and re-minted
+ * — nothing user-owned is lost and nothing needs explaining.
  */
 #ifndef DB_TLS_H
 #define DB_TLS_H
@@ -66,8 +72,9 @@ typedef enum {
 } db_tls_source_t;
 
 /* The two mbedTLS-verdict sentences, defined once so the upload 400 in
- * http_api.c and the load-time rejected_reason use the SAME words — the
- * person who reads one at upload time recognizes the other at boot time. */
+ * http_api.c and the boot-time rejected_reason (the notice) use the SAME
+ * words — the person who reads one at upload time recognizes the other at
+ * boot time. */
 #define DB_TLS_MSG_PAIR_INVALID \
     "the pair did not validate: a certificate or the key failed to parse, " \
     "or the key does not match the (first) certificate — the chain must " \
@@ -83,8 +90,9 @@ typedef enum {
  * ESP_OK whether or not an identity was found — check db_tls_ready(). A
  * stored pair that no longer validates degrades to "no identity yet", never
  * to a dead HTTPS server (anti-brick): a GENERATED one is discarded outright,
- * a PROVIDED one is left untouched in NVS and merely shadowed — see the file
- * header and db_tls_custom_rejected(). */
+ * a PROVIDED one is erased with a persisted notice left in its place — see
+ * the file header and db_tls_custom_rejected(). Also reloads any standing
+ * notice from NVS. */
 esp_err_t db_tls_load(void);
 
 /* True once a certificate + key are in RAM (loaded, generated or installed). */
@@ -131,26 +139,40 @@ esp_err_t db_tls_get_fingerprint(char *out, size_t out_sz);
 esp_err_t db_tls_set_identity(const char *cert_pem, size_t cert_len,
                               const char *key_pem, size_t key_len);
 
-/* Which identity is active (meaningful only while db_tls_ready()). While a
- * rejected upload is shadowed this reports DB_TLS_GENERATED — that IS what is
- * being served; the shadowing itself is db_tls_custom_rejected()'s to tell. */
+/* Which identity is active (meaningful only while db_tls_ready()). After a
+ * rejected upload was replaced this reports DB_TLS_GENERATED — that IS what
+ * is served and stored; the replacement's story is db_tls_custom_rejected()'s
+ * to tell. */
 db_tls_source_t db_tls_source(void);
 
-/* True while a STORED provided pair failed load-time validation and the
- * generated fallback is standing in for it (see the file header). When true
- * and reason_out is non-NULL, copies the one-sentence human reason (at most
- * DB_TLS_REJECT_REASON_MAX bytes including the NUL) — either a pem_scan.c
- * structural sentence or one of the DB_TLS_MSG_* verdicts above. Takes the
- * module lock; safe from any task. Cleared by a successful
- * db_tls_set_identity() (the re-upload) or by db_tls_clear() (the deliberate
- * delete) — never by a reboot, which merely re-detects it. */
+/* True while the persisted rejected notice stands: a STORED provided pair
+ * failed load-time validation and was replaced by a persisted generated
+ * identity (see the file header). When true and reason_out is non-NULL,
+ * copies the one-sentence human reason (at most DB_TLS_REJECT_REASON_MAX
+ * bytes including the NUL) — either a pem_scan.c structural sentence or one
+ * of the DB_TLS_MSG_* verdicts above. Takes the module lock; safe from any
+ * task. Cleared by a successful db_tls_set_identity() (the fixed re-upload)
+ * or by db_tls_ack_rejection() (the explicit dismissal) — never by a reboot,
+ * which reloads it from NVS. */
 bool db_tls_custom_rejected(char *reason_out, size_t reason_sz);
+
+/* True only on the boot whose db_tls_load() DETECTED the rejection (and so
+ * performed the replacement), false when a standing notice was merely
+ * reloaded — the difference between "announce the replacement once" and
+ * "nag every boot" for the event feed. */
+bool db_tls_rejection_is_fresh(void);
+
+/* Dismiss the rejected notice without touching the active identity — the
+ * DELETE /api/tls/rejection acknowledgment. Erases the persisted record so
+ * the dismissal outlives a reboot; idempotent. */
+esp_err_t db_tls_ack_rejection(void);
 
 /* Drop the stored identity (provided or generated) from NVS and RAM. The next
  * db_tls_ensure() mints a fresh self-signed one — which BREAKS existing pins,
  * so the API warns in its response and docs/security.md explains re-pairing.
- * Also ends any shadowing: deleting the stored pair is the explicit "give it
- * up" the shadow state exists to wait for. */
+ * A standing rejected notice is deliberately NOT cleared — it has its own
+ * dismissals (upload, ack), and a key rotation should not swallow the
+ * explanation of why the previous upload vanished. */
 esp_err_t db_tls_clear(void);
 
 #ifdef DB_HOSTTEST

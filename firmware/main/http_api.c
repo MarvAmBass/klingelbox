@@ -41,6 +41,7 @@
  *   GET  /api/config   POST /api/config  non-secret configuration
  *   POST /api/tls/identity               install an operator cert+key (PEM)
  *   DEL  /api/tls/identity               drop it; back to the on-device one
+ *   DEL  /api/tls/rejection              dismiss the rejected-upload notice
  *   (GET /cert.pem lives OUTSIDE /api and outside auth on purpose: the active
  *    certificate for trust-on-first-use pinning, needed before trust exists.)
  *   GET  /api/ap       POST /api/ap      softAP + recovery portal settings
@@ -2354,11 +2355,12 @@ static esp_err_t api_config_get(httpd_req_t *req)
         cJSON_AddBoolToObject(web, "tls_enabled", s_cfg->tls_enabled);
         if (db_tls_ready()) {
             cJSON *tls = cJSON_AddObjectToObject(web, "tls");
-            /* While a rejected upload is shadowed (db_tls.h) `source` still
-             * says "generated" ON PURPOSE: source describes what is being
-             * SERVED, and that is the on-device fallback — a client that
-             * pins by this object must pin the real thing. The shadowing
-             * itself rides in `custom_rejected`, present only when true,
+            /* After a rejected upload was replaced (db_tls.h) `source` says
+             * "generated" because that is the truth now: the replacement is
+             * persisted, served, and stable — a client that pins by this
+             * object pins the real thing. The standing notice rides in
+             * `custom_rejected` + `rejected_reason`, present only while it
+             * stands (until a fixed upload or DELETE /api/tls/rejection),
              * like every tls field that is only sometimes meaningful. */
             cJSON_AddStringToObject(tls, "source",
                 db_tls_source() == DB_TLS_PROVIDED ? "provided" : "generated");
@@ -2676,8 +2678,9 @@ static esp_err_t api_tls_identity_post(httpd_req_t *req)
 
     esp_err_t err = db_tls_set_identity(cert, strlen(cert), key, strlen(key));
     cJSON_Delete(j);
-    /* The two verdict sentences live in db_tls.h because the load-time
-     * shadow path (rejected_reason) tells the same story with them. */
+    /* The two verdict sentences live in db_tls.h because the boot-time
+     * check (the rejected notice's rejected_reason) tells the same story
+     * with them — upload-400 and boot-check can never drift apart. */
     if (err == ESP_ERR_INVALID_ARG)
         return send_error(req, "400 Bad Request", DB_TLS_MSG_PAIR_INVALID);
     if (err == ESP_ERR_NOT_SUPPORTED)
@@ -2749,6 +2752,26 @@ static esp_err_t api_tls_identity_delete(httpd_req_t *req)
         cJSON_AddBoolToObject(o, "restarting", false);
         db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0, "TLS certificate removed");
     }
+    return send_json(req, o, "200 OK");
+}
+
+/*
+ * DELETE /api/tls/rejection — dismiss the persisted rejected-upload notice
+ * (db_tls.h) without touching the active identity. DELETE rather than a
+ * POST .../ack because the notice is a stored record and this removes it —
+ * the exact shape DELETE /api/tls/identity already set for this API; there
+ * is nothing to acknowledge WITH, so a verb-suffix endpoint would carry an
+ * empty body to say the same thing. Idempotent: dismissing a notice that
+ * does not stand is a 200, not an error — the state the caller asked for is
+ * the state the box is in.
+ */
+static esp_err_t api_tls_rejection_delete(httpd_req_t *req)
+{
+    esp_err_t err = db_tls_ack_rejection();
+    if (err != ESP_OK)
+        return send_esp_err(req, err, "could not clear the rejection notice");
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
     return send_json(req, o, "200 OK");
 }
 
@@ -3511,6 +3534,7 @@ static esp_err_t delete_router(httpd_req_t *req)
     if (uri_is(u, "/api/graph/links"))  return api_link_edit(req, false);
     if (uri_is(u, "/api/raw"))          return api_raw_discard(req);
     if (uri_is(u, "/api/tls/identity")) return api_tls_identity_delete(req);
+    if (uri_is(u, "/api/tls/rejection")) return api_tls_rejection_delete(req);
     if (uri_starts(u, "/api/signals/")) {
         uint16_t id = path_id(u, "/api/signals/", tail, sizeof(tail));
         if (id && !tail[0]) return api_signal_delete(req, id);
@@ -4120,16 +4144,18 @@ static esp_err_t start_servers(void)
         want_tls = false;
     }
 
-    /* SHADOWING (db_tls.h): the ensure above just minted the stand-in for a
-     * stored-but-rejected upload. One feed entry per boot, not per server
-     * restart — the state cannot change without going through a path (upload,
-     * delete, reboot) that resets or re-announces it anyway; the full reason
-     * sentence is too long for the ring and lives in GET /api/config. */
-    static bool s_shadow_announced;
-    if (want_tls && db_tls_custom_rejected(NULL, 0) && !s_shadow_announced) {
-        s_shadow_announced = true;
+    /* REPLACEMENT (db_tls.h): the ensure above just minted — and persisted —
+     * the replacement for a stored-but-rejected upload. One feed entry at
+     * REPLACEMENT time only: is_fresh separates the boot that replaced from
+     * the boots that merely reload the standing notice, which would
+     * otherwise nag the feed every boot until dismissed; the static guards
+     * against server restarts within this boot. The full reason sentence is
+     * too long for the ring and lives in GET /api/config. */
+    static bool s_replacement_announced;
+    if (want_tls && db_tls_rejection_is_fresh() && !s_replacement_announced) {
+        s_replacement_announced = true;
         db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
-                       "uploaded TLS certificate rejected — serving the "
+                       "uploaded TLS certificate rejected — replaced with a "
                        "generated one");
     }
 

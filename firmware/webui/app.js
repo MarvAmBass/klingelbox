@@ -5851,19 +5851,34 @@ function renderAccess(body, flash) {
   var fsC = el("fieldset");
   add(fsC, el("legend", null, t("Certificate")));
   var tls = web.tls || null;
-  /* SHADOWING (custom_rejected): the stored upload failed validation at boot
-     and the box serves its own generated certificate instead — `source` below
-     honestly says "generated" because that IS what is served. The stored pair
-     is still on the box; this note is the one place that says so, with the
-     firmware's reason sentence verbatim (server prose, never translated —
-     same policy as every {"error": ...} sentence). */
+  /* REJECTED-UPLOAD NOTICE (custom_rejected): the stored upload failed
+     validation at boot and was REPLACED by a certificate the box generated
+     and persisted — `source` below says "generated" because that is simply
+     true now, and the fingerprint is stable across boots. The pair itself is
+     gone (the box has no way to hand it back anyway); this notice is the
+     durable record of the replacement, with the firmware's reason sentence
+     verbatim (server prose, never translated — same policy as every
+     {"error": ...} sentence). It stands, reboots included, until a fixed
+     pair is uploaded or it is dismissed here. */
   if (tls && tls.custom_rejected) {
     var rj = el("div", "note warn");
     add(rj, el("div", null,
-      t("The certificate you uploaded was rejected when the box last started:")));
+      t("The certificate you uploaded was rejected when the box last checked it:")));
     add(rj, el("div", "mono", tls.rejected_reason || ""));
     add(rj, el("div", null,
-      t("The box is serving a certificate it generated itself instead — HTTPS stays on. Your uploaded pair is still stored, untouched: install a fixed pair below to replace it, or delete it.")));
+      t("It has been replaced by a certificate the box generated itself — HTTPS stays on, and the new fingerprint is shown below. Upload a fixed pair, or dismiss this notice.")));
+    var rjMsg = el("div", "formmsg");
+    var dis = el("button", "btn small", t("Dismiss this notice"));
+    dis.type = "button";
+    dis.addEventListener("click", function () {
+      dis.disabled = true;
+      delJSON("/api/tls/rejection").then(function () {
+        return loadConfig().then(function () {
+          renderAccess(body, t("Notice dismissed."));
+        });
+      }).catch(function (e) { dis.disabled = false; setMsg(rjMsg, e.message, "err"); });
+    });
+    add(rj, dis, rjMsg);
     add(fsC, rj);
   }
   if (!tls || !tls.fingerprint) {
@@ -5933,20 +5948,15 @@ function renderAccess(body, flash) {
     });
   });
   add(cFoot, up);
-  /* The delete button also shows while a rejected upload is shadowed: the
-     pair being stored-but-not-served is exactly when "delete it" must stay
-     reachable, and `source` is "generated" then, so the source test alone
-     would hide it. */
-  if (tls && (tls.source === "provided" || tls.custom_rejected)) {
-    var rev = el("button", "btn danger", tls.custom_rejected
-      ? t("Delete the rejected certificate")
-      : t("Back to the generated certificate"));
+  /* Plain source test on purpose: after a rejected upload was replaced,
+     `source` is "generated" and there is no uploaded pair left to discard —
+     the notice above (with its own Dismiss) is the whole remaining state. */
+  if (tls && tls.source === "provided") {
+    var rev = el("button", "btn danger", t("Back to the generated certificate"));
     rev.type = "button";
     rev.addEventListener("click", function () {
       confirmSheet(t("Discard the uploaded certificate?"),
-        [tls.custom_rejected
-          ? t("The stored (rejected) pair is deleted from the box. The box keeps serving the certificate it generated itself.")
-          : t("The box returns to the certificate it generated itself. Browsers that trusted the uploaded one will warn again.")],
+        [t("The box returns to the certificate it generated itself. Browsers that trusted the uploaded one will warn again.")],
         t("Discard it"), true).then(function (ok) {
         if (!ok) return;
         setMsg(cMsg, t("Saving…"));

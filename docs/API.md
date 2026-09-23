@@ -117,11 +117,13 @@ curl --cacert klingelbox.pem https://klingelbox.local/api/system
   SHA-256 of the certificate's DER — what `openssl x509 -fingerprint -sha256`
   prints, minus the colons. When a **stored uploaded pair failed validation
   at boot** (see [security.md](security.md), "Fallbacks, stated honestly")
-  the object additionally carries `"custom_rejected": true` and
-  `"rejected_reason": "<one sentence naming the problem>"` — absent
-  otherwise. `source` is `"generated"` then: the box is serving its own
-  self-signed stand-in while the rejected pair stays stored, untouched,
-  until you re-upload a fixed pair or `DELETE /api/tls/identity`.
+  the pair was replaced by a generated, *persisted* identity — stable
+  fingerprint, safe to pin — and the object additionally carries
+  `"custom_rejected": true` and `"rejected_reason": "<one sentence naming
+  the problem>"` (the same sentence the upload 400 would have used) — absent
+  otherwise. `source` is `"generated"` then, because that is what is served
+  *and* stored. The notice survives reboots and clears only on a successful
+  re-upload or `DELETE /api/tls/rejection`.
 * The generated certificate is self-signed (browsers warn once; pin or
   install it), CN = the box's hostname, validity fixed 2026–2056 because the
   box has **no clock** — see `db_tls.h`.
@@ -144,7 +146,9 @@ meet the strength floor — **RSA ≥ 2048 bits, EC ≥ 255 bits** (P-256 and up
 no other key types. A rejected upload is a **400 naming the actual mistake**
 (swapped fields, encrypted key, truncated block, key/leaf mismatch, key below
 the floor...) and leaves the active identity untouched. **507** when the box's NVS partition genuinely has no room. If TLS
-is running, the servers restart onto the new identity immediately.
+is running, the servers restart onto the new identity immediately. A
+successful upload also clears any standing `custom_rejected` notice — it is
+the fixed pair the notice was asking for.
 
 ### `DELETE /api/tls/identity`
 
@@ -152,9 +156,20 @@ Drops the stored identity. With TLS enabled a **fresh self-signed one** is
 minted and served immediately (the response carries its fingerprint); with
 TLS off the slate is wiped and the next enable mints lazily. Either way every
 pinned client must re-pair — on a *generated* identity this doubles as
-deliberate key rotation. This is also one of the two ways out of the
-`custom_rejected` shadow state (the other being a successful new upload):
-deleting the stored pair is the explicit "give it up".
+deliberate key rotation. A standing `custom_rejected` notice is deliberately
+*not* cleared by this: rotation must not swallow the explanation of why an
+upload vanished — dismissing the notice is its own call, below.
+
+### `DELETE /api/tls/rejection`
+
+→ `{"ok":true}`
+
+Dismisses the `custom_rejected` notice — the persisted record that a stored
+uploaded pair failed validation at boot and was replaced (see the
+`GET /api/config` shape above) — without touching the active identity. The
+other exit is a successful `POST /api/tls/identity`; a reboot is *not* one,
+the notice is stored and reloads. Idempotent: deleting a notice that does
+not stand is still a `200`.
 
 ### `GET /cert.pem`
 
@@ -1063,7 +1078,7 @@ write-only and takes `""` as **remove** (its one documented exception to the
 empty-string rule); `tls_enabled` applies live — the servers restart onto the
 other transport right after the response; `web.tls` is `null` until the first
 enable mints an identity, and gains `custom_rejected`/`rejected_reason` while
-a stored uploaded pair is being shadowed (see
+the notice about a rejected-and-replaced uploaded pair stands (see
 [Authentication & TLS](#authentication--tls)).
 
 `mqtt.base_topic` and `mqtt.discovery_prefix` are validated on write by the same

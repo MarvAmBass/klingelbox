@@ -41,13 +41,15 @@
 #                    power cut must not turn into a ghost signal, the
 #                    boot-time flash reconciliation, and the store-full
 #                    budget check. Also db_tls.c's load-path decisions —
-#                    activate vs shadow vs discard — against the same fake
+#                    activate vs replace vs discard — against the same fake
 #                    NVS plus a content-driven fake mbedTLS
 #                    (stubs/host_mbedtls.c): the property pinned there is
-#                    that a stored UPLOADED pair failing validation stays
-#                    byte-identical in flash while a generated stand-in
-#                    serves. DB_HOSTTEST enables the reset hooks that
-#                    let one process simulate several boots.
+#                    that a stored UPLOADED pair failing validation is
+#                    replaced by a PERSISTED generated identity (stable
+#                    fingerprint across boots) plus a persisted notice that
+#                    only an upload or an explicit ack ends. DB_HOSTTEST
+#                    enables the reset hooks that let one process simulate
+#                    several boots.
 #
 # They are separate binaries rather than one because the rfpulse test's whole
 # premise is that it links three files and no others.

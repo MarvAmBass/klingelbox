@@ -137,17 +137,24 @@ One failure is *not* transient and gets its own shape: a **stored uploaded
 pair that fails validation at boot** (the concrete case: a pair accepted
 under an older firmware's rules that a newer key-strength floor refuses).
 Retrying that forever would leave the box headless over bytes that will
-never start validating, and discarding it would destroy the operator's
-property. So the box **shadows** it instead: the stored pair stays in flash
-byte-for-byte untouched, a self-signed identity is minted and served in its
-place — **TLS stays on, no downgrade** — and the state is flagged loudly:
-one event-feed entry at boot, and `GET /api/config` → `web.tls` carries
-`custom_rejected: true` plus a `rejected_reason` sentence naming the actual
-problem. `source` still reads `"generated"` because that is what is being
-served. The shadow identity is deliberately *not* persisted (persisting it
-would overwrite the stored pair), so its fingerprint changes every boot —
-nothing should pin it. The state ends only by an explicit act of yours:
-upload a fixed pair, or `DELETE /api/tls/identity` the stored one.
+never start validating. So the box **replaces** it: the dead pair is erased,
+a self-signed identity is minted, **persisted**, and served in its place —
+**TLS stays on, no downgrade**, and because the replacement is stored like
+any generated identity its fingerprint is **stable across boots** and safe
+to pin. Erasing your upload is deliberate, and honest: an earlier design
+kept the rejected pair in flash "for inspection", but this box has **no
+retrieval path** for it — `/cert.pem` serves the *active* certificate and
+the API never returns private keys — so the preserved bytes could not be
+inspected by anyone, while the unpersisted stand-in that design served
+changed its fingerprint every boot and broke pinning clients repeatedly.
+You still have the originals (you uploaded them), and a blob the box cannot
+validate is worthless anyway. What survives instead is a **persisted
+notice**: one event-feed entry at replacement time, and `GET /api/config` →
+`web.tls` carries `custom_rejected: true` plus a `rejected_reason` sentence
+naming the actual problem — the same sentence the upload would have been
+refused with. `source` reads `"generated"` because that is what is served
+and stored. The notice outlives reboots and ends only by an explicit act of
+yours: upload a fixed pair, or dismiss it with `DELETE /api/tls/rejection`.
 
 On the recovery
 portal with TLS enabled, captive-portal sheets may balk at the self-signed
