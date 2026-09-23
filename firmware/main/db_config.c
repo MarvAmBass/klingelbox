@@ -19,10 +19,8 @@
  * must not silently skew an old migration. Fields introduced after vN simply
  * keep their default value.
  *
- * v1 is the first shipped layout, so the chain is currently EMPTY — the switch
- * in migrate_blob() exists with the scaffolding in place and documented, so
- * adding v2 is a small, obvious edit rather than a redesign. See the comment on
- * migrate_blob() for the exact three steps.
+ * v2 added the web-access fields (http_pass, tls_enabled); v1 is frozen below
+ * and migrated per the recipe on migrate_blob().
  */
 #include "db_config.h"
 
@@ -41,7 +39,7 @@ static const char *TAG = "db_cfg";
 
 #define DB_NS          "klingelbox"
 #define DB_BLOB_KEY    "cfg"
-#define DB_CFG_VERSION 1u
+#define DB_CFG_VERSION 2u
 
 /* A tiny header stamped in front of the blob so a layout change is detected. */
 typedef struct {
@@ -165,6 +163,11 @@ void db_config_defaults(db_config_t *cfg)
     cfg->tx_repeats = 6;                  /* see db_config.h: one copy is
                                              routinely ignored by receivers */
     cfg->tx_gap_us  = 8000u;
+
+    /* Web access: open and plain out of the box, matching the trusted-LAN
+     * posture the box has always shipped with. Both are opt-in. */
+    cfg->http_pass[0] = '\0';
+    cfg->tls_enabled  = false;
 }
 
 /* ---- migration chain -------------------------------------------------------
@@ -173,41 +176,111 @@ void db_config_defaults(db_config_t *cfg)
  * layout. Returns true if *cfg was populated from the old bytes (the caller then
  * re-saves it in the current layout), false to keep the factory defaults.
  *
- * ADDING v2 (the whole recipe):
+ * ADDING v3 (the whole recipe, exactly as v2 followed it):
  *   1. Copy the CURRENT db_config_t verbatim into a frozen
- *      `typedef struct { ... } db_config_v1_t;` right above this function,
- *      commented "layout as shipped in DB_CFG_VERSION 1".
- *   2. Bump DB_CFG_VERSION to 2 and edit db_config_t / db_config_defaults().
- *   3. Add a `migrate_v1()` that calls db_config_defaults(cfg) and then copies
- *      every v1 field across one by one, and wire it into the switch below:
- *
- *        case 1:
- *            if (size != sizeof(db_config_v1_t) ||
- *                payload_len != sizeof(db_config_v1_t)) break;
- *            migrate_v1(cfg, (const db_config_v1_t *)payload);
- *            ESP_LOGI(TAG, "config migrated v1 -> v%u", DB_CFG_VERSION);
- *            return true;
+ *      `typedef struct { ... } db_config_v2_t;` beside db_config_v1_t,
+ *      commented "layout as shipped in DB_CFG_VERSION 2".
+ *   2. Bump DB_CFG_VERSION to 3 and edit db_config_t / db_config_defaults().
+ *   3. Add a `migrate_v2()` that calls db_config_defaults(cfg) and then copies
+ *      every v2 field across one by one, and wire it into the switch below
+ *      next to `case 1:`.
  *
  * Migrations are chained through the current struct, not against each other:
  * every migrate_vN() lands directly on today's db_config_t, so an upgrade from
  * any shipped version is a single hop and old code never has to be kept alive.
  */
+/* Layout as shipped in DB_CFG_VERSION 1 — frozen verbatim; see the recipe. */
+typedef struct {
+    char     hostname[DB_STR_HOSTNAME];
+    db_sta_net_t sta[DB_STA_MAX];
+    char     ap_ssid[DB_STR_SSID];
+    char     ap_pass[DB_STR_PASS];
+    uint8_t  ap_security;
+    uint8_t  ap_channel;
+    char     ap_ip[16];
+    bool     ap_enabled;
+    bool     ap_fallback_enabled;
+    char     recovery_ap_pass[DB_STR_PASS];
+    bool     mqtt_enabled;
+    char     mqtt_host[DB_STR_HOST];
+    uint16_t mqtt_port;
+    char     mqtt_user[DB_STR_NAME];
+    char     mqtt_pass[DB_STR_PASS];
+    char     mqtt_base_topic[DB_STR_TOPIC];
+    bool     mqtt_homeassistant;
+    char     mqtt_discovery_prefix[DB_STR_TOPIC];
+    char     ota_url[DB_STR_URL];
+    uint32_t radio_freq_hz;
+    uint8_t  radio_modulation;
+    uint32_t radio_datarate_bps;
+    uint32_t radio_bandwidth_hz;
+    int8_t   radio_tx_power_dbm;
+    uint8_t  tx_repeats;
+    uint32_t tx_gap_us;
+} db_config_v1_t;
+
+/* Field by field over the current defaults, never memcpy — a future edit to
+ * db_config_t must not silently skew this migration. The v2 additions
+ * (http_pass, tls_enabled) keep their defaults: auth off, TLS off, exactly
+ * the behaviour every v1 box already had. */
+static void migrate_v1(db_config_t *cfg, const db_config_v1_t *old)
+{
+    db_config_defaults(cfg);
+
+    strlcpy(cfg->hostname, old->hostname, sizeof(cfg->hostname));
+    for (int i = 0; i < DB_STA_MAX; i++) {
+        strlcpy(cfg->sta[i].ssid, old->sta[i].ssid, sizeof(cfg->sta[i].ssid));
+        strlcpy(cfg->sta[i].pass, old->sta[i].pass, sizeof(cfg->sta[i].pass));
+    }
+    strlcpy(cfg->ap_ssid, old->ap_ssid, sizeof(cfg->ap_ssid));
+    strlcpy(cfg->ap_pass, old->ap_pass, sizeof(cfg->ap_pass));
+    cfg->ap_security = old->ap_security;
+    cfg->ap_channel  = old->ap_channel;
+    strlcpy(cfg->ap_ip, old->ap_ip, sizeof(cfg->ap_ip));
+    cfg->ap_enabled          = old->ap_enabled;
+    cfg->ap_fallback_enabled = old->ap_fallback_enabled;
+    strlcpy(cfg->recovery_ap_pass, old->recovery_ap_pass,
+            sizeof(cfg->recovery_ap_pass));
+
+    cfg->mqtt_enabled = old->mqtt_enabled;
+    strlcpy(cfg->mqtt_host, old->mqtt_host, sizeof(cfg->mqtt_host));
+    cfg->mqtt_port = old->mqtt_port;
+    strlcpy(cfg->mqtt_user, old->mqtt_user, sizeof(cfg->mqtt_user));
+    strlcpy(cfg->mqtt_pass, old->mqtt_pass, sizeof(cfg->mqtt_pass));
+    strlcpy(cfg->mqtt_base_topic, old->mqtt_base_topic,
+            sizeof(cfg->mqtt_base_topic));
+    cfg->mqtt_homeassistant = old->mqtt_homeassistant;
+    strlcpy(cfg->mqtt_discovery_prefix, old->mqtt_discovery_prefix,
+            sizeof(cfg->mqtt_discovery_prefix));
+
+    strlcpy(cfg->ota_url, old->ota_url, sizeof(cfg->ota_url));
+
+    cfg->radio_freq_hz       = old->radio_freq_hz;
+    cfg->radio_modulation    = old->radio_modulation;
+    cfg->radio_datarate_bps  = old->radio_datarate_bps;
+    cfg->radio_bandwidth_hz  = old->radio_bandwidth_hz;
+    cfg->radio_tx_power_dbm  = old->radio_tx_power_dbm;
+    cfg->tx_repeats          = old->tx_repeats;
+    cfg->tx_gap_us           = old->tx_gap_us;
+}
+
 static bool migrate_blob(db_config_t *cfg, uint32_t version, uint32_t size,
                          const void *payload, size_t payload_len)
 {
-    (void)cfg;
-    (void)size;
-    (void)payload;
-    (void)payload_len;
-
     switch (version) {
-    /* No older layout has ever shipped: v1 is the first. See the recipe above. */
+    case 1:
+        if (size != sizeof(db_config_v1_t) ||
+            payload_len != sizeof(db_config_v1_t)) break;
+        migrate_v1(cfg, (const db_config_v1_t *)payload);
+        ESP_LOGI(TAG, "config migrated v1 -> v%u", DB_CFG_VERSION);
+        return true;
     default:
-        ESP_LOGW(TAG, "stored config layout v%u/%u is not migratable — "
-                      "falling back to factory defaults",
-                 (unsigned)version, (unsigned)size);
-        return false;
+        break;
     }
+    ESP_LOGW(TAG, "stored config layout v%u/%u is not migratable — "
+                  "falling back to factory defaults",
+             (unsigned)version, (unsigned)size);
+    return false;
 }
 
 esp_err_t db_config_load(db_config_t *cfg)

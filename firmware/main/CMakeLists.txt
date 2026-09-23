@@ -18,6 +18,9 @@ idf_component_register(
         "wifi_mgr.c"         # APSTA + Tasmota-style recovery portal
         "dns_server.c"       # captive DNS for the portal
         "http_api.c"         # REST + web UI serving
+        "http_auth.c"        # Basic-auth parse + constant-time compare (pure)
+        "pem_scan.c"         # structural preflight of uploaded PEM (pure)
+        "db_tls.c"           # the box's TLS identity (generate/upload/persist)
         "mqtt_bridge.c"      # MQTT + Home Assistant discovery
         "ota.c"              # dual-slot OTA + rollback
         "update_check.c"     # "is there a newer release?" against GitHub
@@ -35,6 +38,7 @@ idf_component_register(
         esp_event
         lwip
         esp_http_server
+        esp_https_server    # optional TLS personality of the web server
         esp_http_client
         esp_https_ota
         app_update

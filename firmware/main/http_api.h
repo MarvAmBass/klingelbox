@@ -1,20 +1,28 @@
 /*
- * http_api.h - The box's only user interface: an HTTP server on :80 that serves
- * the SPIFFS web UI and the REST surface specified in docs/API.md.
+ * http_api.h - The box's only user interface: a web server that serves the
+ * SPIFFS web UI and the REST surface specified in docs/API.md — plain HTTP on
+ * :80 by default, HTTPS on :443 (with :80 shrunk to a 302 redirect) when the
+ * user enables TLS.
  *
  * WHY ONE ENTRY POINT. Everything the user can do — learn a button, wire the
  * node graph, replay a signal, join a Wi-Fi network, update the firmware — goes
  * through this module. It owns no domain state of its own: it translates JSON
- * into calls on signal_store / node_graph / rf_service / db_config and back. If
- * you find yourself wanting to keep a fact here, it belongs in one of those.
+ * into calls on signal_store / node_graph / rf_service / db_config / db_tls and
+ * back. If you find yourself wanting to keep a fact here, it belongs in one of
+ * those.
  *
- * NO AUTH, NO TLS, BY DESIGN. This is a trusted-LAN / softAP appliance with no
- * clock, no certificate store worth the flash, and no user database. Adding a
- * login would mean a password to lose on a device with no screen. The security
- * boundary is the network the box is on — stated here so it is a decision on the
- * record rather than an omission.
+ * AUTH AND TLS ARE OPT-IN, OFF BY DEFAULT, AND INDEPENDENT. Out of the box
+ * this remains the trusted-LAN appliance it always was: the security boundary
+ * is the network. Setting a web password (POST /api/config, `web` section)
+ * puts every /api route — on the LAN, the softAP and the recovery portal alike
+ * — behind HTTP Basic auth for user "admin"; enabling TLS moves the server to
+ * :443 with an on-device ECDSA identity that clients pin via GET /cert.pem.
+ * Neither implies the other in firmware (the docs recommend TLS once a
+ * password exists, because Basic credentials on plain HTTP can be sniffed).
+ * The whole threat model lives in docs/security.md.
  *
- * The server is started AFTER Wi-Fi (it binds the LWIP stack) and BEFORE
+ * The server is started AFTER Wi-Fi (it binds the LWIP stack, and a lazy TLS
+ * key generation needs the RF-fed hardware RNG) and BEFORE
  * db_ota_mark_valid(), so an image that cannot serve its own UI never confirms
  * itself as good and gets rolled back on the next reset.
  */
@@ -29,7 +37,9 @@
 extern "C" {
 #endif
 
-/* Mount the `storage` SPIFFS image at /spiffs and start the HTTP server.
+/* Mount the `storage` SPIFFS image at /spiffs and start the web server in the
+ * personality cfg->tls_enabled selects (a TLS toggle at runtime is applied by
+ * http_api itself, from a deferred task, without a reboot).
  *
  * `cfg` is the LIVE, long-lived configuration owned by app_main: the API reads
  * it on every request and writes it in place, calling db_config_save() itself

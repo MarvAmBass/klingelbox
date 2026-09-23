@@ -39,6 +39,10 @@
  *   GET  /api/gpio/available             pins offerable for a wired button
  *   GET  /api/events?since=<serial>      recent activity, newest first
  *   GET  /api/config   POST /api/config  non-secret configuration
+ *   POST /api/tls/identity               install an operator cert+key (PEM)
+ *   DEL  /api/tls/identity               drop it; back to the on-device one
+ *   (GET /cert.pem lives OUTSIDE /api and outside auth on purpose: the active
+ *    certificate for trust-on-first-use pinning, needed before trust exists.)
  *   GET  /api/ap       POST /api/ap      softAP + recovery portal settings
  *   GET  /api/wifi/scan                  visible networks (first-run wizard)
  *   POST /api/wifi                       the wizard's save; reboots
@@ -56,12 +60,26 @@
  * the only way to get `/api/signals/<id>` at all — ids are parsed here, by hand,
  * from req->uri.
  *
- * SECRETS ARE WRITE-ONLY. No password — Wi-Fi, softAP, recovery portal or MQTT —
- * is ever serialized into a response. The API reports `has_pass` /
- * `has_recovery_pass` booleans instead, and an empty string in a POST means
- * "leave the stored value alone" so a UI can round-trip a form it never received
- * the secret for. This is the single rule most easily broken by a well-meant
- * "just add the field so the form can prefill" change: do not.
+ * SECRETS ARE WRITE-ONLY. No password — Wi-Fi, softAP, recovery portal, MQTT or
+ * web — is ever serialized into a response. The API reports `has_pass` /
+ * `has_recovery_pass` / `has_http_password` booleans instead, and an empty
+ * string in a POST means "leave the stored value alone" so a UI can round-trip
+ * a form it never received the secret for. This is the single rule most easily
+ * broken by a well-meant "just add the field so the form can prefill" change:
+ * do not. ONE deliberate exception: `web.http_password` takes "" as REMOVE,
+ * because "no password" must itself be reachable over the API — documented at
+ * the field in API.md and nowhere generalized.
+ *
+ * AUTH AND TLS ARE OPTIONAL AND INDEPENDENT (both off by default). When a web
+ * password is set, every /api route on every transport — LAN, softAP, recovery
+ * portal alike — demands `Authorization: Basic` for user "admin"; static
+ * assets and GET /cert.pem stay open (the login screen must render, and a
+ * TOFU pin must be fetchable before trust exists). When TLS is on, the full
+ * server moves to :443 with the db_tls identity and :80 shrinks to a bare 302
+ * redirect — never an HSTS header, because the user may turn TLS back off and
+ * a sticky browser policy would then lock them out. See api_request_allowed()
+ * and start_servers() for the mechanics, docs/security.md for the threat
+ * model.
  *
  * DIFFERENCE FROM THE REFERENCE FIRMWARE (deliberate, the design notes): there is no
  * network-side origin gate. That box refused management over its softAP; this one
@@ -88,6 +106,7 @@
 #include "cJSON.h"
 #include "esp_app_desc.h"
 #include "esp_http_server.h"
+#include "esp_https_server.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_ota_ops.h"
@@ -102,7 +121,10 @@
 #include "db_config.h"
 #include "db_diag.h"
 #include "db_mqtt.h"
+#include "db_tls.h"
 #include "event_log.h"
+#include "http_auth.h"
+#include "pem_scan.h"
 #include "mqtt_topic.h"
 #include "node_graph.h"
 #include "ota.h"
@@ -139,6 +161,17 @@ static char s_asset_tag[12];
 static const char *TAG = "http_api";
 
 static db_config_t *s_cfg;   /* live config, owned by app_main */
+
+/* The web servers. `s_server` carries the whole API + UI, as plain HTTP on
+ * :80 or as HTTPS on :443 depending on cfg->tls_enabled; `s_redirect` exists
+ * only alongside the HTTPS personality and does nothing but 302 plain-HTTP
+ * callers across (and serve /cert.pem — see redirect_router). */
+static httpd_handle_t s_server;
+static httpd_handle_t s_redirect;
+static bool s_tls_active;         /* which personality s_server has NOW */
+static volatile bool s_apply_pending;   /* a restart task is already queued */
+
+static void schedule_web_apply(void);
 
 /* Request bodies are small JSON documents; the only large POST bodies are the
  * OTA uploads, which are streamed and never go through read_body(). */
@@ -2272,6 +2305,26 @@ static esp_err_t api_config_get(httpd_req_t *req)
     cJSON_AddBoolToObject(mqtt, "homeassistant", s_cfg->mqtt_homeassistant);
     cJSON_AddStringToObject(mqtt, "discovery_prefix", s_cfg->mqtt_discovery_prefix);
 
+    /* Web access. The password is presence-only like every other secret. The
+     * `tls` object exists once an identity does — which is lazily, on the
+     * first enable — so `null` here means "nothing minted yet", not an error;
+     * `fingerprint` is what a pinning client checks against /cert.pem. */
+    {
+        cJSON *web = cJSON_AddObjectToObject(root, "web");
+        cJSON_AddBoolToObject(web, "has_http_password", s_cfg->http_pass[0] != '\0');
+        cJSON_AddBoolToObject(web, "tls_enabled", s_cfg->tls_enabled);
+        if (db_tls_ready()) {
+            cJSON *tls = cJSON_AddObjectToObject(web, "tls");
+            cJSON_AddStringToObject(tls, "source",
+                db_tls_source() == DB_TLS_PROVIDED ? "provided" : "generated");
+            char fp[65];
+            if (db_tls_get_fingerprint(fp, sizeof(fp)) == ESP_OK)
+                cJSON_AddStringToObject(tls, "fingerprint", fp);
+        } else {
+            cJSON_AddNullToObject(web, "tls");
+        }
+    }
+
     cJSON *ota = cJSON_AddObjectToObject(root, "ota");
     cJSON_AddStringToObject(ota, "url", s_cfg->ota_url);
     /* The stable release assets, so the UI can prefill the manual "update from a
@@ -2336,6 +2389,36 @@ static esp_err_t api_config_post(httpd_req_t *req)
                                      DB_STR_TOPIC - 1, verr, sizeof(verr))) {
                 cJSON_Delete(j);
                 return send_error(req, "400 Bad Request", verr);
+            }
+        }
+    }
+
+    /* Web-access pre-checks, same validate-before-mutate rule. Enabling TLS
+     * also mints the identity HERE, before anything is applied: generation is
+     * the only step that can fail (~200 ms of software P-256 when no identity
+     * exists yet; ESP_ERR_NVS_NOT_ENOUGH_SPACE on a full 24 KB partition),
+     * and failing after half the body was applied would break this handler's
+     * all-or-nothing promise. */
+    cJSON *web_pre = cJSON_GetObjectItem(j, "web");
+    if (cJSON_IsObject(web_pre)) {
+        const char *pw;
+        if (json_str(web_pre, "http_password", &pw) &&
+            strlen(pw) > DB_STR_PASS - 1) {
+            cJSON_Delete(j);
+            return send_error(req, "400 Bad Request",
+                              "http_password must be at most 64 characters "
+                              "(or an empty string to remove it)");
+        }
+        bool want_tls;
+        if (json_bool(web_pre, "tls_enabled", &want_tls) &&
+            want_tls && !s_cfg->tls_enabled) {
+            esp_err_t terr = db_tls_ensure(s_cfg->hostname);
+            if (terr != ESP_OK) {
+                cJSON_Delete(j);
+                return send_esp_err(req, terr,
+                                    "TLS was NOT enabled — the box could not "
+                                    "create (or store) its certificate, and "
+                                    "nothing else in the request was applied");
             }
         }
     }
@@ -2416,6 +2499,35 @@ static esp_err_t api_config_post(httpd_req_t *req)
     if (cJSON_IsObject(ota) && json_str(ota, "url", &s))
         strlcpy(s_cfg->ota_url, s, sizeof(s_cfg->ota_url));
 
+    bool tls_toggled = false;
+    cJSON *web = cJSON_GetObjectItem(j, "web");
+    if (cJSON_IsObject(web)) {
+        /* http_password is the one field where "" means REMOVE, not "keep":
+         * disabling auth must be expressible, and unlike the Wi-Fi/MQTT
+         * secrets this one guards the API itself, so a UI that wants to keep
+         * it simply omits the field. Length was validated above. Applies on
+         * the very next request — no server restart involved. */
+        if (json_str(web, "http_password", &s)) {
+            bool had = s_cfg->http_pass[0] != '\0';
+            bool has = s[0] != '\0';
+            if (had != has || (has && strcmp(s, s_cfg->http_pass) != 0))
+                db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                               has ? (had ? "web password changed"
+                                          : "web password set — /api now "
+                                            "requires login (user admin)")
+                                   : "web password removed — /api is open "
+                                     "again");
+            strlcpy(s_cfg->http_pass, s, sizeof(s_cfg->http_pass));
+        }
+        if (json_bool(web, "tls_enabled", &b) && b != s_cfg->tls_enabled) {
+            s_cfg->tls_enabled = b;   /* identity already ensured above */
+            tls_toggled = true;
+            db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                           b ? "TLS enabled — moving the web UI to https://"
+                             : "TLS disabled — back to plain http://");
+        }
+    }
+
     cJSON_Delete(j);
     esp_err_t save_err = db_config_save(s_cfg);
     /* Credentials apply live — no reboot needed to join a new home network.
@@ -2442,11 +2554,141 @@ static esp_err_t api_config_post(httpd_req_t *req)
     } else if (old_mqtt_ha != s_cfg->mqtt_homeassistant) {
         db_mqtt_on_signals_changed();
     }
+    /* A TLS toggle applies LIVE, but deferred: the servers restart from a
+     * short-lived task (the same respond-first pattern as
+     * db_mqtt_apply_config), because httpd_stop() waits for the very handler
+     * that is executing this line — stopping inline would deadlock, and
+     * stopping before responding would eat the response. The client sees this
+     * answer over the old transport, then reconnects on the new one. */
+    if (tls_toggled)
+        schedule_web_apply();
     if (save_err != ESP_OK)
         return send_esp_err(req, save_err,
                             "the settings are applied but could not be saved to "
                             "flash — they will revert at the next reboot");
     return api_config_get(req);
+}
+
+/* ------------------------------------------------------------------ TLS identity */
+
+/*
+ * POST /api/tls/identity — {"cert_pem":"...","key_pem":"..."}.
+ *
+ * Two validation gates, in order of error quality: pem_scan.c names the
+ * structural paste mistakes (swapped fields, encrypted key, truncated block)
+ * in a sentence, then db_tls_set_identity() has mbedTLS prove the pair —
+ * certificates parse, key parses, key matches the LEAF (chains are accepted
+ * leaf-first). NOTHING persists until both pass, so a bad upload can never
+ * take a running HTTPS server down.
+ *
+ * The ceiling is its own, above BODY_MAX: a leaf + intermediate chain plus an
+ * RSA key is ~6-8 KB of PEM. Still bounded, because read_json_max() holds the
+ * body AND its cJSON tree at once.
+ */
+#define TLS_BODY_MAX 10240
+
+static esp_err_t api_tls_identity_post(httpd_req_t *req)
+{
+    if (req->content_len > (size_t)TLS_BODY_MAX) {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "that is %u bytes; the limit is %d — a leaf certificate, its "
+                 "chain and one key fit comfortably below it",
+                 (unsigned)req->content_len, TLS_BODY_MAX);
+        return send_error(req, "413 Payload Too Large", msg);
+    }
+
+    cJSON *j = read_json_max(req, TLS_BODY_MAX);
+    if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
+
+    const char *cert = NULL, *key = NULL;
+    if (!json_str(j, "cert_pem", &cert) || !json_str(j, "key_pem", &key)) {
+        cJSON_Delete(j);
+        return send_error(req, "400 Bad Request",
+                          "cert_pem and key_pem are required strings");
+    }
+
+    const char *why = db_pem_scan_pair(cert, strlen(cert), key, strlen(key));
+    if (why) {
+        cJSON_Delete(j);
+        return send_error(req, "400 Bad Request", why);
+    }
+
+    esp_err_t err = db_tls_set_identity(cert, strlen(cert), key, strlen(key));
+    cJSON_Delete(j);
+    if (err == ESP_ERR_INVALID_ARG)
+        return send_error(req, "400 Bad Request",
+                          "the pair did not validate: a certificate or the key "
+                          "failed to parse, or the key does not match the "
+                          "(first) certificate — the chain must be leaf-first");
+    if (err == ESP_ERR_INVALID_SIZE)
+        return send_error(req, "413 Payload Too Large",
+                          "the certificate must stay under 6 KB and the key "
+                          "under 4 KB of PEM");
+    if (err != ESP_OK)   /* the 507 path when the 24 KB-NVS box is full */
+        return send_esp_err(req, err, "could not store the TLS identity");
+
+    char fp[65];
+    db_tls_get_fingerprint(fp, sizeof(fp));
+    db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                   "TLS certificate installed (fingerprint %.8s…)", fp);
+
+    /* Serve the new identity now, not at the next reboot — but only when a
+     * TLS server is actually up; with TLS off the identity just waits. */
+    bool restarting = s_cfg->tls_enabled;
+    if (restarting)
+        schedule_web_apply();
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    cJSON_AddStringToObject(o, "fingerprint", fp);
+    cJSON_AddStringToObject(o, "source", "provided");
+    cJSON_AddBoolToObject(o, "restarting", restarting);
+    return send_json(req, o, "200 OK");
+}
+
+/*
+ * DELETE /api/tls/identity — drop the stored pair. With TLS enabled a fresh
+ * self-signed identity is minted immediately (the HTTPS server cannot run
+ * without one) and the servers restart onto it; with TLS off the slate is
+ * simply wiped and the next enable mints lazily as usual. Works on a
+ * GENERATED identity too — that is deliberate key rotation, not an error.
+ * Either way every pinned client must re-pair; the UI warns before calling.
+ */
+static esp_err_t api_tls_identity_delete(httpd_req_t *req)
+{
+    esp_err_t err = db_tls_clear();
+    if (err != ESP_OK)
+        return send_esp_err(req, err, "could not remove the stored identity");
+
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+
+    if (s_cfg->tls_enabled) {
+        err = db_tls_ensure(s_cfg->hostname);
+        if (err != ESP_OK) {
+            /* The old pair is gone and no new one could be minted (in
+             * practice: NVS full). start_servers() would fall back to plain
+             * HTTP at the next boot — say so instead of pretending. */
+            cJSON_Delete(o);
+            return send_esp_err(req, err,
+                                "the identity was removed but a replacement "
+                                "could not be generated — TLS will fall back "
+                                "to plain HTTP until storage is freed");
+        }
+        char fp[65];
+        db_tls_get_fingerprint(fp, sizeof(fp));
+        cJSON_AddStringToObject(o, "fingerprint", fp);
+        cJSON_AddStringToObject(o, "source", "generated");
+        cJSON_AddBoolToObject(o, "restarting", true);
+        db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                       "TLS certificate replaced — pinned clients must re-pair");
+        schedule_web_apply();
+    } else {
+        cJSON_AddBoolToObject(o, "restarting", false);
+        db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0, "TLS certificate removed");
+    }
+    return send_json(req, o, "200 OK");
 }
 
 /* ------------------------------------------------------------------ softAP */
@@ -2993,8 +3235,55 @@ static bool content_type_is(httpd_req_t *req, const char *want)
     return n == strlen(want) && strncasecmp(ct, want, n) == 0;
 }
 
+/*
+ * The authentication gate — the ONLY optional one of the three checks below,
+ * active exactly while a web password is stored (POST /api/config, web
+ * section). Username hardcoded "admin"; parsing and the constant-time compare
+ * live in http_auth.c so the host tests pin them down.
+ *
+ * THE 401 DELIBERATELY CARRIES NO WWW-Authenticate HEADER. The challenge
+ * header makes browsers throw their native login dialog over the web UI's own
+ * login screen — two competing prompts for the same credential, and the
+ * native one cannot be styled, explained or dismissed reliably. Every
+ * non-browser client (curl -u admin:pw, Home Assistant, scripts) sends the
+ * header preemptively and never needs the challenge. Do not "fix" this to be
+ * RFC-polite; the omission is the feature.
+ *
+ * THE FAILURE PATH BURNS ~300 ms, UNIFORMLY. Wrong password, malformed
+ * header and missing header all cost the same single vTaskDelay, so timing
+ * distinguishes nothing. esp_http_server runs every handler on ONE task, so
+ * this also caps online guessing at ~3/s box-wide — and because it is one
+ * bounded delay (never a loop, never proportional to anything the client
+ * sent) it can wedge that task for at most the 300 ms itself.
+ */
+static bool api_auth_ok(httpd_req_t *req)
+{
+    if (!s_cfg->http_pass[0]) return true;   /* no password = auth disabled */
+
+    /* "Basic " + base64("admin:" + 64-char password) is ~102 bytes; anything
+     * that does not fit here cannot be a valid credential for this box, and
+     * the truncated read falls through to the same uniform failure. */
+    char authz[192];
+    if (httpd_req_get_hdr_value_str(req, "Authorization", authz,
+                                    sizeof(authz)) != ESP_OK)
+        authz[0] = '\0';
+
+    if (db_auth_basic_check(authz, s_cfg->http_pass) == DB_AUTH_OK)
+        return true;
+
+    vTaskDelay(pdMS_TO_TICKS(300));
+    send_error(req, "401 Unauthorized", "authentication required");
+    return false;
+}
+
 /* The one gate every /api router passes through. True = proceed; false = the
- * 403/415 has already been sent. See the threat-model comment above. */
+ * 401/403/415 has already been sent. See the threat-model comment above.
+ *
+ * ORDER, DECIDED NOT INHERITED: Host first — it is one header compare, leaks
+ * nothing, and a DNS-rebound request should not get to probe the auth gate at
+ * all. Auth second, BEFORE Content-Type: an unauthenticated caller learns
+ * nothing about what a route accepts, and the 300 ms failure delay must not
+ * be skippable by omitting a header the CSRF check would reject faster. */
 static bool api_request_allowed(httpd_req_t *req)
 {
     if (!host_is_this_box(req)) {
@@ -3004,6 +3293,9 @@ static bool api_request_allowed(httpd_req_t *req)
                    "use the box's hostname or one of its IP addresses");
         return false;
     }
+
+    if (!api_auth_ok(req))
+        return false;
 
     if (req->method == HTTP_POST) {
         bool upload = uri_is(req->uri, "/api/ota/upload") ||
@@ -3123,9 +3415,10 @@ static esp_err_t post_router(httpd_req_t *req)
         return send_error(req, "404 Not Found", "no such endpoint");
     }
 
-    if (uri_is(u, "/api/config"))    return api_config_post(req);
-    if (uri_is(u, "/api/ap"))        return api_ap_post(req);
-    if (uri_is(u, "/api/wifi"))      return api_wifi_post(req);
+    if (uri_is(u, "/api/config"))       return api_config_post(req);
+    if (uri_is(u, "/api/tls/identity")) return api_tls_identity_post(req);
+    if (uri_is(u, "/api/ap"))           return api_ap_post(req);
+    if (uri_is(u, "/api/wifi"))         return api_wifi_post(req);
     return send_error(req, "404 Not Found", "no such endpoint");
 }
 
@@ -3136,8 +3429,9 @@ static esp_err_t delete_router(httpd_req_t *req)
     const char *u = req->uri;
     char tail[24];
 
-    if (uri_is(u, "/api/graph/links")) return api_link_edit(req, false);
-    if (uri_is(u, "/api/raw"))         return api_raw_discard(req);
+    if (uri_is(u, "/api/graph/links"))  return api_link_edit(req, false);
+    if (uri_is(u, "/api/raw"))          return api_raw_discard(req);
+    if (uri_is(u, "/api/tls/identity")) return api_tls_identity_delete(req);
     if (uri_starts(u, "/api/signals/")) {
         uint16_t id = path_id(u, "/api/signals/", tail, sizeof(tail));
         if (id && !tail[0]) return api_signal_delete(req, id);
@@ -3215,6 +3509,30 @@ static FILE *open_asset(const char *base, bool gz_ok, bool *is_gz)
 }
 
 /*
+ * GET /cert.pem — the ACTIVE certificate, DELIBERATELY unauthenticated and
+ * outside /api. This is the trust-on-first-use bootstrap: a client that wants
+ * to pin the box's certificate needs it BEFORE any trust (or credential)
+ * exists, and the certificate is public material by definition — it is handed
+ * to every TLS peer in the handshake anyway. Served on the redirect server
+ * too, so the pin can be fetched over plain HTTP while TLS is on.
+ */
+static esp_err_t serve_cert_pem(httpd_req_t *req)
+{
+    const char *pem;
+    size_t len;   /* includes the NUL — see db_tls_get_cert_pem */
+    if (db_tls_get_cert_pem(&pem, &len) != ESP_OK)
+        return send_error(req, "404 Not Found",
+                          "no TLS identity exists yet — enable TLS once, or "
+                          "install one with POST /api/tls/identity");
+    httpd_resp_set_type(req, "application/x-pem-file");
+    /* no-store: DELETE /api/tls/identity rotates the certificate, and a
+     * cached stale pem is precisely the wrong thing to pin. */
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, pem, (ssize_t)(len - 1));
+    return ESP_OK;
+}
+
+/*
  * Everything that is not an /api path: the SPA.
  *
  * Unknown paths fall back to index.html rather than 404ing, because the UI is a
@@ -3224,6 +3542,11 @@ static FILE *open_asset(const char *base, bool gz_ok, bool *is_gz)
  */
 static esp_err_t static_router(httpd_req_t *req)
 {
+    /* Before the captive-portal redirect: the pin must be fetchable on the
+     * recovery portal too — that is where first contact usually happens. */
+    if (uri_is(req->uri, "/cert.pem"))
+        return serve_cert_pem(req);
+
     if (db_wifi_mode() == DB_WIFI_RECOVERY) {
         char ip[16];
         db_wifi_ap_ip(ip);
@@ -3326,43 +3649,34 @@ static void mount_spiffs(void)
     ESP_LOGI(TAG, "SPIFFS mounted: %u/%u bytes used", (unsigned)used, (unsigned)total);
 }
 
-esp_err_t db_http_start(db_config_t *cfg)
+/* Base httpd tuning shared by both personalities of the main server. */
+static void main_server_config(httpd_config_t *hc)
 {
-    s_cfg = cfg;
-    snprintf(s_asset_tag, sizeof(s_asset_tag), "%08" PRIx32, esp_random());
-    mount_spiffs();
-
-    httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
-    hc.server_port = 80;
     /* Four routers are registered: GET, POST and DELETE on the /api wildcard,
      * plus GET on the root wildcard. The surface grows by endpoint rather than
      * by handler, but the headroom costs a few bytes and saves a silent
      * registration failure later. */
-    hc.max_uri_handlers = 8;
+    hc->max_uri_handlers = 8;
     /* Wildcards are mandatory here: without them httpd matches literal URIs and
      * "/api/signals/3" could never be routed at all. Ids are parsed in path_id. */
-    hc.uri_match_fn = httpd_uri_match_wildcard;
-    hc.lru_purge_enable = true;
+    hc->uri_match_fn = httpd_uri_match_wildcard;
+    hc->lru_purge_enable = true;
     /* cJSON recursion plus the graph/signal serializers on one worker stack;
      * 4 KB (the default) is not enough for the /api/graph and /api/diagnostics
      * trees, and a stack overflow here looks like a random reboot. */
-    hc.stack_size = 10240;
+    hc->stack_size = 10240;
     /* Browser OTA uploads push megabytes through one socket; the default 5 s
      * window is tight over a busy softAP. */
-    hc.recv_wait_timeout = 15;
-    hc.send_wait_timeout = 15;
+    hc->recv_wait_timeout = 15;
+    hc->send_wait_timeout = 15;
+}
 
-    httpd_handle_t srv = NULL;
-    esp_err_t err = httpd_start(&srv, &hc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    /* Registration order IS match order: the /api routers must precede the
-     * catch-all static handler, or every API call would be answered with the
-     * SPA's index.html. */
-    httpd_uri_t routes[] = {
+/* Registration order IS match order: the /api routers must precede the
+ * catch-all static handler, or every API call would be answered with the
+ * SPA's index.html. */
+static void register_routes(httpd_handle_t srv)
+{
+    static const httpd_uri_t routes[] = {
         { .uri = "/api/*", .method = HTTP_GET,    .handler = get_router },
         { .uri = "/api/*", .method = HTTP_POST,   .handler = post_router },
         { .uri = "/api/*", .method = HTTP_DELETE, .handler = delete_router },
@@ -3370,7 +3684,251 @@ esp_err_t db_http_start(db_config_t *cfg)
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)
         ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(srv, &routes[i]));
+}
 
-    ESP_LOGI(TAG, "HTTP server + REST API on :80 (http://%s.local/)", s_cfg->hostname);
+static esp_err_t start_plain_server(void)
+{
+    httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
+    hc.server_port = 80;
+    main_server_config(&hc);
+
+    esp_err_t err = httpd_start(&s_server, &hc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(err));
+        s_server = NULL;
+        return err;
+    }
+    register_routes(s_server);
+    s_tls_active = false;
+    ESP_LOGI(TAG, "HTTP server + REST API on :80 (http://%s.local/)",
+             s_cfg->hostname);
     return ESP_OK;
+}
+
+static esp_err_t start_tls_server(void)
+{
+    httpd_ssl_config_t sc = HTTPD_SSL_CONFIG_DEFAULT();
+    main_server_config(&sc.httpd);
+
+    /*
+     * THREE TLS sockets, not httpd's default seven. With
+     * CONFIG_MBEDTLS_DYNAMIC_BUFFER a connection idles cheaply but peaks at
+     * roughly 20 KB while records are in flight; the box runs at ~110 KB free
+     * heap with Wi-Fi, MQTT and a possible 43 KB listening session also on
+     * it, so three concurrent peaks (~60 KB) is the most that leaves working
+     * margin. Browsers happily open six sockets; lru_purge_enable means the
+     * oldest idle one is recycled instead of the seventh connect failing.
+     */
+    sc.httpd.max_open_sockets = 3;
+
+    const char *cert, *key;
+    size_t clen, klen;   /* PEM lengths INCLUDING the NUL, as httpd wants */
+    esp_err_t err = db_tls_get_cert_pem(&cert, &clen);
+    if (err == ESP_OK) err = db_tls_get_key_pem(&key, &klen);
+    if (err != ESP_OK) return err;   /* caller falls back to plain HTTP */
+    sc.servercert     = (const uint8_t *)cert;
+    sc.servercert_len = clen;
+    sc.prvtkey_pem    = (const uint8_t *)key;
+    sc.prvtkey_len    = klen;
+
+    err = httpd_ssl_start(&s_server, &sc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_ssl_start failed: %s", esp_err_to_name(err));
+        s_server = NULL;
+        return err;
+    }
+    register_routes(s_server);
+    s_tls_active = true;
+    ESP_LOGI(TAG, "HTTPS server + REST API on :443 (https://%s.local/)",
+             s_cfg->hostname);
+    return ESP_OK;
+}
+
+/* ---- the :80 redirect helper (only while TLS is on) ---------------------- */
+
+/*
+ * A bare 302 to the same host and path on https — and NEVER an HSTS header.
+ * HSTS is a browser-persisted promise that this host will speak HTTPS
+ * "forever"; the user can turn TLS off again tomorrow, and a box that made
+ * that promise would then be unreachable from every browser that believed it
+ * until the entry expires. The one-shot redirect is the entire enforcement.
+ */
+static esp_err_t redirect_get(httpd_req_t *req)
+{
+    /* The pin bootstrap stays reachable on plain HTTP — see serve_cert_pem. */
+    if (uri_is(req->uri, "/cert.pem"))
+        return serve_cert_pem(req);
+
+    char host[80] = "";
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK ||
+        !host[0]) {
+        snprintf(host, sizeof(host), "%s.local",
+                 s_cfg->hostname[0] ? s_cfg->hostname : "klingelbox");
+    } else {
+        char *colon = strchr(host, ':');   /* :80 would be wrong on https */
+        if (colon) *colon = '\0';
+    }
+
+    /* In recovery the captive-portal contract of static_router still holds:
+     * a probe aimed at the internet is pointed at the portal itself, just on
+     * the scheme the portal now actually speaks. */
+    if (db_wifi_mode() == DB_WIFI_RECOVERY && !host_is_this_box(req)) {
+        char ip[16];
+        db_wifi_ap_ip(ip);
+        snprintf(host, sizeof(host), "%s", ip[0] ? ip : s_cfg->ap_ip);
+    }
+
+    char loc[640];
+    snprintf(loc, sizeof(loc), "https://%s%s", host,
+             req->uri[0] ? req->uri : "/");
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", loc);
+    /* no-store: a cached redirect would outlive a later TLS-off decision. */
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, "");
+    return ESP_OK;
+}
+
+/* A 302 would silently turn a POST into a GET (and drop the body), so writes
+ * get told where the API went instead of being half-replayed. */
+static esp_err_t redirect_write(httpd_req_t *req)
+{
+    return send_error(req, "403 Forbidden",
+                      "TLS is enabled on this box — send API requests to "
+                      "https:// on port 443 (plain HTTP only redirects GETs)");
+}
+
+static esp_err_t start_redirect_server(void)
+{
+    httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
+    hc.server_port = 80;
+    /* Two httpd instances must not share the (UDP) control port — and
+     * HTTPD_SSL_CONFIG_DEFAULT already claims ESP_HTTPD_DEF_CTRL_PORT+1
+     * for exactly that reason, so +1 here collides with the HTTPS server
+     * and the ctrl bind fails with EADDRINUSE (httpd_start: ESP_FAIL).
+     * This server takes +2. */
+    hc.ctrl_port = ESP_HTTPD_DEF_CTRL_PORT + 2;
+    hc.max_open_sockets = 2;
+    hc.max_uri_handlers = 3;
+    hc.uri_match_fn = httpd_uri_match_wildcard;
+    hc.lru_purge_enable = true;
+    hc.stack_size = 4096;   /* it builds one Location header */
+
+    esp_err_t err = httpd_start(&s_redirect, &hc);
+    if (err != ESP_OK) {
+        /* Non-fatal: the real server is up on :443; :80 just stays silent.
+         * Loud in the event feed, not only on serial — a box in a cupboard
+         * has no serial console, and a dead :80 looks like a dead box to
+         * anyone who typed the bare hostname. */
+        ESP_LOGW(TAG, "redirect server failed to start: %s", esp_err_to_name(err));
+        db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                       "the :80 redirect helper failed to start (%s) — "
+                       "https:// on port 443 still works", esp_err_to_name(err));
+        s_redirect = NULL;
+        return err;
+    }
+    static const httpd_uri_t routes[] = {
+        { .uri = "/*", .method = HTTP_GET,    .handler = redirect_get },
+        { .uri = "/*", .method = HTTP_POST,   .handler = redirect_write },
+        { .uri = "/*", .method = HTTP_DELETE, .handler = redirect_write },
+    };
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++)
+        ESP_ERROR_CHECK_WITHOUT_ABORT(httpd_register_uri_handler(s_redirect,
+                                                                 &routes[i]));
+    return ESP_OK;
+}
+
+/* ---- lifecycle ----------------------------------------------------------- */
+
+static void stop_servers(void)
+{
+    if (s_redirect) {
+        httpd_stop(s_redirect);
+        s_redirect = NULL;
+    }
+    if (s_server) {
+        if (s_tls_active) httpd_ssl_stop(s_server);
+        else              httpd_stop(s_server);
+        s_server = NULL;
+    }
+}
+
+static esp_err_t start_servers(void)
+{
+    bool want_tls = s_cfg->tls_enabled;
+
+    /* ANTI-BRICK: a box whose TLS identity cannot be produced (NVS corrupt
+     * AND full, say) must still serve — an unreachable box cannot even be
+     * told to turn TLS off. Falling back to plain HTTP is loud in the log
+     * and the event feed, never silent. */
+    if (want_tls && db_tls_ensure(s_cfg->hostname) != ESP_OK) {
+        ESP_LOGE(TAG, "TLS is enabled but no identity could be produced — "
+                      "falling back to plain HTTP");
+        db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                       "TLS unavailable (no certificate could be stored) — "
+                       "serving plain HTTP instead");
+        want_tls = false;
+    }
+
+    esp_err_t err;
+    if (want_tls) {
+        err = start_tls_server();
+        if (err == ESP_OK) {
+            start_redirect_server();   /* best-effort, see above */
+        } else {
+            ESP_LOGE(TAG, "HTTPS failed to start — falling back to plain HTTP");
+            db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
+                           "the HTTPS server failed to start — serving plain "
+                           "HTTP instead");
+            err = start_plain_server();
+        }
+    } else {
+        err = start_plain_server();
+    }
+    return err;
+}
+
+/*
+ * Deferred restart of the web servers after a TLS config change — the
+ * respond-first-then-rebuild pattern of db_mqtt_apply_config, forced here by
+ * a harder constraint: httpd_stop() joins the httpd task, and the request
+ * that ASKED for the change is executing on that task, so an inline stop is
+ * a deadlock by construction. The delay lets the response reach the client
+ * (the same grace api_restart gives esp_restart); the task is one-shot and
+ * deletes itself.
+ */
+static void web_apply_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(600));
+    stop_servers();
+    start_servers();
+    s_apply_pending = false;
+    vTaskDelete(NULL);
+}
+
+static void schedule_web_apply(void)
+{
+    if (s_apply_pending) return;   /* one restart covers any burst of changes */
+    s_apply_pending = true;
+    /* 8 KB stack: start_servers may end up inside mbedTLS (certificate parse,
+     * or even a fallback keygen), which is no place to be frugal. */
+    if (xTaskCreate(web_apply_task, "db_web_apply", 8192, NULL, 5, NULL) != pdPASS) {
+        s_apply_pending = false;
+        ESP_LOGE(TAG, "could not start the web-apply task — the TLS change "
+                      "applies at the next reboot");
+    }
+}
+
+esp_err_t db_http_start(db_config_t *cfg)
+{
+    s_cfg = cfg;
+    snprintf(s_asset_tag, sizeof(s_asset_tag), "%08" PRIx32, esp_random());
+    mount_spiffs();
+
+    /* Load (never generate) any stored identity, so GET /cert.pem and the
+     * config fingerprint work even while TLS itself is switched off. */
+    db_tls_load();
+
+    return start_servers();
 }

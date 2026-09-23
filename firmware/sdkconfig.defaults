@@ -41,7 +41,11 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 CONFIG_LWIP_DHCPS=y
 
 # ---- lwIP -----------------------------------------------------------------
-CONFIG_LWIP_MAX_SOCKETS=12
+# 16, up from 12: with TLS enabled TWO httpd instances run at once (HTTPS on
+# :443 with 3 data sockets + listener + control, and the :80 redirect helper
+# with 2 + listener + control) beside MQTT, mDNS and the captive DNS. At 12,
+# the second server could fail to start exactly when everything else is busy.
+CONFIG_LWIP_MAX_SOCKETS=16
 # (CONFIG_LWIP_SO_RCVTIMEO was dropped upstream — SO_RCVTIMEO is always
 #  available in IDF 5.x. Setting it here only produced an 'unknown kconfig
 #  symbol' warning, which CI now treats as a failure.)
@@ -52,13 +56,47 @@ CONFIG_LWIP_IPV4=y
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_HTTPD_MAX_URI_LEN=512
 CONFIG_HTTPD_PURGE_BUF_LEN=64
+# The optional-TLS personality of the web server (http_api.c / db_tls.c).
+CONFIG_ESP_HTTPS_SERVER_ENABLE=y
 
 # ---- OTA ------------------------------------------------------------------
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
 
-# ---- mbedTLS (no TLS server; only the OTA client may use it) -------------
+# ---- mbedTLS: tuned for a no-PSRAM S3 that can SERVE TLS ------------------
+# Both roles run here: the OTA/update-check CLIENT (GitHub over HTTPS, via the
+# certificate bundle) and, when the user enables it, the HTTPS SERVER with the
+# on-device ECDSA identity (db_tls.c).
+#
+# Dynamic buffers take a TLS connection from ~42 KB to ~20 KB peak and nearly
+# nothing at idle (Espressif's numbers) — on ~110 KB of free heap that is the
+# difference between one HTTPS connection and the three the server allows.
+# They depend on DTLS staying off, which nothing here needs. FREE_CONFIG_DATA
+# and FREE_CA_CERT additionally drop the handshake-only material (CA chains,
+# DHM params) once a session is up; the OTA client re-attaches the bundle per
+# connection, so freeing it costs nothing.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
+CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+# Asymmetric record buffers. IN must stay the full 16384: peers may legally
+# send 16 KB records and the server cannot negotiate them down (browsers offer
+# no Max Fragment Length), so the OTA browser-upload over HTTPS would die on
+# its first large record with a smaller value. OUT stays 4096 because our own
+# response chunks are small and under our control. These match the IDF
+# defaults; they are pinned here because the server depends on them.
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=4096
+# Key exchange: ECDHE only, in both cert flavours. ECDHE_ECDSA serves our own
+# P-256 identity (the S3 has no ECC accelerator, but software ECDSA still
+# beats hardware RSA-4096 by ~10x per handshake — which is why the identity
+# is ECDSA in the first place, see db_tls.h). ECDHE_RSA stays ON for the OTA
+# CLIENT: GitHub's release CDN may present an RSA certificate, and an RSA
+# certificate over an ECDHE exchange is exactly that suite. What goes is
+# STATIC RSA and finite-field DHE — no modern server or client needs either,
+# and dropping them trims the mbedTLS code the image carries.
+CONFIG_MBEDTLS_KEY_EXCHANGE_RSA=n
+CONFIG_MBEDTLS_KEY_EXCHANGE_DHE_RSA=n
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 
 # ---- FreeRTOS -------------------------------------------------------------

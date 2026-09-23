@@ -69,12 +69,174 @@ function add(parent) {
   return parent;
 }
 
+/* ======================================================================
+   Optional HTTP Basic auth — ONE account, username hardcoded "admin"
+
+   The firmware may require a password on every /api request (set under
+   Settings → Access). When it does, a failure comes back as 401 JSON
+   DELIBERATELY WITHOUT a WWW-Authenticate header, so the browser never pops
+   its own ugly modal credential dialog — the login screen below is the whole
+   auth UX, on every browser, in the user's language.
+
+   THE PASSWORD LIVES IN localStorage. That is a deliberate trade, stated
+   here so it does not get "fixed" into a session cookie: anyone with this
+   browser profile can read the password out of localStorage — and the same
+   person could simply open the page, which the stored password unlocks
+   anyway. In exchange the box never asks again across reloads and reboots,
+   which is the convenience bar of a home appliance on a trusted LAN. The
+   matching advice (set a password AND turn on TLS if the LAN is not fully
+   trusted) is stated in the Access section itself.
+
+   EVERY request path goes through here: api() (and so postJSON/delJSON)
+   attaches the header centrally, and the two firmware-upload XHRs set the
+   same header themselves. Any 401 anywhere funnels into onUnauthorized().
+   ====================================================================== */
+
+var AUTH_KEY = "klingelbox-http-pass";
+var authPass = null;
+try { authPass = localStorage.getItem(AUTH_KEY) || null; } catch (e) { /* private mode */ }
+
+/* btoa() alone throws on anything outside Latin-1, and "Klingelstraße" is a
+   perfectly reasonable password. UTF-8-encode first; the firmware compares
+   the same bytes. */
+function b64utf8(s) { return btoa(unescape(encodeURIComponent(s))); }
+function basicAuth(pass) { return "Basic " + b64utf8("admin:" + pass); }
+
+function setAuthPass(pass) {
+  authPass = pass || null;
+  try {
+    if (authPass) localStorage.setItem(AUTH_KEY, authPass);
+    else localStorage.removeItem(AUTH_KEY);
+  } catch (e) { /* private mode: the session works, it just won't survive a reload */ }
+  syncLogoutBtn();
+}
+/* The header 🔒 exists only while a password is actually in use — an
+   always-there logout button on a box with no login is a puzzle. */
+function syncLogoutBtn() {
+  var b = $("#logout-btn");
+  if (b) b.classList.toggle("hidden", !authPass);
+}
+
+/* The box said 401. Whatever password we hold (possibly none) does not work,
+   so: forget it, stop every poll (a wall of failing requests helps nobody),
+   and put the login screen up. Idempotent on purpose — a tab poll, the system
+   poll and a user click can all 401 in the same second. */
+function onUnauthorized() {
+  if (loginBox) return;
+  setAuthPass(null);
+  stopTabPolls();
+  stopPoll("system");
+  showLogin();
+}
+
+/* ----------------------------------------------------------- login screen --
+   A full-page overlay ABOVE everything (sheets and the bottom nav included:
+   z-index 80 vs their 60/40), so a 401 mid-flow cannot leave a live control
+   floating over the lock. The username is shown, fixed, because "admin" is
+   part of the credential and a user setting up curl or Home Assistant needs
+   to read it somewhere. */
+var loginBox = null;   /* the overlay element while it is up, else null */
+
+function showLogin() {
+  if (loginBox) return;
+  var wrap = el("div", "login");
+  var box = el("div", "panel login-box");
+  var brand = el("div", "login-brand");
+  add(brand, el("span", "login-ico", "🔔"), el("h2", null, "Klingelbox"));
+  add(box, brand);
+  add(box, el("p", "hint",
+    t("This box is protected by a password. Everything stays locked until it is entered.")));
+
+  var userIn = inputEl("text", "admin");
+  userIn.readOnly = true;
+  userIn.tabIndex = -1;
+  add(box, field(t("Username"), userIn, t("Fixed. This box has exactly one account.")));
+
+  var passIn = inputEl("password", "", { maxlength: "64" });
+  passIn.autocomplete = "current-password";
+  add(box, field(t("Password"), passIn));
+  var showPass = checkField(t("Show password"), false);
+  showPass.input.addEventListener("change", function () {
+    passIn.type = showPass.input.checked ? "text" : "password";
+  });
+  add(box, showPass);
+
+  var prog = el("div", "progress indet hidden");
+  add(prog, el("i"));
+  var msg = el("div", "formmsg");
+  var foot = el("div", "formfoot");
+  var go = el("button", "btn primary block", t("Sign in"));
+  go.type = "button";
+  add(foot, go);
+  add(box, prog, foot, msg);
+
+  function fail(text) {
+    go.disabled = false;
+    passIn.disabled = false;
+    prog.classList.add("hidden");
+    setMsg(msg, text, "err");
+    passIn.focus();
+    passIn.select();
+  }
+  function submit() {
+    var p = passIn.value;
+    if (!p) { setMsg(msg, t("Enter the password"), "err"); return; }
+    go.disabled = true;
+    passIn.disabled = true;
+    prog.classList.remove("hidden");
+    setMsg(msg, "");
+    /* A raw fetch, NOT api(): api() would attach the stored (absent or wrong)
+       header and feed its own failure back into onUnauthorized. Nothing is
+       stored until this probe has actually answered 200. The firmware delays
+       a wrong password by ~300 ms on purpose (brute-force damping), so the
+       spinner is not decoration — it makes that pause read as checking
+       rather than as a hang. */
+    fetch("/api/system", { headers: { "Authorization": basicAuth(p) } })
+      .then(function (res) {
+        if (res.ok) {
+          setAuthPass(p);
+          /* The app booted (or kept polling) without credentials, so the
+             caches under S are error states. Reload instead of patching each
+             one: boot runs again with the header attached, and with the
+             stored password now valid this screen does not come back. */
+          location.reload();
+          return;
+        }
+        fail(res.status === 401
+          ? t("Wrong password.")
+          : t("The box answered HTTP {code}.", { code: res.status }));
+      }, function () { fail(t("No answer from the box (connection lost).")); });
+  }
+  go.addEventListener("click", submit);
+  passIn.addEventListener("keydown", function (e) { if (e.key === "Enter") submit(); });
+
+  add(wrap, box);
+  document.body.appendChild(wrap);
+  loginBox = wrap;
+  setTimeout(function () { passIn.focus(); }, 30);
+}
+
+function hideLogin() {
+  if (!loginBox) return;
+  loginBox.remove();
+  loginBox = null;
+}
+
 /* fetch wrapper: resolves with the parsed body, rejects with an Error whose
    .message is the server's `error` string and whose .status is the code. */
 function api(path, opts) {
+  opts = opts || {};
+  if (authPass) {
+    /* The ONE place the credential is attached for fetch-based requests.
+       Callers build a fresh opts object per request, so writing into it is
+       safe; postJSON/delJSON pass their headers through here too. */
+    if (!opts.headers) opts.headers = {};
+    opts.headers["Authorization"] = basicAuth(authPass);
+  }
   return fetch(path, opts).then(function (res) {
     return res.json().catch(function () { return {}; }).then(function (body) {
       if (!res.ok) {
+        if (res.status === 401) onUnauthorized();
         var err = new Error((body && body.error) ? body.error : ("HTTP " + res.status));
         err.status = res.status;
         /* Keep the whole envelope. Some 4xx bodies carry machine-readable
@@ -375,6 +537,10 @@ function translateStatic() {
 function rerenderForLang() {
   translateStatic();
   if (themeRelabel) themeRelabel();
+  /* The login overlay is built code-side, so a rebuild is what re-reads t().
+     (Unreachable from the overlay itself — it covers the toggle — but a
+     future path to here must not leave it half-translated.) */
+  if (loginBox) { hideLogin(); showLogin(); }
   S.built = {};
   $$(".tabpane").forEach(function (p) { if (p.id !== "tab-recovery") clear(p); });
   renderHeader();
@@ -423,6 +589,24 @@ function rerenderForLang() {
     var next = (langCur === "en") ? "de" : "en";
     try { localStorage.setItem(KEY, next); } catch (e) { /* ignore */ }
     apply(next, true);
+  });
+})();
+
+/* ======================================================================
+   Logout — the header 🔒, visible only while a password is in use
+   ====================================================================== */
+(function logoutBtn() {
+  var b = $("#logout-btn");
+  if (!b) return;
+  syncLogoutBtn();
+  b.addEventListener("click", function () {
+    /* Basic auth has no server-side session to end: forgetting the password
+       IS the logout, on this device only. The same teardown a 401 performs —
+       polls off, login screen up — but without the round trip. */
+    setAuthPass(null);
+    stopTabPolls();
+    stopPoll("system");
+    showLogin();
   });
 })();
 
@@ -5195,6 +5379,7 @@ function buildSettings() {
   add(root, sectionIdentity());
   add(root, sectionWifi());
   add(root, sectionAp());
+  add(root, sectionAccess());
   add(root, sectionMqtt());
   add(root, sectionRadio());
   add(root, sectionSignals());
@@ -5380,6 +5565,349 @@ function sectionAp() {
     add(body, el("div", "note warn", t("Access-point settings are not available on this firmware ({err}).", { err: e.message })));
   });
   return s;
+}
+
+/* ---------------------------------------------------------------- access --
+
+   Optional password + optional TLS, each independently toggleable, both off
+   by default — this is a trusted-LAN appliance and must keep working like
+   one. The section exists to make the not-fully-trusted LAN a two-tap fix.
+
+   The coupling between the two is stated but never enforced: Basic auth over
+   plain HTTP sends the password readable on every request, so TLS is
+   RECOMMENDED once a password is set — and that is a sentence next to the
+   toggle, not a dependency between the toggles. Someone on an isolated VLAN
+   is allowed their password without the certificate-warning ceremony.
+
+   GET /api/config carries `web: { has_http_password, tls_enabled, tls:
+   { source, fingerprint } }`; the password itself is write-only, exactly
+   like the MQTT and Wi-Fi secrets. A firmware without `web` predates the
+   feature, and the section says so instead of offering dead controls. */
+
+function sectionAccess() {
+  var s = section(t("Access & encryption"),
+    t("Who may open this page, and whether the connection is encrypted."));
+  var body = s.bodyEl;
+  var loading = el("div", "empty", t("Loading…"));
+  add(body, loading);
+  loadConfig().then(function (cfg) {
+    loading.remove();
+    if (!cfg || !cfg.web) {
+      add(body, el("div", "note",
+        t("This firmware has no access settings. Update it under Settings → Firmware to get password protection and TLS.")));
+      return;
+    }
+    renderAccess(body, null);
+  }).catch(function (e) {
+    loading.remove();
+    add(body, el("div", "note warn",
+      t("Could not load access settings: {err}", { err: e.message })));
+  });
+  return s;
+}
+
+/* Rebuilt whole after every state change (password set/removed, certificate
+   installed/discarded), because almost every line depends on the new state.
+   `flash` is the one-line success banner that survives the rebuild. */
+function renderAccess(body, flash) {
+  clear(body);
+  var web = (S.config && S.config.web) || {};
+  if (flash) add(body, el("div", "note ok", flash));
+
+  /* ------------------------------------------------------------ password */
+  var fsP = el("fieldset");
+  add(fsP, el("legend", null, t("Password")));
+  add(fsP, el("div", "note" + (web.has_http_password ? " ok" : ""),
+    web.has_http_password
+      ? t("A password is set. Every page load and every API call must present it — username admin.")
+      : t("No password is set. Anyone who can reach this address can operate the box and change every setting.")));
+  var userIn = inputEl("text", "admin");
+  userIn.readOnly = true;
+  userIn.tabIndex = -1;
+  add(fsP, field(t("Username"), userIn, t("Fixed. This box has exactly one account.")));
+  var p1 = inputEl("password", "", { maxlength: "64" });
+  p1.autocomplete = "new-password";
+  var p2 = inputEl("password", "", { maxlength: "64" });
+  p2.autocomplete = "new-password";
+  add(fsP, field(web.has_http_password ? t("New password") : t("Password"), p1,
+    t("1–64 characters. This browser signs itself in with it and keeps it stored — anyone using this browser profile can open the box either way.")));
+  add(fsP, field(t("Repeat it"), p2));
+  var pMsg = el("div", "formmsg");
+  var pFoot = el("div", "formfoot");
+  var pSave = el("button", "btn primary",
+    web.has_http_password ? t("Change password") : t("Set password"));
+  pSave.type = "button";
+  pSave.addEventListener("click", function () {
+    var p = p1.value;
+    if (!p) { setMsg(pMsg, t("Type the new password first."), "err"); return; }
+    if (p !== p2.value) { setMsg(pMsg, t("The two fields do not match."), "err"); return; }
+    pSave.disabled = true;
+    setMsg(pMsg, t("Saving…"));
+    postJSON("/api/config", { web: { http_password: p } }).then(function () {
+      /* Adopt the new credential BEFORE the next request goes out, so the
+         session continues seamlessly — changing the password must never be
+         the thing that logs you out. */
+      setAuthPass(p);
+      return loadConfig().then(function () {
+        renderAccess(body, t("Password saved. This browser is signed in and stays signed in."));
+      });
+    }).catch(function (e) { pSave.disabled = false; setMsg(pMsg, e.message, "err"); });
+  });
+  add(pFoot, pSave);
+  if (web.has_http_password) {
+    var pDel = el("button", "btn danger", t("Remove the password"));
+    pDel.type = "button";
+    pDel.addEventListener("click", function () {
+      confirmSheet(t("Remove the password?"),
+        [t("The login screen disappears and anyone who can reach this address can operate the box again — the whole API included."),
+         t("The password itself is deleted from the box, not just from this browser.")],
+        t("Remove the password"), true).then(function (ok) {
+        if (!ok) return;
+        setMsg(pMsg, t("Saving…"));
+        /* Empty string is the contract's "remove it" — the same write-only
+           key, never a separate endpoint. */
+        postJSON("/api/config", { web: { http_password: "" } }).then(function () {
+          setAuthPass(null);
+          return loadConfig().then(function () {
+            renderAccess(body, t("Password removed. The box is open again."));
+          });
+        }).catch(function (e) { setMsg(pMsg, e.message, "err"); });
+      });
+    });
+    add(pFoot, pDel);
+  }
+  add(pFoot, pMsg);
+  add(fsP, pFoot);
+  add(body, fsP);
+
+  /* ----------------------------------------------------------------- TLS */
+  var fsT = el("fieldset");
+  add(fsT, el("legend", null, "TLS (HTTPS)"));
+  var tlsOn = checkField(t("Serve this page over HTTPS (TLS)"), !!web.tls_enabled,
+    t("Recommended once a password is set: over plain HTTP the password crosses the network readable on every request, so anyone listening on the LAN can pick it up. The two settings are independent — either works without the other."));
+  add(fsT, tlsOn);
+  var tMsg = el("div", "formmsg");
+  var tArea = el("div");
+  var tFoot = el("div", "formfoot");
+  var tSave = el("button", "btn primary", t("Save TLS setting"));
+  tSave.type = "button";
+  tSave.addEventListener("click", function () {
+    var want = tlsOn.input.checked;
+    tSave.disabled = true;
+    setMsg(tMsg, t("Saving…"));
+    postJSON("/api/config", { web: { tls_enabled: want } }).then(function () {
+      setMsg(tMsg, "");
+      if (want === !!web.tls_enabled) {
+        /* Nothing actually flipped — no restart to wait out. */
+        setMsg(tMsg, t("Saved."), "ok");
+        tSave.disabled = false;
+        return;
+      }
+      web.tls_enabled = want;
+      tlsTransition(tArea, want, function () { tSave.disabled = false; });
+    }).catch(function (e) { tSave.disabled = false; setMsg(tMsg, e.message, "err"); });
+  });
+  add(tFoot, tSave, tMsg);
+  add(fsT, tFoot, tArea);
+  add(body, fsT);
+
+  /* --------------------------------------------------------- certificate */
+  var fsC = el("fieldset");
+  add(fsC, el("legend", null, t("Certificate")));
+  var tls = web.tls || null;
+  if (!tls || !tls.fingerprint) {
+    add(fsC, el("div", "hint",
+      t("No certificate exists yet. The box generates one of its own the first time TLS is switched on.")));
+  } else {
+    var kv = el("dl", "kv");
+    add(kv, el("dt", null, t("Source")));
+    add(kv, el("dd", null, tls.source === "provided"
+      ? t("uploaded by you") : t("generated on the box")));
+    add(kv, el("dt", null, t("Fingerprint")));
+    add(kv, el("dd", "mono", tls.fingerprint));
+    add(fsC, kv);
+    add(fsC, el("div", "hint",
+      t("SHA-256 of the certificate. It is how you check, on the browser's warning page, that you are talking to this box and not to something in between.")));
+    var cRow = el("div", "btnrow");
+    var cp = el("button", "btn small", t("Copy fingerprint"));
+    cp.type = "button";
+    var cpMsg = el("div", "formmsg");
+    cp.addEventListener("click", function () {
+      copyText(tls.fingerprint).then(function () {
+        setMsg(cpMsg, t("Copied ✓"), "ok");
+        setTimeout(function () { setMsg(cpMsg, ""); }, 1800);
+      }, function () {
+        setMsg(cpMsg, t("Copying failed — select it above and copy by hand."), "err");
+      });
+    });
+    var dl = el("a", "btn small", t("Download cert.pem"));
+    dl.href = "/cert.pem";
+    dl.setAttribute("download", "cert.pem");
+    add(cRow, cp, dl);
+    add(fsC, cRow, cpMsg);
+    add(fsC, el("div", "hint",
+      t("The download needs no password on purpose: a device must be able to fetch and pin the certificate before it can sign in.")));
+  }
+
+  add(fsC, el("div", "divider"));
+  add(fsC, el("h3", null, t("Use your own certificate")));
+  add(fsC, el("p", "hint",
+    t("For a certificate your browsers already trust — from your own CA, for instance. Paste the PEM text, or pick the files; both parts are needed.")));
+  var certF = pemField(t("Certificate (PEM)"), "-----BEGIN CERTIFICATE-----", null);
+  var keyF = pemField(t("Private key (PEM)"), "-----BEGIN PRIVATE KEY-----",
+    t("Sent to the box once and stored there. It is never shown back."));
+  add(fsC, certF.wrap, keyF.wrap);
+  var cMsg = el("div", "formmsg");
+  var cFoot = el("div", "formfoot");
+  var up = el("button", "btn primary", t("Install certificate"));
+  up.type = "button";
+  up.addEventListener("click", function () {
+    var c = certF.ta.value.trim(), k = keyF.ta.value.trim();
+    if (!c || !k) {
+      setMsg(cMsg, t("Both parts are needed: the certificate and its private key."), "err");
+      return;
+    }
+    up.disabled = true;
+    setMsg(cMsg, t("Uploading…"));
+    postJSON("/api/tls/identity", { cert_pem: c, key_pem: k }).then(function (r) {
+      return loadConfig().then(function () {
+        renderAccess(body, t("Certificate installed. Fingerprint: {fp}",
+          { fp: (r && r.fingerprint) || "?" }));
+      });
+    }).catch(function (e) {
+      up.disabled = false;
+      /* The 400 sentence names the exact PEM problem (firmware prose, shown
+         verbatim, never translated). */
+      setMsg(cMsg, e.message, "err");
+    });
+  });
+  add(cFoot, up);
+  if (tls && tls.source === "provided") {
+    var rev = el("button", "btn danger", t("Back to the generated certificate"));
+    rev.type = "button";
+    rev.addEventListener("click", function () {
+      confirmSheet(t("Discard the uploaded certificate?"),
+        [t("The box returns to the certificate it generated itself. Browsers that trusted the uploaded one will warn again.")],
+        t("Discard it"), true).then(function (ok) {
+        if (!ok) return;
+        setMsg(cMsg, t("Saving…"));
+        delJSON("/api/tls/identity").then(function () {
+          return loadConfig().then(function () {
+            renderAccess(body, t("Back on the box's own certificate."));
+          });
+        }).catch(function (e) { setMsg(cMsg, e.message, "err"); });
+      });
+    });
+    add(cFoot, rev);
+  }
+  add(cFoot, cMsg);
+  add(fsC, cFoot);
+  add(body, fsC);
+}
+
+/* A PEM textarea with a file picker that reads INTO it — one control, two
+   ways to fill it, and what gets sent is always what the textarea shows. */
+function pemField(labelText, placeholder, hint) {
+  var ta = el("textarea", "mono");
+  ta.rows = 4;
+  ta.spellcheck = false;
+  ta.placeholder = placeholder;
+  var wrap = field(labelText, ta, hint);
+  var f = el("input", "hidden");
+  f.type = "file";
+  f.accept = ".pem,.crt,.cer,.key,.txt";
+  var pick = el("button", "btn small", t("…or pick a file"));
+  pick.type = "button";
+  pick.addEventListener("click", function (e) { e.preventDefault(); f.click(); });
+  f.addEventListener("change", function () {
+    var file = f.files && f.files[0];
+    if (!file) return;
+    var r = new FileReader();
+    r.onload = function () { ta.value = String(r.result || ""); };
+    r.readAsText(file);
+  });
+  add(wrap, pick, f);
+  return { wrap: wrap, ta: ta };
+}
+
+/* navigator.clipboard needs a secure context, which a box on plain
+   http://klingelbox.local is not — so the execCommand fallback is not legacy
+   support here, it is the common case until TLS is on. */
+function copyText(s) {
+  if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
+    return navigator.clipboard.writeText(s);
+  }
+  return new Promise(function (resolve, reject) {
+    var ta = document.createElement("textarea");
+    ta.value = s;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    var ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) { /* fall through */ }
+    ta.remove();
+    if (ok) resolve(); else reject(new Error("copy"));
+  });
+}
+
+/* Flipping TLS restarts the box's web server and may move the page to the
+   other scheme entirely. Two rules are honoured here and must stay honoured:
+   the page NEVER redirects itself (the user taps a link when they are
+   ready), and success is NEVER claimed until a probe has actually answered.
+   A cross-scheme probe is impossible from here — the browser refuses it
+   until the certificate on the other side has been accepted once (or, going
+   the other way, refuses plain-HTTP requests from an HTTPS page as mixed
+   content) — so the loop probes the address the page is on and the link
+   covers the move. */
+function tlsTransition(area, enabled, done) {
+  clear(area);
+  var want = enabled ? "https:" : "http:";
+  var moving = location.protocol !== want;
+  add(area, el("div", "note warn",
+    t("Saved. The box is restarting its web server — a few seconds of silence now is normal.")));
+  if (moving) {
+    /* Same host, default port: the box serves each scheme on its standard
+       port, and the one in location.host belongs to the scheme being left. */
+    var url = want + "//" + location.hostname + "/";
+    var n = el("div", "note");
+    add(n, el("span", null, enabled
+      ? t("If this address stops answering, continue on the encrypted one: ")
+      : t("If this address stops answering, continue on the unencrypted one: ")));
+    var a = el("a", "mono", url);
+    a.href = url;
+    add(n, a);
+    add(area, n);
+    if (enabled) {
+      add(area, el("div", "note",
+        t("First visit over HTTPS: the browser warns about the certificate, because nobody co-signed it. Compare its fingerprint with the one below, accept it once, and the warning is gone.")));
+    }
+  }
+  var prog = el("div", "progress indet");
+  add(prog, el("i"));
+  var st = el("div", "formmsg", t("Waiting for the box to answer on this address…"));
+  add(area, prog, st);
+  var tries = 0;
+  var timer = setInterval(function () {
+    tries++;
+    if (tries > 20) {
+      clearInterval(timer);
+      prog.classList.add("hidden");
+      st.textContent = moving
+        ? t("No answer here after 40 s — expected if the box now speaks only the other scheme. Use the link above; this page cannot check that address for you.")
+        : t("No answer after 40 s. Check the box's power and network, then reload this page.");
+      if (done) done();
+      return;
+    }
+    api("/api/system").then(function () {
+      clearInterval(timer);
+      prog.classList.add("hidden");
+      st.className = "formmsg ok";
+      st.textContent = t("The box is back and still answers on this address.");
+      loadConfig();
+      if (done) done();
+    }).catch(function () { /* still restarting; the next tick retries */ });
+  }, 2000);
 }
 
 function sectionMqtt() {
@@ -5997,6 +6525,10 @@ function sectionFirmware() {
         var xhr = new XMLHttpRequest();
         xhr.open("POST", path);
         xhr.setRequestHeader("Content-Type", "application/octet-stream");
+        /* The uploads are XHR (fetch has no upload progress), so they sit
+           outside api() and carry the auth header themselves — the only
+           requests in the file that do. */
+        if (authPass) xhr.setRequestHeader("Authorization", basicAuth(authPass));
         xhr.timeout = 10 * 60 * 1000;
         xhr.upload.onprogress = function (ev) {
           if (!ev.lengthComputable) return;
@@ -6008,6 +6540,11 @@ function sectionFirmware() {
           var res = {};
           try { res = JSON.parse(xhr.responseText || "{}"); } catch (e) { /* non-JSON */ }
           b.disabled = false;
+          if (xhr.status === 401) {
+            prog.classList.add("hidden");
+            onUnauthorized();
+            return;
+          }
           if (xhr.status === 200 && !res.error) {
             bar.style.width = "100%";
             setMsg(upMsg, t("Flashed. The box is rebooting — reload this page in a few seconds."), "ok");

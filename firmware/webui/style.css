@@ -384,6 +384,9 @@ main {
   font-size: .8rem; color: var(--muted);
   background: var(--sunk); border-left: 3px solid var(--line);
   border-radius: 0 var(--r-sm) var(--r-sm) 0; padding: .5rem .65rem; margin: .6rem 0 0;
+  /* Notes carry unbreakable tokens too — a TLS fingerprint is 64 characters
+     with no break point, wider than a 360 px phone. */
+  overflow-wrap: anywhere;
 }
 .note.warn { border-left-color: var(--warn); background: var(--warn-bg); color: var(--text); }
 .note.bad  { border-left-color: var(--bad);  background: var(--bad-bg);  color: var(--text); }
@@ -415,6 +418,8 @@ main {
   touch-action: manipulation;
 }
 .btn:active { transform: translateY(1px); }
+/* One .btn is an <a> (the cert.pem download): same box, no underline. */
+a.btn { text-decoration: none; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 .btn.danger  { color: var(--bad); border-color: var(--line); }
 .btn.ghost   { background: transparent; border-color: transparent; color: var(--muted); }
@@ -938,6 +943,29 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
   cursor: pointer; flex: none; line-height: 1;
 }
 .sheet-sub { font-size: .82rem; color: var(--muted); margin: -.25rem 0 .6rem; }
+
+/* ------------------------------------------------------------- login gate --
+   The password screen. A full-page overlay ABOVE everything — sheets are
+   z-index 60 and the bottom nav 40, so 80 guarantees that a 401 arriving
+   mid-flow cannot leave a live control floating over the lock. It paints
+   var(--bg) opaquely rather than a scrim: this is not a dialog over the app,
+   it IS the page until the password is right.
+
+   One centred column, and the box is capped at 22rem — a password form
+   stretched across a monitor reads as broken. At 360 px the panel is simply
+   full width minus the padding, same as every settings card. */
+.login {
+  position: fixed; inset: 0; z-index: 80;
+  background: var(--bg);
+  overflow-y: auto;
+  display: flex; flex-direction: column; align-items: center;
+  padding: 12vh 1rem 2rem;
+  padding-top: calc(12vh + env(safe-area-inset-top));
+}
+.login-box { width: 100%; max-width: 22rem; }
+.login-brand { display: flex; align-items: center; gap: .5rem; margin-bottom: .3rem; }
+.login-brand h2 { font-size: 1.15rem; }
+.login-ico { font-size: 1.4rem; line-height: 1; }
 
 /* -------------------------------------------------------------- progress -- */
 .progress { height: .55rem; background: var(--sunk); border-radius: 999px;

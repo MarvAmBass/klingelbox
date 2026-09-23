@@ -9,8 +9,21 @@ nav_order: 6
 The contract between `firmware/main/http_api.c` and `firmware/webui/`. Both are
 written against this document; neither may invent endpoints.
 
-* Base: `http://<hostname>.local/` (also reachable on the softAP IP).
-* No auth, no TLS — by design, a trusted-LAN / AP appliance.
+* Base: `http://<hostname>.local/` (also reachable on the softAP IP). With
+  TLS enabled it becomes `https://<hostname>.local/` on port 443, and port 80
+  answers every GET with a plain `302` to the same path on https (never an
+  HSTS header — TLS can be turned off again).
+* **No auth and no TLS by default** — the out-of-the-box posture is still the
+  trusted-LAN appliance. Both are **opt-in and independent**: see
+  [Authentication & TLS](#authentication--tls).
+* When a web password **is** set, every `/api` route requires
+  `Authorization: Basic` for user **`admin`** — on the LAN, the softAP and the
+  recovery portal alike. Static files and `GET /cert.pem` stay open. A missing
+  or wrong credential is a **401** with body
+  `{"error":"authentication required"}` and **deliberately no
+  `WWW-Authenticate` header**, so browsers never throw their native login
+  dialog over the web UI's own login screen; `curl -u admin:pw` and Home
+  Assistant send the header preemptively and need no challenge.
 * All responses are JSON. **Every failure is `{"error": "..."}`** with a real
   HTTP status (400 bad input, 404 unknown id, 409 wrong state, 503 no radio).
   `error` is always a **human sentence** — an `ESP_ERR_*` constant is never part
@@ -35,6 +48,102 @@ the box never answers (which defeats CSRF), and refusing foreign `Host` values
 defeats DNS rebinding, where an attacker's own hostname is re-pointed at the
 box's address. The box's web UI and any direct client — `curl`, scripts, Home
 Assistant — pass both rules by simply stating the `Content-Type` they send.
+
+---
+
+## Authentication & TLS
+
+Both features live in the `web` section of `/api/config`, both default OFF,
+and neither implies the other in firmware. The full threat model — what the
+password protects, why TLS is *recommended* once a password exists, pinning,
+lockout recovery — is in [`security.md`](security.md).
+
+### The web password
+
+```bash
+# set (1..64 characters; user is always "admin")
+curl -X POST http://klingelbox.local/api/config \
+     -H 'Content-Type: application/json' \
+     -d '{"web":{"http_password":"hunter2-but-better"}}'
+
+# every /api call from then on
+curl -u admin:hunter2-but-better http://klingelbox.local/api/system
+
+# remove (empty string — auth is off again)
+curl -u admin:hunter2-but-better -X POST http://klingelbox.local/api/config \
+     -H 'Content-Type: application/json' \
+     -d '{"web":{"http_password":""}}'
+```
+
+* The password is **write-only**; reads report `has_http_password` only.
+* `""` **removes** the password — the one deliberate exception to the
+  "empty string means keep" rule of every other secret, because "no
+  password" must itself be settable. *Omit* the field to keep the stored one.
+* It guards `/api` on **every** transport, the recovery portal included. A
+  forgotten password is recovered by USB reflash, nothing less — see
+  [`security.md`](security.md#lockout-recovery).
+* Wrong or missing credentials cost a uniform ~300 ms before the 401, and the
+  comparison is constant-time — guessing is slow and timing reveals nothing.
+
+### TLS
+
+```bash
+# enable — the box mints an ECDSA P-256 identity on first enable and moves
+# the server to :443 within about a second (the response still arrives on
+# the old transport)
+curl -X POST http://klingelbox.local/api/config \
+     -H 'Content-Type: application/json' \
+     -d '{"web":{"tls_enabled":true}}'
+
+# fetch + pin the certificate (TOFU; never authenticated, plain HTTP allowed)
+curl http://klingelbox.local/cert.pem -o klingelbox.pem
+openssl x509 -in klingelbox.pem -noout -fingerprint -sha256   # compare with
+curl -sk https://klingelbox.local/api/config | jq .web.tls.fingerprint
+
+# then talk to the box against exactly that certificate
+curl --cacert klingelbox.pem https://klingelbox.local/api/system
+```
+
+* `GET /api/config` → `web.tls` is `{"source":"generated"|"provided",
+  "fingerprint":"<64 hex>"}` once an identity exists, `null` before the first
+  enable (identities are minted lazily, not at boot). The fingerprint is the
+  SHA-256 of the certificate's DER — what `openssl x509 -fingerprint -sha256`
+  prints, minus the colons.
+* The generated certificate is self-signed (browsers warn once; pin or
+  install it), CN = the box's hostname, validity fixed 2026–2056 because the
+  box has **no clock** — see `db_tls.h`.
+* While TLS is on, port 80 answers GETs with `302 Found` to
+  `https://<same host><same path>` and refuses writes with a pointer to :443.
+  **No HSTS, ever**: TLS may be disabled again later, and a browser that was
+  promised HTTPS-forever would then refuse the box outright.
+
+### `POST /api/tls/identity` — bring your own certificate
+
+`{"cert_pem":"...","key_pem":"..."}` → `{"ok":true,"fingerprint":"...",
+"source":"provided","restarting":<bool>}`
+
+The pair is validated **completely before anything persists**: both must
+parse, and the key must match the **first** certificate (chains are accepted
+leaf-first, ~6 KB cert / 4 KB key ceilings, 10 KB body cap). A rejected
+upload is a **400 naming the actual mistake** (swapped fields, encrypted key,
+truncated block, key/leaf mismatch...) and leaves the active identity
+untouched. **507** when the box's NVS partition genuinely has no room. If TLS
+is running, the servers restart onto the new identity immediately.
+
+### `DELETE /api/tls/identity`
+
+Drops the stored identity. With TLS enabled a **fresh self-signed one** is
+minted and served immediately (the response carries its fingerprint); with
+TLS off the slate is wiped and the next enable mints lazily. Either way every
+pinned client must re-pair — on a *generated* identity this doubles as
+deliberate key rotation.
+
+### `GET /cert.pem`
+
+The **active** certificate, `Content-Type: application/x-pem-file`,
+**never authenticated** (it is public material — every TLS handshake hands it
+out anyway) and served on plain :80 even while TLS is on, because the pin has
+to be fetchable before any trust exists.
 
 ---
 
@@ -912,10 +1021,19 @@ succeeded and the key was dropped.) Reads report only `has_pass`.
   "mqtt": { "enabled":false, "host":"", "port":1883, "user":"",
             "base_topic":"doorbell", "homeassistant":true,
             "discovery_prefix":"homeassistant" },
+  "web":  { "has_http_password":false, "tls_enabled":false,
+            "tls": { "source":"generated",
+                     "fingerprint":"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" } },
   "ota": { "url":"https://github.com/MarvAmBass/klingelbox/releases/latest/download/klingelbox.bin",
            "default_url":"https://github.com/MarvAmBass/klingelbox/releases/latest/download/klingelbox.bin",
            "default_webui_url":"https://github.com/MarvAmBass/klingelbox/releases/latest/download/storage.bin" } }
 ```
+
+`web` is [Authentication & TLS](#authentication--tls): `http_password` is
+write-only and takes `""` as **remove** (its one documented exception to the
+empty-string rule); `tls_enabled` applies live — the servers restart onto the
+other transport right after the response; `web.tls` is `null` until the first
+enable mints an identity.
 
 `mqtt.base_topic` and `mqtt.discovery_prefix` are validated on write by the same
 rule as a node's `topic` — see [Topic validation](#topic-validation). A bad value

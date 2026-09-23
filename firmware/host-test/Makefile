@@ -18,6 +18,13 @@
 #                    final. Wrong once in a way only an rc runner would ever
 #                    see, which is exactly the user no on-device test covers.
 #
+#   test_http_auth   the pure halves of the web security wave: the HTTP Basic
+#                    credential parser + constant-time compare (http_auth.c)
+#                    and the structural PEM preflight (pem_scan.c). Both files
+#                    are framework-free BY CONTRACT so this binary can link
+#                    them with no stubs at all — if either grows an IDF
+#                    dependency, this build breaks first, on purpose.
+#
 #   test_node_graph  the pieces of main/ that can destroy a user's data:
 #                    the frozen on-flash node layouts and their widening
 #                    (node_migrate.c), the shared MQTT topic validity rule
@@ -59,7 +66,7 @@ NG_SRCS := test_node_graph.c \
         $(RFPULSE)/rf_decode.c \
         $(RFPULSE)/rf_ev1527.c
 
-BINS := test_rf_decode test_node_graph test_version_cmp
+BINS := test_rf_decode test_node_graph test_version_cmp test_http_auth
 
 .PHONY: all test clean
 all: $(BINS)
@@ -81,12 +88,19 @@ test_node_graph: $(NG_SRCS) $(MAIN)/node_migrate.h $(MAIN)/node_graph.h \
 test_version_cmp: test_version_cmp.c $(MAIN)/version_cmp.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(MAIN) -o $@ test_version_cmp.c
 
+test_http_auth: test_http_auth.c $(MAIN)/http_auth.c $(MAIN)/http_auth.h \
+        $(MAIN)/pem_scan.c $(MAIN)/pem_scan.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(MAIN) -o $@ \
+	        test_http_auth.c $(MAIN)/http_auth.c $(MAIN)/pem_scan.c
+
 test: $(BINS)
 	./test_rf_decode
 	@echo
 	./test_node_graph
 	@echo
 	./test_version_cmp
+	@echo
+	./test_http_auth
 
 clean:
 	rm -rf $(BINS) $(addsuffix .dSYM,$(BINS))

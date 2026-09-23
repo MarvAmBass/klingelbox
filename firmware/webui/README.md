@@ -438,10 +438,12 @@ Five tabs, plus the recovery wizard that replaces the whole page.
 | ↳ *add-node flow: configure by hand* | `/api/signals/virtual` |
 | ↳ *node editor, signal inline* | `/api/signals`, `/api/signals/{id}` (GET/POST), `/api/signals/{id}/transmit` |
 | **Settings** | `/api/config`, `/api/ap`, `/api/radio`, `/api/wifi/scan`, `/api/system/hostname`, `/api/ota*`, `/api/update*`, `/api/restart` |
+| ↳ *Access & encryption* | `/api/config` (`web.*`), `/api/tls/identity` (POST/DELETE), `/cert.pem` |
 | ↳ *Stored signals* | `/api/signals`, `/api/signals/{id}` (GET/POST/DELETE), `/api/signals/{id}/transmit`, `/api/graph` (to say who uses what) |
 | ↳ *Backup* — export/import | export: `/api/system`, `/api/radio`, `/api/signals`, `/api/signals/{id}`, `/api/graph`. import: `/api/signals/import`, `/api/graph/nodes` (POST/DELETE), `/api/graph/links`, `/api/signals/{id}` (DELETE), `/api/radio` (optional) |
 | **Diagnostics** | `/api/diagnostics` |
 | **Recovery wizard** | `/api/system`, `/api/wifi/scan`, `/api/wifi` |
+| **Login screen** | `/api/system` (a raw probe with the candidate password — see **Auth & TLS**) |
 
 A few notes on the less obvious ones:
 
@@ -592,6 +594,84 @@ labels tick smoothly at 1 Hz off a 0.1 Hz poll.
    empty string is never sent — per the contract that means "leave unchanged",
    so a blank field keeps the stored secret rather than clearing it. The same
    rule applies to the MQTT password and the AP recovery passphrase.
+
+---
+
+## Auth & TLS (Settings → Access & encryption)
+
+Both **off by default** and each **independently** toggleable: this is a
+trusted-LAN appliance and must keep working like one. The section exists so a
+not-fully-trusted LAN is a two-tap fix. The UI recommends TLS *once a password
+is set* — Basic credentials over plain HTTP are readable to anyone on the LAN —
+but states it as a sentence next to the toggle, never as a dependency between
+the toggles.
+
+**One account, username hardcoded `admin`.** The login screen shows it, fixed
+and non-editable, because it is part of the credential and someone setting up
+`curl` or Home Assistant has to read it somewhere.
+
+**The login screen is the only auth UX.** When a password is set, every `/api`
+request must carry `Authorization: Basic base64("admin:" + password)`.
+Failures come back as **401 JSON deliberately without a `WWW-Authenticate`
+header**, so the browser never raises its native credential dialog — the
+full-page overlay in `app.js` (`showLogin()`) is what every user sees, in
+their language, at 360 px, in dark mode. It probes `GET /api/system` with the
+candidate password via a **raw `fetch`** (not `api()`, which would attach the
+stored header and feed its own failure back into the 401 handler) and stores
+nothing until that probe answers 200. A wrong password is delayed ~300 ms by
+the firmware (brute-force damping); the overlay shows a spinner so the pause
+reads as checking, not hanging. On success it reloads the page — boot ran
+without credentials, so the caches are error states, and a reload re-boots
+cleanly with the header attached.
+
+**Where the header attaches — exactly two places.** `api()` is the single
+fetch path (`postJSON`/`delJSON` route through it), and the two OTA upload
+XHRs (which exist only because `fetch` has no upload progress) set the same
+header themselves. Any 401 anywhere funnels into `onUnauthorized()`: forget
+the stored password, stop every poll, show the login screen — idempotently,
+because a tab poll, the system poll and a user click can all 401 in the same
+second.
+
+**The password lives in `localStorage`** (`klingelbox-http-pass`). Deliberate
+trade, stated here so it does not get "fixed" into a session cookie: anyone
+with this browser profile can read the password out of storage — and the same
+person could simply open the page, which the stored password unlocks anyway.
+In exchange the box never asks again across reloads and reboots, which is the
+convenience bar of a home appliance. **Sign out** (the header 🔒, visible only
+while a password is in use) forgets it on this device; **removing the
+password** (behind a confirmation that says the API becomes open again) deletes
+it from the box. After a password *change*, the UI adopts the new credential
+before the next request goes out, so changing it never logs you out.
+
+**TLS** serves the UI over HTTPS with either a device-generated certificate or
+one you upload (two PEM boxes — paste, or pick files that are read into them;
+server-side PEM errors are shown verbatim). The certificate card shows the
+source, the SHA-256 fingerprint (copyable — via the `execCommand` fallback,
+because `navigator.clipboard` needs a secure context and plain-HTTP is the
+common case until TLS is on) and a link to **`/cert.pem`**, which answers
+*without* a password on purpose: a device must be able to fetch and pin the
+certificate before it can sign in.
+
+**Flipping TLS restarts the box's web server**, and may move the page to the
+other scheme. Two rules in `tlsTransition()`, kept on purpose:
+
+1. **The page never redirects itself.** It renders a plain link to
+   `https://<same-host>/` (or `http://…` when disabling) and the user taps it
+   when ready.
+2. **Success is never claimed until a probe answers.** The retry loop probes
+   the address the page is on; a *cross-scheme* probe is impossible from here
+   (the browser refuses it until the self-signed certificate has been accepted
+   once — or, the other way, blocks plain-HTTP requests from an HTTPS page as
+   mixed content), and the copy says so instead of pretending.
+
+Everything is **scheme-relative**: every request in this file is a
+root-relative path (`/api/...`), so the same flashed UI works over `http://`
+and `https://` unchanged. The only `http://` literals in `app.js` are prose
+about mDNS (`http://<name>.local`) and the GitHub release URLs the *box*
+downloads OTA images from.
+
+A firmware whose `GET /api/config` has no `web` object predates the feature;
+the Access section says so and offers nothing, per the ground rules.
 
 ---
 

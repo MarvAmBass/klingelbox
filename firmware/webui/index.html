@@ -65,8 +65,14 @@
        same kind of control — one tap, one stored preference, nothing to undo.
        The language button shows the language you would GET (DE while you are
        reading English), because showing the current one makes the tap a
-       guess. -->
+       guess.
+
+       The 🔒 before them is sign-out, and it exists only while the box has a
+       password AND this browser holds it (app.js unhides it): on an open box
+       a logout button would be a puzzle. Tapping it forgets the stored
+       password on this device and locks the page again. -->
   <div class="topbar-right">
+    <button id="logout-btn" class="theme-toggle hidden" type="button" aria-label="Sign out" data-i18n-aria title="Sign out" data-i18n-title>&#128274;</button>
     <button id="lang-toggle" class="theme-toggle lang-toggle" type="button" aria-label="Language">DE</button>
     <button id="theme-toggle" class="theme-toggle" type="button" aria-label="Theme" data-i18n-aria>&#128421;</button>
     <div id="status-badge" class="status-badge" title="Box status" data-i18n-title>&hellip;</div>

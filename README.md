@@ -175,18 +175,32 @@ captures/minute to **zero**, with real presses unaffected.
 
 ## Security
 
-**Do not expose this box to the internet.** The REST API has no authentication —
-by design, because the security boundary is your network. On a trusted LAN that
-is a reasonable trade; port-forwarded, it is a device-takeover primitive.
+**Do not expose this box to the internet.** Even with everything below turned
+on, reach it from outside over a VPN into your own network, never a port
+forward. Anyone who can drive the API can transmit any signal you have
+learned, rewrite the node graph, overwrite your Wi-Fi and MQTT credentials,
+and — via `POST /api/ota/upload` — **flash arbitrary firmware onto the
+device**.
 
-Anyone who can reach `:80` can transmit any signal you have learned, rewrite the
-node graph, overwrite your Wi-Fi and MQTT credentials, and — via
-`POST /api/ota/upload` — **flash arbitrary firmware onto the device**.
+Out of the box there is **no login and no TLS** — the security boundary is
+your network, as it always was. Two opt-in layers tighten that
+([docs/security.md](docs/security.md) has the full threat model):
 
-Reach it from outside over a VPN into your own network, never a port forward.
+* **Web password** (`web.http_password` in `POST /api/config`): every `/api`
+  route then requires HTTP Basic auth as user `admin` — on the LAN, the
+  softAP and the recovery portal alike. Write-only, constant-time compared,
+  failures rate-limited; a forgotten password means USB reflash. Removing it
+  (empty string) reopens the API.
+* **TLS** (`web.tls_enabled`): the web server moves to `https://` on :443
+  with an ECDSA certificate minted on the device; port 80 becomes a plain
+  302 redirect (never HSTS — you can turn TLS off again). Clients pin the
+  certificate via the unauthenticated `GET /cert.pem` and check its SHA-256
+  fingerprint from `GET /api/config`. **Set TLS together with the password**
+  — Basic credentials on plain HTTP are readable by anyone on the wire. Your
+  own certificate can be installed with `POST /api/tls/identity`.
 
 Related, and deliberate:
-* What the box **does** defend against is your own browser being used as a
+* The box **always** defends against your own browser being used as a
   proxy: `/api` refuses requests whose `Host` header does not name the box
   (DNS rebinding) and POSTs without a proper `Content-Type` (cross-site request
   forgery from a hostile web page). Neither is authentication — see the intro

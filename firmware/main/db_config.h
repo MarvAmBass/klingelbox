@@ -120,6 +120,18 @@ typedef struct {
      * difference between "the chime rings" and "nothing happens". */
     uint8_t  tx_repeats;                 /* 6 */
     uint32_t tx_gap_us;                  /* 8000 — silence between repeats */
+
+    /* ---- web access (v2) ----
+     * Both default OFF and are fully independent: the password guards /api on
+     * whatever transport is running, TLS changes the transport under whatever
+     * auth is configured. The docs recommend TLS once a password is set (Basic
+     * credentials on plain HTTP are sniffable on the LAN), but the firmware
+     * never couples them. http_pass is WRITE-ONLY over the API like every
+     * other secret; "" means auth is disabled. The username is always "admin"
+     * (http_auth.h). A forgotten password is recovered by USB reflash —
+     * docs/security.md, "Lockout recovery". */
+    char     http_pass[DB_STR_PASS];     /* "" = no auth (default) */
+    bool     tls_enabled;                /* false = plain HTTP on :80 (default) */
 } db_config_t;
 
 /* Initialise NVS flash (call once, early, before db_config_load).

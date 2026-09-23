@@ -131,7 +131,12 @@ captures per minute to **zero**, with real presses unaffected.
   active development — expect rough edges.
 - `TX_OK` means the transmit completed *in software*. The box has no receiver on the other
   end and deliberately does not claim that any chime reacted.
-- The web UI and REST API have **no authentication and no TLS**, by design: this is a
-  trusted-LAN / AP appliance. Do not expose it to the public internet.
+- The web UI and REST API ship with **no password and no TLS**, by design: this is a
+  trusted-LAN / AP appliance and must work like one out of the box. Both are one toggle
+  away under **Settings → Access & encryption** — an optional password (HTTP Basic,
+  username fixed to `admin`, the web UI brings its own login screen) and optional HTTPS
+  with a device-generated or your own certificate. They are independent, but turn TLS on
+  if you set a password: Basic credentials on plain HTTP are readable to anyone on the
+  LAN. Even with both on, do not expose the box to the public internet.
 - 433 MHz is a licence-free ISM band, but transmit power and duty cycle limits are
   regional. The default TX power is deliberately modest.
