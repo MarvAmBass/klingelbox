@@ -115,15 +115,17 @@ curl --cacert klingelbox.pem https://klingelbox.local/api/system
   "fingerprint":"<64 hex>"}` once an identity exists, `null` before the first
   enable (identities are minted lazily, not at boot). The fingerprint is the
   SHA-256 of the certificate's DER — what `openssl x509 -fingerprint -sha256`
-  prints, minus the colons. When a **stored uploaded pair failed validation
-  at boot** (see [security.md](security.md), "Fallbacks, stated honestly")
-  the pair was replaced by a generated, *persisted* identity — stable
-  fingerprint, safe to pin — and the object additionally carries
-  `"custom_rejected": true` and `"rejected_reason": "<one sentence naming
-  the problem>"` (the same sentence the upload 400 would have used) — absent
-  otherwise. `source` is `"generated"` then, because that is what is served
-  *and* stored. The notice survives reboots and clears only on a successful
-  re-upload or `DELETE /api/tls/rejection`.
+  prints, minus the colons. When a **stored pair failed validation at boot**
+  — uploaded *or* the box's own (see [security.md](security.md), "Fallbacks,
+  stated honestly") — the pair was replaced by a generated, *persisted*
+  identity — stable fingerprint, safe to pin — and the object additionally
+  carries `"custom_rejected": true`, `"rejected_reason": "<one sentence
+  naming the problem>"` (the same sentence the upload 400 would have used)
+  and `"rejected_source": "provided"|"generated"` naming which kind of pair
+  was replaced — all absent otherwise. `source` is `"generated"` then,
+  because that is what is served *and* stored. The notice survives reboots
+  and clears only on a successful re-upload or
+  `DELETE /api/tls/rejection`.
 * The generated certificate is self-signed (browsers warn once; pin or
   install it), CN = the box's hostname, validity fixed 2026–2056 because the
   box has **no clock** — see `db_tls.h`.
@@ -165,11 +167,13 @@ upload vanished — dismissing the notice is its own call, below.
 → `{"ok":true}`
 
 Dismisses the `custom_rejected` notice — the persisted record that a stored
-uploaded pair failed validation at boot and was replaced (see the
-`GET /api/config` shape above) — without touching the active identity. The
-other exit is a successful `POST /api/tls/identity`; a reboot is *not* one,
-the notice is stored and reloads. Idempotent: deleting a notice that does
-not stand is still a `200`.
+pair (uploaded or the box's own, see `rejected_source` in the
+`GET /api/config` shape above) failed validation at boot and was replaced —
+without touching the active identity. Dismissing accepts the replacement;
+a later failure raises a fresh notice. The other exit is a successful
+`POST /api/tls/identity`; a reboot is *not* one, the notice is stored and
+reloads. Idempotent: deleting a notice that does not stand is still a
+`200`.
 
 ### `GET /cert.pem`
 
@@ -1077,8 +1081,9 @@ succeeded and the key was dropped.) Reads report only `has_pass`.
 write-only and takes `""` as **remove** (its one documented exception to the
 empty-string rule); `tls_enabled` applies live — the servers restart onto the
 other transport right after the response; `web.tls` is `null` until the first
-enable mints an identity, and gains `custom_rejected`/`rejected_reason` while
-the notice about a rejected-and-replaced uploaded pair stands (see
+enable mints an identity, and gains
+`custom_rejected`/`rejected_reason`/`rejected_source` while the notice about
+a rejected-and-replaced stored pair stands (see
 [Authentication & TLS](#authentication--tls)).
 
 `mqtt.base_topic` and `mqtt.discovery_prefix` are validated on write by the same

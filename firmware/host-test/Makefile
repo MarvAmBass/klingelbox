@@ -44,10 +44,12 @@
 #                    activate vs replace vs discard — against the same fake
 #                    NVS plus a content-driven fake mbedTLS
 #                    (stubs/host_mbedtls.c): the property pinned there is
-#                    that a stored UPLOADED pair failing validation is
-#                    replaced by a PERSISTED generated identity (stable
-#                    fingerprint across boots) plus a persisted notice that
-#                    only an upload or an explicit ack ends. DB_HOSTTEST
+#                    that ANY stored pair failing validation — uploaded or
+#                    the box's own — is replaced by a PERSISTED generated
+#                    identity (stable fingerprint across boots) plus a
+#                    persisted notice naming the reason and which kind was
+#                    replaced, which only an upload or an explicit ack
+#                    ends. DB_HOSTTEST
 #                    enables the reset hooks that let one process simulate
 #                    several boots.
 #

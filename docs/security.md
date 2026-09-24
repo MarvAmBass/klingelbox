@@ -133,28 +133,39 @@ transient boot-time failure must not silently revoke that choice until the
 next power cycle. The event feed reports the fallback once when it happens
 and the recovery once when it succeeds, not every retry.
 
-One failure is *not* transient and gets its own shape: a **stored uploaded
-pair that fails validation at boot** (the concrete case: a pair accepted
-under an older firmware's rules that a newer key-strength floor refuses).
-Retrying that forever would leave the box headless over bytes that will
-never start validating. So the box **replaces** it: the dead pair is erased,
-a self-signed identity is minted, **persisted**, and served in its place —
-**TLS stays on, no downgrade**, and because the replacement is stored like
-any generated identity its fingerprint is **stable across boots** and safe
-to pin. Erasing your upload is deliberate, and honest: an earlier design
-kept the rejected pair in flash "for inspection", but this box has **no
-retrieval path** for it — `/cert.pem` serves the *active* certificate and
-the API never returns private keys — so the preserved bytes could not be
-inspected by anyone, while the unpersisted stand-in that design served
-changed its fingerprint every boot and broke pinning clients repeatedly.
-You still have the originals (you uploaded them), and a blob the box cannot
-validate is worthless anyway. What survives instead is a **persisted
-notice**: one event-feed entry at replacement time, and `GET /api/config` →
-`web.tls` carries `custom_rejected: true` plus a `rejected_reason` sentence
-naming the actual problem — the same sentence the upload would have been
-refused with. `source` reads `"generated"` because that is what is served
-and stored. The notice outlives reboots and ends only by an explicit act of
-yours: upload a fixed pair, or dismiss it with `DELETE /api/tls/rejection`.
+One failure is *not* transient and gets its own shape: a **stored pair that
+fails validation at boot** — an uploaded pair accepted under an older
+firmware's rules that a newer key-strength floor refuses, or the box's own
+generated pair corrupted in flash. Retrying that forever would leave the
+box headless over bytes that will never start validating. So the box
+**replaces** it: the dead pair is erased, a self-signed identity is minted,
+**persisted**, and served in its place — **TLS stays on, no downgrade**,
+and because the replacement is stored like any generated identity its
+fingerprint is **stable across boots** and safe to pin. Erasing your upload
+is deliberate, and honest: an earlier design kept the rejected pair in
+flash "for inspection", but this box has **no retrieval path** for it —
+`/cert.pem` serves the *active* certificate and the API never returns
+private keys — so the preserved bytes could not be inspected by anyone,
+while the unpersisted stand-in that design served changed its fingerprint
+every boot and broke pinning clients repeatedly. You still have the
+originals (you uploaded them), and a blob the box cannot validate is
+worthless anyway. What survives instead is a **persisted notice**, raised
+for *any* replacement — a changed fingerprint must never be a mystery,
+whether the dead pair was yours or the box's own: one event-feed entry at
+replacement time, and `GET /api/config` → `web.tls` carries
+`custom_rejected: true`, a `rejected_reason` sentence naming the actual
+problem — the same sentence an upload would have been refused with — and
+`rejected_source` (`"provided"` or `"generated"`) saying which kind of pair
+was replaced, so the UI can word the two cases honestly. `source` reads
+`"generated"` because that is what is served and stored. The notice
+outlives reboots and ends only by an explicit act of yours: upload a fixed
+pair, or dismiss it with `DELETE /api/tls/rejection` — dismissing accepts
+the replacement (re-pin first); a later failure raises a fresh notice.
+The web UI surfaces it twice: as a banner on every page right after the UI
+loads — so the explanation greets exactly the person who just clicked through
+a browser certificate warning — and on the certificate card in Settings →
+Access & encryption, where the durable notice is managed. Closing the banner
+hides it for the browser session only; the stored notice stands until you act.
 
 On the recovery
 portal with TLS enabled, captive-portal sheets may balk at the self-signed

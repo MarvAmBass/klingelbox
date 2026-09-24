@@ -46,11 +46,22 @@ static const char *TAG = "db_tls";
 #define NVS_K_CERT  "cert"
 #define NVS_K_KEY   "key"
 #define NVS_K_SRC   "src"     /* u8 db_tls_source_t */
-#define NVS_K_REJ   "rej_why" /* blob: NUL-terminated rejected-notice reason
+#define NVS_K_REJ   "rej_why" /* blob: one source-marker byte (below) followed
+                                 by the NUL-terminated rejected-notice reason
                                  sentence; the key's PRESENCE is the
                                  custom_rejected flag — a notice always has a
                                  reason, so a separate flag would only add a
                                  way for the two to disagree */
+
+/* The notice blob's leading byte: WHICH KIND of stored pair the notice is
+ * about. In the same blob rather than a second NVS key for the same reason
+ * the flag is the key's presence: flag, reason and source written in one
+ * blob can never disagree with each other. Control bytes on purpose — no
+ * reason sentence starts with one, so a LEGACY blob (written before the
+ * marker existed, first byte printable) is unambiguous and reads as
+ * PROVIDED: only provided-pair notices could exist before this change. */
+#define REJ_MARK_PROVIDED  0x01
+#define REJ_MARK_GENERATED 0x02
 
 /*
  * FIXED validity window — see db_tls.h for why a box with no clock must not
@@ -68,13 +79,17 @@ static size_t s_key_len;
 static bool   s_ready;
 static db_tls_source_t s_source = DB_TLS_GENERATED;
 
-/* REJECTED-NOTICE state (db_tls.h): a stored PROVIDED pair failed load-time
- * validation and was replaced by a persisted generated identity; the notice
- * (flag + reason sentence) is the durable record of that replacement. Mirror
- * of the NVS_K_REJ blob: written at replacement, reloaded at every boot,
- * erased only by a successful new upload or an explicit acknowledge. */
+/* REJECTED-NOTICE state (db_tls.h): a stored pair — provided OR generated —
+ * failed load-time validation and was replaced by a persisted generated
+ * identity; the notice (flag + reason sentence + which kind was replaced) is
+ * the durable record of that replacement. Mirror of the NVS_K_REJ blob:
+ * written at replacement, reloaded at every boot, erased only by a
+ * successful new upload or an explicit acknowledge. */
 static bool s_custom_rejected;
 static char s_rejected_reason[DB_TLS_REJECT_REASON_MAX];
+/* Which kind of stored pair the standing notice replaced; meaningful only
+ * while s_custom_rejected. */
+static db_tls_source_t s_rejected_source = DB_TLS_PROVIDED;
 /* RAM-only: the rejection was DETECTED during this boot's load (as opposed
  * to the notice merely being reloaded from NVS). http_api uses it to put the
  * replacement into the event feed exactly once — at replacement time, not on
@@ -236,12 +251,17 @@ static esp_err_t persist(db_tls_source_t source)
  * identity is what keeps HTTPS alive, the notice only explains it, so a
  * failed notice write must never block the replacement — worst case the
  * operator loses the explanation, never the server. */
-static void notice_persist(const char *why)
+static void notice_persist(db_tls_source_t src, const char *why)
 {
+    /* Marker + sentence as ONE blob — see REJ_MARK_* for why not two keys. */
+    char rec[1 + DB_TLS_REJECT_REASON_MAX];
+    rec[0] = (src == DB_TLS_GENERATED) ? REJ_MARK_GENERATED : REJ_MARK_PROVIDED;
+    snprintf(rec + 1, sizeof(rec) - 1, "%s", why);
+
     nvs_handle_t h;
     esp_err_t err = nvs_open(DB_TLS_NS, NVS_READWRITE, &h);
     if (err == ESP_OK) {
-        err = nvs_set_blob(h, NVS_K_REJ, why, strlen(why) + 1);
+        err = nvs_set_blob(h, NVS_K_REJ, rec, 1 + strlen(rec + 1) + 1);
         if (err == ESP_OK) err = nvs_commit(h);
         nvs_close(h);
     }
@@ -283,11 +303,31 @@ esp_err_t db_tls_load(void)
      * be no pair at all — so NVS is the only place the notice survives a
      * reboot. Erased solely by a successful upload or an explicit ack. */
     {
-        size_t rlen = sizeof(s_rejected_reason);
+        char rec[1 + DB_TLS_REJECT_REASON_MAX];
+        size_t rlen = sizeof(rec);
         state_lock();
-        if (nvs_get_blob(h, NVS_K_REJ, s_rejected_reason, &rlen) == ESP_OK &&
-            rlen > 0) {
-            s_rejected_reason[sizeof(s_rejected_reason) - 1] = '\0';
+        if (nvs_get_blob(h, NVS_K_REJ, rec, &rlen) == ESP_OK && rlen > 0) {
+            rec[sizeof(rec) - 1] = '\0';
+            /* Leading source marker (REJ_MARK_*). A blob without one predates
+             * the marker and reads as PROVIDED — only provided-pair notices
+             * could exist before the marker did. */
+            const char *reason = rec;
+            s_rejected_source = DB_TLS_PROVIDED;
+            if (rec[0] == REJ_MARK_GENERATED) {
+                s_rejected_source = DB_TLS_GENERATED;
+                reason = rec + 1;
+            } else if (rec[0] == REJ_MARK_PROVIDED) {
+                reason = rec + 1;
+            }
+            /* Explicit clamp instead of snprintf: a marked blob's sentence
+             * fits by construction, but rec is one byte roomier than the
+             * reason buffer (the marker), and gcc's format-truncation check
+             * cannot see that the legacy case never uses that byte. */
+            size_t rl = strlen(reason);
+            if (rl >= sizeof(s_rejected_reason))
+                rl = sizeof(s_rejected_reason) - 1;
+            memcpy(s_rejected_reason, reason, rl);
+            s_rejected_reason[rl] = '\0';
             s_custom_rejected = true;
         }
         state_unlock();
@@ -307,45 +347,48 @@ esp_err_t db_tls_load(void)
      * way the pair is REPLACED: erased here, re-minted and PERSISTED by the
      * next db_tls_ensure(), so the box serves one stable generated identity
      * from then on instead of retrying bytes that will never start
-     * validating. For GENERATED that was never controversial — flash
-     * corruption is the only way our own pair gets here, nothing user-owned
-     * is lost. For PROVIDED (the concrete case from our own history: a pair
-     * accepted under v0.8.0's rules refused by v0.9.0's key-strength floor)
-     * the replacement deserves its why spelled out, because v0.9.1 shipped
-     * the opposite — keep the stored pair byte-identical "for inspection",
-     * serve a RAM-only stand-in — and that design was rejected: this system
-     * has NO retrieval path. /cert.pem serves the ACTIVE certificate and the
-     * API never returns private keys (our own security rule), so the
-     * preserved pair could never be inspected by anyone, while the
-     * unpersisted stand-in changed the served fingerprint every boot and
+     * validating. For PROVIDED (the concrete case from our own history: a
+     * pair accepted under v0.8.0's rules refused by v0.9.0's key-strength
+     * floor) the replacement deserves its why spelled out, because v0.9.1
+     * shipped the opposite — keep the stored pair byte-identical "for
+     * inspection", serve a RAM-only stand-in — and that design was rejected:
+     * this system has NO retrieval path. /cert.pem serves the ACTIVE
+     * certificate and the API never returns private keys (our own security
+     * rule), so the preserved pair could never be inspected by anyone, while
+     * the unpersisted stand-in changed the served fingerprint every boot and
      * broke pinning clients again and again. Preservation without retrieval
      * is pure cost; the uploader has the originals by construction, and a
-     * corrupt blob is worthless. What a PROVIDED pair gets instead is a
-     * persisted NOTICE naming the reason, standing until the operator
-     * uploads a fixed pair or dismisses it. */
+     * corrupt blob is worthless.
+     *
+     * GENERATED used to take a QUIET discard-and-remint here, on the theory
+     * that nothing user-owned was lost. Wrong theory: the served FINGERPRINT
+     * is user-owned the moment a client pins it, and a silent remint changes
+     * it with no explanation — exactly the mystery the notice exists to
+     * prevent. So the rule is now uniform: ANY replacement gets explained —
+     * a changed fingerprint must never be a mystery. Both kinds get the same
+     * persisted NOTICE naming the reason and which kind was replaced,
+     * standing until the operator uploads a pair or dismisses it. */
     esp_err_t verr = validate_pair(s_cert_pem, s_cert_len, s_key_pem, s_key_len);
     if (verr != ESP_OK) {
-        const char *why = NULL;
-        if (src == DB_TLS_PROVIDED) {
-            /* Best reason first: pem_scan names a structural wound (truncated
-             * block, wrong label) in a sentence; otherwise reuse the exact
-             * verdict sentence the upload 400 would have used. */
-            why = db_pem_scan_pair(s_cert_pem, s_cert_len,
-                                   s_key_pem, s_key_len);
-            if (!why)
-                why = (verr == ESP_ERR_NOT_SUPPORTED) ? DB_TLS_MSG_KEY_WEAK
-                                                      : DB_TLS_MSG_PAIR_INVALID;
-            state_lock();
-            s_custom_rejected = true;
-            s_rejected_this_boot = true;
-            snprintf(s_rejected_reason, sizeof(s_rejected_reason), "%s", why);
-            state_unlock();
-            ESP_LOGE(TAG, "stored uploaded TLS identity failed validation — "
-                          "replacing it with a generated one (%s)", why);
-        } else {
-            ESP_LOGE(TAG, "stored generated TLS identity failed validation — "
-                          "discarding it");
-        }
+        /* Best reason first: pem_scan names a structural wound (truncated
+         * block, wrong label) in a sentence; otherwise reuse the exact
+         * verdict sentence the upload 400 would have used. */
+        const char *why = db_pem_scan_pair(s_cert_pem, s_cert_len,
+                                           s_key_pem, s_key_len);
+        if (!why)
+            why = (verr == ESP_ERR_NOT_SUPPORTED) ? DB_TLS_MSG_KEY_WEAK
+                                                  : DB_TLS_MSG_PAIR_INVALID;
+        db_tls_source_t bad = (src == DB_TLS_PROVIDED) ? DB_TLS_PROVIDED
+                                                       : DB_TLS_GENERATED;
+        state_lock();
+        s_custom_rejected = true;
+        s_rejected_this_boot = true;
+        s_rejected_source = bad;
+        snprintf(s_rejected_reason, sizeof(s_rejected_reason), "%s", why);
+        state_unlock();
+        ESP_LOGE(TAG, "stored %s TLS identity failed validation — replacing "
+                      "it with a generated one (%s)",
+                 bad == DB_TLS_PROVIDED ? "uploaded" : "generated", why);
         /* ORDER: erase first, notice second, replacement last (at the next
          * db_tls_ensure). The erase frees the pair's one-to-eight KB, which
          * on a nearly-full 24 KB partition may be exactly what lets the
@@ -355,7 +398,7 @@ esp_err_t db_tls_load(void)
          * mint lands in start_servers()' plain-HTTP fallback + retry. The
          * clear also scrubs the bad private key out of RAM. */
         db_tls_clear();
-        if (why) notice_persist(why);
+        notice_persist(bad, why);
         return ESP_OK;
     }
 
@@ -512,6 +555,15 @@ bool db_tls_custom_rejected(char *reason_out, size_t reason_sz)
         snprintf(reason_out, reason_sz, "%s", s_rejected_reason);
     state_unlock();
     return rejected;
+}
+
+db_tls_source_t db_tls_rejected_source(void)
+{
+    /* Same locking rule as the flag and reason it belongs to. */
+    state_lock();
+    db_tls_source_t src = s_rejected_source;
+    state_unlock();
+    return src;
 }
 
 bool db_tls_rejection_is_fresh(void)
@@ -708,6 +760,7 @@ void db_tls_hosttest_reset(void)
     memset(s_key_pem, 0, sizeof(s_key_pem));
     s_custom_rejected = false;
     s_rejected_reason[0] = '\0';
+    s_rejected_source = DB_TLS_PROVIDED;
     s_rejected_this_boot = false;
 }
 #endif

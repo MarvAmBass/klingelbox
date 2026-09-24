@@ -589,6 +589,7 @@ function rerenderForLang() {
   $$(".tabpane").forEach(function (p) { if (p.id !== "tab-recovery") clear(p); });
   renderHeader();
   renderSkewNotice(true);   /* an up banner must switch language too */
+  renderCertNotice(true);
   if (S.recovery) { if (S.sys) buildRecovery(S.sys); return; }
   stopTabPolls();
   onTabEnter(S.tab, true);
@@ -1031,7 +1032,7 @@ function loadGpio() {
 }
 
 function loadConfig() {
-  return api("/api/config").then(function (cfg) { S.config = cfg; return cfg; })
+  return api("/api/config").then(function (cfg) { S.config = cfg; renderCertNotice(); return cfg; })
     .catch(function (e) { if (e.status === 404) S.has.config = false; return null; });
 }
 
@@ -1173,6 +1174,69 @@ function renderSkewNotice(force) {
 
   var m = $("main");
   if (m) { m.insertBefore(box, m.firstChild); skewNote = box; }
+}
+
+/* ======================================================================
+   Replaced-certificate banner -- the login-visible face of custom_rejected
+   ====================================================================== */
+
+/* The certificate card in Settings is where the persisted notice is managed
+   (its Dismiss calls DELETE /api/tls/rejection). But someone who just clicked
+   through a browser certificate warning does not know to look there -- so the
+   same notice also surfaces as a banner on every tab, first thing after
+   login/config load. Its ✕ is deliberately SESSION-local (like the skew
+   banner): closing the banner hides the reminder for this visit without
+   destroying the durable record, which keeps exactly one authoritative
+   dismiss path. Keyed by the source AND the reason sentence, so a different,
+   later rejection — same words about the other kind of pair included —
+   shows again even inside the same session. */
+var CERTNOTE_KEY = "klingelbox-certnote-dismissed";
+var certNote = null;
+
+function renderCertNotice(force) {
+  var tls = S.config && S.config.web && S.config.web.tls;
+  /* An absent rejected_source is an older firmware, whose notice could only
+     ever be about an uploaded pair — same backward rule the box applies to
+     its own stored record. */
+  var rjSrc = (tls && tls.rejected_source) || "provided";
+  var key = (tls && tls.custom_rejected)
+    ? (rjSrc + "\n" + (tls.rejected_reason || "?")) : null;
+  var seen = null;
+  try { seen = sessionStorage.getItem(CERTNOTE_KEY); } catch (e) { /* private mode */ }
+  if (!key || seen === key || S.recovery) {
+    if (certNote) { certNote.remove(); certNote = null; }
+    return;
+  }
+  if (certNote && certNote.__key === key && !force) return;
+  if (certNote) certNote.remove();
+
+  var box = el("div", "note warn skewnote");
+  box.__key = key;
+  var txt = el("div", "skew-text");
+  /* Same structure either way; only the intro sentence knows WHICH kind of
+     stored pair was replaced (rejected_source). */
+  add(txt, el("div", null, rjSrc === "generated"
+    ? t("The box could not load its stored HTTPS certificate at startup and generated a "
+      + "fresh one — that is why your browser may have warned about a new certificate:")
+    : t("The box replaced your uploaded HTTPS certificate at startup because it could no "
+      + "longer be used — that is why your browser may have warned about a new certificate:")));
+  /* Server prose, shown verbatim -- same policy as every {"error": ...}. */
+  add(txt, el("div", "mono", tls.rejected_reason || ""));
+  add(txt, el("div", null,
+    t("Details and the new fingerprint are under Settings → Access & encryption.")));
+  add(box, txt);
+  var x = el("button", "skew-x", "✕");
+  x.type = "button";
+  x.title = t("Dismiss");
+  x.setAttribute("aria-label", t("Dismiss"));
+  x.addEventListener("click", function () {
+    try { sessionStorage.setItem(CERTNOTE_KEY, key); } catch (e) { /* shows again next load */ }
+    if (certNote) { certNote.remove(); certNote = null; }
+  });
+  add(box, x);
+
+  var m = $("main");
+  if (m) { m.insertBefore(box, m.firstChild); certNote = box; }
 }
 
 /* ======================================================================
@@ -5692,7 +5756,8 @@ function sectionAp() {
    is allowed their password without the certificate-warning ceremony.
 
    GET /api/config carries `web: { has_http_password, tls_enabled, tls:
-   { source, fingerprint, custom_rejected?, rejected_reason? } }`; the
+   { source, fingerprint, custom_rejected?, rejected_reason?,
+   rejected_source? } }`; the
    password itself is write-only, exactly like the MQTT and Wi-Fi secrets. A
    firmware without `web` predates the feature, and the section says so
    instead of offering dead controls. */
@@ -5851,22 +5916,29 @@ function renderAccess(body, flash) {
   var fsC = el("fieldset");
   add(fsC, el("legend", null, t("Certificate")));
   var tls = web.tls || null;
-  /* REJECTED-UPLOAD NOTICE (custom_rejected): the stored upload failed
+  /* REJECTED-CERTIFICATE NOTICE (custom_rejected): a stored pair failed
      validation at boot and was REPLACED by a certificate the box generated
      and persisted — `source` below says "generated" because that is simply
-     true now, and the fingerprint is stable across boots. The pair itself is
-     gone (the box has no way to hand it back anyway); this notice is the
-     durable record of the replacement, with the firmware's reason sentence
-     verbatim (server prose, never translated — same policy as every
-     {"error": ...} sentence). It stands, reboots included, until a fixed
-     pair is uploaded or it is dismissed here. */
+     true now, and the fingerprint is stable across boots. `rejected_source`
+     says which KIND of pair was replaced, and only the wording keys off it:
+     an uploaded pair asks for a fixed re-upload, the box's own asks for a
+     re-pin (absent on older firmware = "provided", the only kind whose
+     notice existed back then). The pair itself is gone (the box has no way
+     to hand it back anyway); this notice is the durable record of the
+     replacement, with the firmware's reason sentence verbatim (server
+     prose, never translated — same policy as every {"error": ...}
+     sentence). It stands, reboots included, until a fixed pair is uploaded
+     or it is dismissed here. */
   if (tls && tls.custom_rejected) {
+    var rjGen = tls.rejected_source === "generated";
     var rj = el("div", "note warn");
-    add(rj, el("div", null,
-      t("The certificate you uploaded was rejected when the box last checked it:")));
+    add(rj, el("div", null, rjGen
+      ? t("The box's stored certificate could not be loaded when it last started:")
+      : t("The certificate you uploaded was rejected when the box last checked it:")));
     add(rj, el("div", "mono", tls.rejected_reason || ""));
-    add(rj, el("div", null,
-      t("It has been replaced by a certificate the box generated itself — HTTPS stays on, and the new fingerprint is shown below. Upload a fixed pair, or dismiss this notice.")));
+    add(rj, el("div", null, rjGen
+      ? t("It has been replaced by a freshly generated one — HTTPS stays on, but the fingerprint changed; re-pin it below. Dismiss this notice once you have.")
+      : t("It has been replaced by a certificate the box generated itself — HTTPS stays on, and the new fingerprint is shown below. Upload a fixed pair, or dismiss this notice.")));
     var rjMsg = el("div", "formmsg");
     var dis = el("button", "btn small", t("Dismiss this notice"));
     dis.type = "button";

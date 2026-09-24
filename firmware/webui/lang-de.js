@@ -1260,5 +1260,20 @@ window.KLINGELBOX_DE = {
   "external reset pin": "externer Reset-Pin",
   "power-on": "Einschalten",
   "software restart": "Software-Neustart",
+
+  /* v0.9.3 -- replaced-certificate notice, banner + settings card: the
+     custom_rejected wordings for both rejected_source cases (an uploaded
+     pair asks for a fixed re-upload, the box's own for a re-pin). Keys
+     sorted within the block. */
+  "Details and the new fingerprint are under Settings \u2192 Access & encryption.":
+    "Details und den neuen Fingerabdruck findest du unter Einstellungen \u2192 Zugang & Verschl\u00fcsselung.",
+  "It has been replaced by a freshly generated one \u2014 HTTPS stays on, but the fingerprint changed; re-pin it below. Dismiss this notice once you have.":
+    "Es wurde durch ein frisch generiertes ersetzt \u2014 HTTPS bleibt an, aber der Fingerabdruck hat sich ge\u00e4ndert; pinne ihn unten neu. Blende diesen Hinweis aus, sobald du das getan hast.",
+  "The box could not load its stored HTTPS certificate at startup and generated a fresh one \u2014 that is why your browser may have warned about a new certificate:":
+    "Die Box konnte ihr gespeichertes HTTPS-Zertifikat beim Start nicht laden und hat ein frisches generiert \u2014 deshalb hat dein Browser eventuell vor einem neuen Zertifikat gewarnt:",
+  "The box replaced your uploaded HTTPS certificate at startup because it could no longer be used \u2014 that is why your browser may have warned about a new certificate:":
+    "Die Box hat dein hochgeladenes HTTPS-Zertifikat beim Start ersetzt, weil es nicht mehr nutzbar war \u2014 deshalb hat dein Browser eventuell vor einem neuen Zertifikat gewarnt:",
+  "The box's stored certificate could not be loaded when it last started:":
+    "Das gespeicherte Zertifikat der Box lie\u00df sich beim letzten Start nicht laden:",
   "the interrupt watchdog": "der Interrupt-Watchdog"
 };

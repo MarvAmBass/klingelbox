@@ -41,7 +41,7 @@
  *   GET  /api/config   POST /api/config  non-secret configuration
  *   POST /api/tls/identity               install an operator cert+key (PEM)
  *   DEL  /api/tls/identity               drop it; back to the on-device one
- *   DEL  /api/tls/rejection              dismiss the rejected-upload notice
+ *   DEL  /api/tls/rejection              dismiss the rejected-certificate notice
  *   (GET /cert.pem lives OUTSIDE /api and outside auth on purpose: the active
  *    certificate for trust-on-first-use pinning, needed before trust exists.)
  *   GET  /api/ap       POST /api/ap      softAP + recovery portal settings
@@ -2355,11 +2355,13 @@ static esp_err_t api_config_get(httpd_req_t *req)
         cJSON_AddBoolToObject(web, "tls_enabled", s_cfg->tls_enabled);
         if (db_tls_ready()) {
             cJSON *tls = cJSON_AddObjectToObject(web, "tls");
-            /* After a rejected upload was replaced (db_tls.h) `source` says
-             * "generated" because that is the truth now: the replacement is
-             * persisted, served, and stable — a client that pins by this
-             * object pins the real thing. The standing notice rides in
-             * `custom_rejected` + `rejected_reason`, present only while it
+            /* After a rejected stored pair was replaced (db_tls.h) `source`
+             * says "generated" because that is the truth now: the
+             * replacement is persisted, served, and stable — a client that
+             * pins by this object pins the real thing. The standing notice
+             * rides in `custom_rejected` + `rejected_reason` +
+             * `rejected_source` (which KIND of pair was replaced — the UI
+             * words the two cases differently), present only while it
              * stands (until a fixed upload or DELETE /api/tls/rejection),
              * like every tls field that is only sometimes meaningful. */
             cJSON_AddStringToObject(tls, "source",
@@ -2371,6 +2373,9 @@ static esp_err_t api_config_get(httpd_req_t *req)
             if (db_tls_custom_rejected(why, sizeof(why))) {
                 cJSON_AddBoolToObject(tls, "custom_rejected", true);
                 cJSON_AddStringToObject(tls, "rejected_reason", why);
+                cJSON_AddStringToObject(tls, "rejected_source",
+                    db_tls_rejected_source() == DB_TLS_PROVIDED ? "provided"
+                                                                : "generated");
             }
         } else {
             cJSON_AddNullToObject(web, "tls");
@@ -2756,8 +2761,8 @@ static esp_err_t api_tls_identity_delete(httpd_req_t *req)
 }
 
 /*
- * DELETE /api/tls/rejection — dismiss the persisted rejected-upload notice
- * (db_tls.h) without touching the active identity. DELETE rather than a
+ * DELETE /api/tls/rejection — dismiss the persisted rejected-certificate
+ * notice (db_tls.h) without touching the active identity. DELETE rather than a
  * POST .../ack because the notice is a stored record and this removes it —
  * the exact shape DELETE /api/tls/identity already set for this API; there
  * is nothing to acknowledge WITH, so a verb-suffix endpoint would carry an
@@ -4145,18 +4150,22 @@ static esp_err_t start_servers(void)
     }
 
     /* REPLACEMENT (db_tls.h): the ensure above just minted — and persisted —
-     * the replacement for a stored-but-rejected upload. One feed entry at
-     * REPLACEMENT time only: is_fresh separates the boot that replaced from
-     * the boots that merely reload the standing notice, which would
-     * otherwise nag the feed every boot until dismissed; the static guards
-     * against server restarts within this boot. The full reason sentence is
-     * too long for the ring and lives in GET /api/config. */
+     * the replacement for a stored pair that failed validation (uploaded or
+     * the box's own — the entry names which). One feed entry at REPLACEMENT
+     * time only: is_fresh separates the boot that replaced from the boots
+     * that merely reload the standing notice, which would otherwise nag the
+     * feed every boot until dismissed; the static guards against server
+     * restarts within this boot. The full reason sentence is too long for
+     * the ring and lives in GET /api/config. */
     static bool s_replacement_announced;
     if (want_tls && db_tls_rejection_is_fresh() && !s_replacement_announced) {
         s_replacement_announced = true;
         db_events_push(DB_EV_SYSTEM, 0, 0, 0, 0,
-                       "uploaded TLS certificate rejected — replaced with a "
-                       "generated one");
+                       db_tls_rejected_source() == DB_TLS_PROVIDED
+                           ? "uploaded TLS certificate rejected — replaced "
+                             "with a generated one"
+                           : "stored TLS certificate could not be loaded — "
+                             "replaced with a freshly generated one");
     }
 
     esp_err_t err;

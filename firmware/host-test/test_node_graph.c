@@ -1297,17 +1297,20 @@ static void test_graph_delete_survives_failed_links_write(void)
 /*
  * db_tls.c against the same fake NVS, with mbedTLS replaced by the
  * content-driven fake in stubs/host_mbedtls.c. What is under test is the
- * boot-time decision tree for a STORED pair that fails validation:
+ * boot-time decision tree for a STORED pair that fails validation — which
+ * since the rejected_source change is ONE rule for both kinds:
  *
- *   - PROVIDED (uploaded by the operator): REPLACED — the pair is erased and
- *     the next ensure mints AND PERSISTS a generated identity, so the served
- *     fingerprint is the same on every later boot (the fake mints a distinct
- *     key per keygen, exactly so that "stable across boots" can only be
- *     satisfied by actually persisting). What survives is the NOTICE: flag +
- *     reason in NVS, reloaded at every boot, gone only through a successful
- *     new upload or an explicit acknowledge — never through a reboot.
- *   - GENERATED (the box's own): discarded and re-minted, nothing user-owned
- *     is lost and no notice is raised.
+ *   ANY stored pair that fails at load is REPLACED — erased, and the next
+ *   ensure mints AND PERSISTS a generated identity, so the served
+ *   fingerprint is the same on every later boot (the fake mints a distinct
+ *   key per keygen, exactly so that "stable across boots" can only be
+ *   satisfied by actually persisting). What survives is the NOTICE: flag +
+ *   reason + WHICH KIND was replaced (a leading marker byte in the same
+ *   blob: 0x01 provided, 0x02 generated — a flash format, pinned by value
+ *   here; a legacy blob without a marker reads as provided), reloaded at
+ *   every boot, gone only through a successful new upload or an explicit
+ *   acknowledge — never through a reboot. Uniform because a changed
+ *   fingerprint must never be a mystery, whoever owned the dead pair.
  *
  * Plus the shared-sentence property: the notice's reason for a given corpus
  * is the very sentence the upload 400 would have used for it, pinned by
@@ -1393,6 +1396,8 @@ static void test_tls_rejected_pair_is_replaced_and_persisted(void)
      * boot-check and the upload path have drifted apart. */
     CHECK(strcmp(reason, DB_TLS_MSG_KEY_WEAK) == 0,
           "reason IS the upload-path weak-key sentence, got: %s", reason);
+    CHECK(db_tls_rejected_source() == DB_TLS_PROVIDED,
+          "the notice names the uploaded pair");
     CHECK(db_tls_rejection_is_fresh(), "the detection boot reports fresh");
 
     char blob[512];
@@ -1400,9 +1405,9 @@ static void test_tls_rejected_pair_is_replaced_and_persisted(void)
           tls_stored("key", blob, sizeof(blob)) == 0,
           "the dead pair is gone from flash");
     size_t len = tls_stored("rej_why", blob, sizeof(blob));
-    CHECK(len == sizeof(DB_TLS_MSG_KEY_WEAK) &&
-          memcmp(blob, DB_TLS_MSG_KEY_WEAK, len) == 0,
-          "the notice is persisted, reason verbatim");
+    CHECK(len == 1 + sizeof(DB_TLS_MSG_KEY_WEAK) && blob[0] == 0x01 &&
+          memcmp(blob + 1, DB_TLS_MSG_KEY_WEAK, len - 1) == 0,
+          "the notice is persisted: provided marker + reason verbatim");
 
     /* Ensure: mints the replacement AND persists it — from here on the
      * stored identity and the served identity are the same thing. */
@@ -1441,6 +1446,8 @@ static void test_tls_replacement_is_stable_across_boots(void)
     CHECK(db_tls_custom_rejected(reason, sizeof(reason)),
           "notice survived the reboot");
     CHECK(strcmp(reason, DB_TLS_MSG_KEY_WEAK) == 0, "same verdict, same words");
+    CHECK(db_tls_rejected_source() == DB_TLS_PROVIDED,
+          "the provided marker round-trips the reboot");
     CHECK(!db_tls_rejection_is_fresh(), "a reloaded notice is not 'fresh'");
     char fp1[65];
     CHECK(db_tls_get_fingerprint(fp1, sizeof(fp1)) == ESP_OK &&
@@ -1568,27 +1575,122 @@ static void test_tls_delete_is_plain_rotation(void)
           strcmp(fp0, fp1) != 0, "rotated: a new keypair, a new fingerprint");
 }
 
-static void test_tls_generated_corruption_is_discarded(void)
+static void test_tls_generated_failure_raises_notice(void)
 {
-    CASE("a corrupt GENERATED pair keeps the quiet discard-and-remint");
+    CASE("a failing GENERATED pair is replaced WITH a notice, source 'generated'");
     host_nvs_reset();
     db_tls_hosttest_reset();
     /* Flash corruption shape: the cert blob no longer parses. src = 0, the
-     * box's own identity — nothing user-owned in it, nothing to explain. */
+     * box's own identity. This used to be a QUIET discard-and-remint on the
+     * theory nothing user-owned was lost — but the served fingerprint is
+     * user-owned the moment a client pins it, and a silent remint changes
+     * it with zero explanation. Same rule as provided now: any replacement
+     * gets explained. */
     tls_seed_stored("garbage, not PEM\n", TLS_ALPHA_KEY, 0 /* GENERATED */);
 
-    CHECK(db_tls_load() == ESP_OK, "load reports OK");
+    CHECK(db_tls_load() == ESP_OK, "load reports OK (anti-brick)");
     CHECK(!db_tls_ready(), "corrupt pair not served");
+    char reason[DB_TLS_REJECT_REASON_MAX] = "";
+    CHECK(db_tls_custom_rejected(reason, sizeof(reason)), "notice raised");
+    CHECK(db_tls_rejected_source() == DB_TLS_GENERATED,
+          "and it names the box's own pair");
+    CHECK(reason[0] != '\0', "with a reason sentence");
+    CHECK(db_tls_rejection_is_fresh(), "the detection boot reports fresh");
+
     char blob[512];
-    CHECK(!db_tls_custom_rejected(NULL, 0) &&
-          tls_stored("rej_why", blob, sizeof(blob)) == 0,
-          "no notice for our own identity — there is no operator to tell");
-    CHECK(tls_stored("cert", blob, sizeof(blob)) == 0,
+    CHECK(tls_stored("cert", blob, sizeof(blob)) == 0 &&
+          tls_stored("key", blob, sizeof(blob)) == 0,
           "the corrupt blobs were erased");
+    /* The stored record: marker + sentence in ONE blob; 0x02 is the
+     * generated-source marker — a flash format, pinned by value. */
+    size_t len = tls_stored("rej_why", blob, sizeof(blob));
+    CHECK(len == 1 + strlen(reason) + 1 && blob[0] == 0x02 &&
+          memcmp(blob + 1, reason, len - 1) == 0,
+          "persisted: generated marker + reason verbatim");
 
     CHECK(db_tls_ensure("testbox") == ESP_OK, "re-minted");
     CHECK(db_tls_ready() && db_tls_source() == DB_TLS_GENERATED, "generated");
     CHECK(tls_stored("cert", blob, sizeof(blob)) > 0, "and persisted");
+    CHECK(db_tls_custom_rejected(NULL, 0), "the notice still stands");
+}
+
+static void test_tls_generated_marker_round_trips_reboot(void)
+{
+    CASE("the generated-source marker round-trips a reboot");
+    /* Continues the previous test's flash on purpose: the replaced box
+     * reboots onto its persisted replacement plus the standing notice. */
+    char fp0[65];
+    CHECK(db_tls_get_fingerprint(fp0, sizeof(fp0)) == ESP_OK,
+          "fingerprint on the replacement boot");
+    db_tls_hosttest_reset();
+    CHECK(db_tls_load() == ESP_OK && db_tls_ready(),
+          "boot #2 loads the replacement");
+    char reason[DB_TLS_REJECT_REASON_MAX] = "";
+    CHECK(db_tls_custom_rejected(reason, sizeof(reason)), "notice reloaded");
+    CHECK(db_tls_rejected_source() == DB_TLS_GENERATED,
+          "still about the box's own pair — the marker survived");
+    CHECK(reason[0] != '\0' && reason[0] != 0x02,
+          "the marker byte never leaks into the reason");
+    CHECK(!db_tls_rejection_is_fresh(), "a reloaded notice is not 'fresh'");
+    char fp1[65];
+    CHECK(db_tls_get_fingerprint(fp1, sizeof(fp1)) == ESP_OK &&
+          strcmp(fp0, fp1) == 0, "same fingerprint after the reboot");
+}
+
+static void test_tls_legacy_notice_reads_as_provided(void)
+{
+    CASE("a legacy notice blob without the marker reads as 'provided'");
+    host_nvs_reset();
+    db_tls_hosttest_reset();
+    /* A notice exactly as firmware from BEFORE the source marker persisted
+     * it: the bare sentence, first byte printable. Only provided-pair
+     * notices could exist back then, which is why the missing marker must
+     * read as provided — and why no byte may be eaten as one. */
+    nvs_handle_t h;
+    CHECK(nvs_open("db_tls", NVS_READWRITE, &h) == ESP_OK, "open db_tls ns");
+    CHECK(nvs_set_blob(h, "rej_why", DB_TLS_MSG_KEY_WEAK,
+                       sizeof(DB_TLS_MSG_KEY_WEAK)) == ESP_OK,
+          "seed the legacy record");
+    CHECK(nvs_commit(h) == ESP_OK, "commit");
+    nvs_close(h);
+
+    CHECK(db_tls_load() == ESP_OK, "load reports OK");
+    char reason[DB_TLS_REJECT_REASON_MAX] = "";
+    CHECK(db_tls_custom_rejected(reason, sizeof(reason)),
+          "the legacy notice stands");
+    CHECK(strcmp(reason, DB_TLS_MSG_KEY_WEAK) == 0,
+          "the whole blob is the reason — nothing eaten as a marker");
+    CHECK(db_tls_rejected_source() == DB_TLS_PROVIDED, "and reads as provided");
+    CHECK(!db_tls_rejection_is_fresh(), "reloaded, never re-detected");
+}
+
+static void test_tls_dismissal_then_second_failure_recreates_notice(void)
+{
+    CASE("a dismissal accepts ONE replacement; a later failure is a new notice");
+    host_nvs_reset();
+    db_tls_hosttest_reset();
+    tls_seed_stored("garbage, not PEM\n", TLS_ALPHA_KEY, 0 /* GENERATED */);
+    CHECK(db_tls_load() == ESP_OK && db_tls_custom_rejected(NULL, 0),
+          "first failure raises the notice");
+    CHECK(db_tls_ensure("testbox") == ESP_OK, "replacement serving");
+    CHECK(db_tls_ack_rejection() == ESP_OK, "dismissed — replacement accepted");
+    char blob[512];
+    CHECK(!db_tls_custom_rejected(NULL, 0) &&
+          tls_stored("rej_why", blob, sizeof(blob)) == 0, "record gone");
+
+    /* Later, a DIFFERENT stored pair dies (an upload installed after the
+     * dismissal, refused at the next boot): the earlier dismissal accepted
+     * the earlier replacement, never all future ones. */
+    tls_seed_stored(TLS_ALPHA_CERT, TLS_ALPHA_WEAK_KEY, 1 /* PROVIDED */);
+    db_tls_hosttest_reset();
+    CHECK(db_tls_load() == ESP_OK, "boot onto the second failure");
+    char reason[DB_TLS_REJECT_REASON_MAX] = "";
+    CHECK(db_tls_custom_rejected(reason, sizeof(reason)), "notice re-created");
+    CHECK(db_tls_rejected_source() == DB_TLS_PROVIDED,
+          "naming the NEW pair's kind");
+    CHECK(strcmp(reason, DB_TLS_MSG_KEY_WEAK) == 0, "and the new reason");
+    CHECK(db_tls_rejection_is_fresh(),
+          "fresh again — a new replacement earns a new feed entry");
 }
 
 static void test_tls_notice_reason_is_structural_when_it_can_be(void)
@@ -1618,9 +1720,9 @@ static void test_tls_notice_reason_is_structural_when_it_can_be(void)
 
     char blob[512];
     size_t len = tls_stored("rej_why", blob, sizeof(blob));
-    CHECK(upload_says && len == strlen(upload_says) + 1 &&
-          memcmp(blob, upload_says, len) == 0,
-          "and the persisted record carries the same words");
+    CHECK(upload_says && len == 1 + strlen(upload_says) + 1 &&
+          blob[0] == 0x01 && memcmp(blob + 1, upload_says, len - 1) == 0,
+          "and the persisted record carries the same words behind the marker");
 }
 
 /* ---- main ---------------------------------------------------------------- */
@@ -1673,7 +1775,10 @@ int main(void)
     test_tls_good_reupload_clears_notice();
     test_tls_ack_clears_notice();
     test_tls_delete_is_plain_rotation();
-    test_tls_generated_corruption_is_discarded();
+    test_tls_generated_failure_raises_notice();
+    test_tls_generated_marker_round_trips_reboot();
+    test_tls_legacy_notice_reads_as_provided();
+    test_tls_dismissal_then_second_failure_recreates_notice();
     test_tls_notice_reason_is_structural_when_it_can_be();
 
     printf("---------------------\n");
