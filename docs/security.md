@@ -126,7 +126,13 @@ with TLS enabled and *no producible identity* (in practice: stored pair
 corrupted **and** NVS too full to mint a new one), or the HTTPS server
 itself fails to start, it serves **plain HTTP and says so** in the log and
 the event feed, rather than serving nothing — an unreachable box cannot
-even be told to turn TLS off. The downgrade is never permanent: while the
+even be told to turn TLS off. What that costs, stated just as honestly: the
+fallback serves the **full surface** on :80 — this is not the write-refusing
+redirect listener above, which exists only while HTTPS is actually serving —
+so for the length of the window every request crosses the LAN in cleartext,
+and with a web password set that includes the **Basic-auth credential riding
+on each one**, reads and writes alike. The event-feed entry is the flag for
+that exposure. The downgrade is never permanent: while the
 configuration says TLS and the fallback is what is running, the box retries
 the HTTPS start **every 60 seconds, forever** — you chose TLS, and a
 transient boot-time failure must not silently revoke that choice until the
@@ -150,8 +156,12 @@ while the unpersisted stand-in that design served changed its fingerprint
 every boot and broke pinning clients repeatedly. You still have the
 originals (you uploaded them), and a blob the box cannot validate is
 worthless anyway. What survives instead is a **persisted notice**, raised
-for *any* replacement — a changed fingerprint must never be a mystery,
-whether the dead pair was yours or the box's own: one event-feed entry at
+for *any* replacement of a stored pair that failed validation — a changed
+fingerprint must never be a mystery, whether the dead pair was yours or the
+box's own. (One corner currently escapes that rule: if flash loss takes
+exactly **one** of the two blobs, the load path reads "no pair" and re-mints
+as silently as a fresh box would — a gap by this section's own standard,
+not a choice.) The notice is one event-feed entry at
 replacement time, and `GET /api/config` → `web.tls` carries
 `custom_rejected: true`, a `rejected_reason` sentence naming the actual
 problem — the same sentence an upload would have been refused with — and
