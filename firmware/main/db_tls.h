@@ -39,7 +39,10 @@
  * fail validation at load; the concrete provided case from our own history
  * is a pair accepted under an older firmware's rules that a newer strength
  * floor refuses (v0.8.0 took RSA-1024; v0.9.0's floor does not), the
- * generated case is flash corruption. Either way the pair is REPLACED:
+ * generated case is flash corruption. A pair of which exactly ONE blob
+ * survived on flash counts as the same failure (DB_TLS_MSG_PAIR_INCOMPLETE)
+ * — it used to read as "no pair" and re-mint silently, which security.md
+ * called out as a gap. Either way the pair is REPLACED:
  * erased, and the next db_tls_ensure() mints and persists the usual
  * self-signed identity (TLS stays on — no downgrade, and the generated
  * fingerprint is stable across boots, so it can be pinned). Erasing an
@@ -84,6 +87,13 @@ typedef enum {
 #define DB_TLS_MSG_KEY_WEAK \
     "the private key is too weak for a TLS server: the floor is 2048 bits " \
     "for RSA and 255 bits for EC (P-256 and up)"
+
+/* The load-path-only verdict (no upload can produce it: an upload requires
+ * both halves): flash loss took exactly one of the cert/key blobs, so the
+ * stored identity is half a pair and can never serve. */
+#define DB_TLS_MSG_PAIR_INCOMPLETE \
+    "the stored certificate/key pair is incomplete: only one half of it " \
+    "survived on flash, so it cannot be used"
 
 /* Longest reason is a pem_scan sentence (~140 bytes of UTF-8), with room. */
 #define DB_TLS_REJECT_REASON_MAX 192

@@ -89,6 +89,7 @@
 #include <string.h>
 
 #include "board_pins.h"
+#include "db_storage.h"   /* breadcrumb when a save hits a full partition */
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -220,6 +221,19 @@ static const char *TAG = "db_graph";
  * of a toggle comes back in the previous position. That is the right trade: the
  * box publishes its ACTUAL position retained on every connect, so Home Assistant
  * is never lied to, and the alternative is a doorbell that wears its flash out.
+ *
+ * THE WEAR MATH, against the worst case (the OLD 24 KB NVS partition on boxes
+ * first flashed before the table grew). A full nodes blob is ~2.7 KB
+ * (24 nodes x 108 B + header), and NVS is log-structured: each rewrite burns
+ * that much fresh log space, and wear spreads over the partition's usable
+ * ~20 KB (6 pages, one reserved for GC). A Home Assistant automation toggling
+ * a switch several times a day is ~10 debounced writes/day = ~27 KB/day —
+ * about 1.4 full-partition erase cycles/day, or roughly 200 YEARS to the
+ * 100k-cycle rating. Even MIN_GAP's hard ceiling of 720 writes/day (a switch
+ * flapped continuously, forever) is ~1.9 MB/day ≈ 97 cycles/day ≈ 3 years —
+ * survivable for a state nobody actually sustains. What must never happen is
+ * MIN_GAP being removed so the debounce alone carries the cap: 10 s per write
+ * is 8640/day ≈ 23 MB/day, which eats the 24 KB part in under three months.
  */
 #define DB_SWITCH_SAVE_DEBOUNCE_MS   10000u    /* stable for 10 s              */
 #define DB_SWITCH_SAVE_MIN_GAP_MS   120000u    /* at most one write per 2 min  */
@@ -476,6 +490,7 @@ static esp_err_t save_blob(const char *key, const void *items, size_t item_size,
     esp_err_t err = nvs_open(DB_GRAPH_NS, NVS_READWRITE, &h);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "save %s: nvs_open: %s", key, esp_err_to_name(err));
+        db_storage_note_write_failure("graph", err);
         return err;
     }
     err = nvs_set_blob(h, key, s_blob, len);
@@ -483,8 +498,14 @@ static esp_err_t save_blob(const char *key, const void *items, size_t item_size,
         err = nvs_commit(h);
     nvs_close(h);
 
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "save %s failed: %s", key, esp_err_to_name(err));
+        /* Every graph write funnels through here — mutations and the deferred
+         * switch flush alike — so this one call is the whole module's
+         * black-box coverage. The per-caller handling (rollback, or the
+         * best-effort switch save) stays untouched; this only records. */
+        db_storage_note_write_failure("graph", err);
+    }
     return err;
 }
 
@@ -1532,6 +1553,56 @@ static void repeat_service(int64_t now)
     }
 }
 
+/*
+ * Everything one RF burst does to the graph: the switch control action first,
+ * then a traversal from the matching signal.rx node and from every
+ * source.any_rf node. Runs on the graph task (or the single-threaded host
+ * test standing in for it — see db_graph_hosttest_on_rf), which is also why
+ * it is a function rather than inline in the task loop: the full-NVS host
+ * test has to drive this exact path, not a re-implementation of it.
+ *
+ * Returns whether a switch moved, so the caller can notify the MQTT bridge
+ * OUTSIDE the lock (the handler hands work to another task).
+ */
+static bool handle_rf_trigger(const db_trigger_t *trig)
+{
+    lock();
+    /* Control before data — see switch_control_on_signal(). */
+    bool switch_moved = (switch_control_on_signal(trig->signal_id) > 0);
+    for (int i = 0; i < s_node_count; i++) {
+        const db_node_t *n = &s_nodes[i];
+        if (!n->enabled)
+            continue;
+
+        bool fires = false;
+        if (n->type == DB_NODE_SOURCE_ANY_RF) {
+            /* The wildcard: every burst, recognized or not. Opt-in — it
+             * does nothing unless the user placed one. */
+            fires = true;
+        } else if (n->type == DB_NODE_SIGNAL_RX &&
+                   trig->signal_id != 0 &&
+                   n->signal_id == trig->signal_id) {
+            /* RECEIVERS ONLY. A signal.tx bound to the same code is not
+             * started by hearing it — it has no output to start from —
+             * so a heard code cannot re-send itself, structurally,
+             * rather than because a flag was checked. */
+            fires = true;
+        }
+        if (!fires)
+            continue;
+
+        ESP_LOGI(TAG, "RF '%s' fires node %u '%s' (%s)",
+                 trig->label, (unsigned)n->id, n->name,
+                 type_name(n->type));
+        /* A separate traversal per source node, so a burst driving both
+         * a signal chain and the wildcard chain reaches everything on
+         * both — that is intended, not double-firing. */
+        traverse(n->id, trig);
+    }
+    unlock();
+    return switch_moved;
+}
+
 /* A wired button press, already debounced. Runs on the graph task. */
 static void fire_wired(uint16_t node_id)
 {
@@ -1879,40 +1950,7 @@ static void graph_task(void *arg)
 
         switch (q.kind) {
         case TRIG_RF:
-            lock();
-            /* Control before data — see switch_control_on_signal(). */
-            switch_moved = (switch_control_on_signal(q.trig.signal_id) > 0);
-            for (int i = 0; i < s_node_count; i++) {
-                const db_node_t *n = &s_nodes[i];
-                if (!n->enabled)
-                    continue;
-
-                bool fires = false;
-                if (n->type == DB_NODE_SOURCE_ANY_RF) {
-                    /* The wildcard: every burst, recognized or not. Opt-in — it
-                     * does nothing unless the user placed one. */
-                    fires = true;
-                } else if (n->type == DB_NODE_SIGNAL_RX &&
-                           q.trig.signal_id != 0 &&
-                           n->signal_id == q.trig.signal_id) {
-                    /* RECEIVERS ONLY. A signal.tx bound to the same code is not
-                     * started by hearing it — it has no output to start from —
-                     * so a heard code cannot re-send itself, structurally,
-                     * rather than because a flag was checked. */
-                    fires = true;
-                }
-                if (!fires)
-                    continue;
-
-                ESP_LOGI(TAG, "RF '%s' fires node %u '%s' (%s)",
-                         q.trig.label, (unsigned)n->id, n->name,
-                         type_name(n->type));
-                /* A separate traversal per source node, so a burst driving both
-                 * a signal chain and the wildcard chain reaches everything on
-                 * both — that is intended, not double-firing. */
-                traverse(n->id, &q.trig);
-            }
-            unlock();
+            switch_moved = handle_rf_trigger(&q.trig);
             break;
 
         case TRIG_NODE: {
@@ -2611,3 +2649,27 @@ int db_graph_fire_topic(const char *topic)
         ESP_LOGI(TAG, "trigger topic '%s' -> %d node(s), %d fired", topic, n, fired);
     return fired;
 }
+
+/* ---- host-test hooks ------------------------------------------------------- */
+
+#ifdef DB_HOSTTEST
+/* Compiled ONLY into host-test/test_node_graph (its Makefile defines
+ * DB_HOSTTEST; no device build does). The host binary is single-threaded and
+ * the graph task never runs there, so these are how a test drives the exact
+ * code the task would run — the point being to PROVE the doorbell hot path
+ * (RX match -> traversal -> TX sink, switch toggle included) completes on a
+ * flash with zero free space, not to test a lookalike of it. */
+bool db_graph_hosttest_on_rf(const db_trigger_t *trig)
+{
+    return handle_rf_trigger(trig);
+}
+
+void db_graph_hosttest_service(void)
+{
+    lock();
+    int64_t now = esp_timer_get_time();
+    repeat_service(now);
+    switch_save_service(now);
+    unlock();
+}
+#endif

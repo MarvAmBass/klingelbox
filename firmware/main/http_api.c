@@ -42,6 +42,7 @@
  *   POST /api/tls/identity               install an operator cert+key (PEM)
  *   DEL  /api/tls/identity               drop it; back to the on-device one
  *   DEL  /api/tls/rejection              dismiss the rejected-certificate notice
+ *   DEL  /api/storage/trouble            dismiss the storage-trouble breadcrumb
  *   (GET /cert.pem lives OUTSIDE /api and outside auth on purpose: the active
  *    certificate for trust-on-first-use pinning, needed before trust exists.)
  *   GET  /api/ap       POST /api/ap      softAP + recovery portal settings
@@ -118,11 +119,13 @@
 #include "freertos/task.h"
 #include "mdns.h"               /* the service record follows the transport */
 #include "nvs.h"                /* ESP_ERR_NVS_NOT_ENOUGH_SPACE in status_for() */
+#include "nvs_flash.h"          /* NVS_DEFAULT_PART_NAME for the storage stats */
 
 #include "board_pins.h"
 #include "db_config.h"
 #include "db_diag.h"
 #include "db_mqtt.h"
+#include "db_storage.h"
 #include "db_tls.h"
 #include "event_log.h"
 #include "http_auth.h"
@@ -517,6 +520,39 @@ static esp_err_t api_system_get(httpd_req_t *req)
     cJSON_AddBoolToObject(radio, "present", rf_service_radio_present());
     cJSON_AddNumberToObject(radio, "partnum", id.partnum);
     cJSON_AddNumberToObject(radio, "version", id.version);
+
+    /* Settings storage — the NVS partition everything persistent lives on.
+     * Was invisible until the live box filled it and nothing could say so;
+     * now the one page a user checks when "it stopped working" (Diagnostics)
+     * can show the fill level BEFORE the wall is hit. nvs_get_stats() walks
+     * in-RAM page state, no flash I/O — cheap enough to answer per request
+     * rather than cache. The activity feed is deliberately NOT in here: it is
+     * RAM-only by design (event_log.h) and costs these entries nothing. */
+    {
+        nvs_stats_t st;
+        if (nvs_get_stats(NVS_DEFAULT_PART_NAME, &st) == ESP_OK) {
+            cJSON *sto = cJSON_AddObjectToObject(root, "storage");
+            cJSON_AddNumberToObject(sto, "used_entries", (double)st.used_entries);
+            cJSON_AddNumberToObject(sto, "free_entries", (double)st.free_entries);
+            cJSON_AddNumberToObject(sto, "total_entries", (double)st.total_entries);
+            cJSON_AddNumberToObject(sto, "namespaces", (double)st.namespace_count);
+
+            /* The black-box readout (db_storage.h): the last NVS write that
+             * failed for space, surviving reboots until explicitly dismissed
+             * with DELETE /api/storage/trouble or overwritten by a newer
+             * failure. The err is the stable ESP name — diagnostics data the
+             * UI words its own sentence around, not an error envelope. */
+            db_storage_trouble_t tr;
+            if (db_storage_get_trouble(&tr)) {
+                cJSON *lt = cJSON_AddObjectToObject(sto, "last_trouble");
+                cJSON_AddStringToObject(lt, "module", tr.module);
+                cJSON_AddStringToObject(lt, "err", esp_err_to_name(tr.err));
+                cJSON_AddStringToObject(lt, "uptime_bucket",
+                                        db_storage_bucket_name(tr.bucket));
+                cJSON_AddBoolToObject(lt, "prev_boot", tr.prev_boot);
+            }
+        }
+    }
 
     return send_json(req, root, "200 OK");
 }
@@ -2780,6 +2816,24 @@ static esp_err_t api_tls_rejection_delete(httpd_req_t *req)
     return send_json(req, o, "200 OK");
 }
 
+/*
+ * DELETE /api/storage/trouble — dismiss the persisted storage-trouble
+ * breadcrumb (db_storage.h) once the user has acted on it (freed space,
+ * or decided to live with it). Deliberately the same shape as
+ * DELETE /api/tls/rejection: a stored record, removed by a DELETE,
+ * idempotent — dismissing a record that does not stand is the state the
+ * caller asked for, so it is a 200, not an error.
+ */
+static esp_err_t api_storage_trouble_delete(httpd_req_t *req)
+{
+    esp_err_t err = db_storage_clear_trouble();
+    if (err != ESP_OK)
+        return send_esp_err(req, err, "could not clear the storage notice");
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddBoolToObject(o, "ok", true);
+    return send_json(req, o, "200 OK");
+}
+
 /* ------------------------------------------------------------------ softAP */
 
 static esp_err_t api_ap_get(httpd_req_t *req)
@@ -3540,6 +3594,7 @@ static esp_err_t delete_router(httpd_req_t *req)
     if (uri_is(u, "/api/raw"))          return api_raw_discard(req);
     if (uri_is(u, "/api/tls/identity")) return api_tls_identity_delete(req);
     if (uri_is(u, "/api/tls/rejection")) return api_tls_rejection_delete(req);
+    if (uri_is(u, "/api/storage/trouble")) return api_storage_trouble_delete(req);
     if (uri_starts(u, "/api/signals/")) {
         uint16_t id = path_id(u, "/api/signals/", tail, sizeof(tail));
         if (id && !tail[0]) return api_signal_delete(req, id);

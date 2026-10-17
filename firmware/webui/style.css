@@ -478,6 +478,9 @@ a.btn { text-decoration: none; }
    in the layout while the field is fine. */
 .field .hint.bad, .hint.bad { color: var(--bad); font-weight: 500; }
 .hint.bad:empty { display: none; }
+/* The in-between tint: worth noticing, not yet a boxed .note.warn — the
+   Diagnostics storage line uses it from 80 % fill. */
+.field .hint.warn, .hint.warn { color: var(--warn); font-weight: 500; }
 input.badinput { border-color: var(--bad); }
 /* A field a checkbox has just switched off. Dimmed AND disabled, so the topic
    and the "expose to MQTT" checkbox beside it cannot appear to contradict each

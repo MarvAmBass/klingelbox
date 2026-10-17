@@ -55,6 +55,7 @@
 #include "db_config.h"
 #include "db_diag.h"
 #include "db_mqtt.h"
+#include "db_storage.h"
 #include "dns_server.h"
 #include "event_log.h"
 #include "http_api.h"
@@ -251,6 +252,10 @@ void app_main(void)
 
     /* 2-3. event log + domain */
     db_events_init();
+    /* Right after the event ring exists: if the previous boot hit a full NVS,
+     * this is what pushes the "storage trouble last boot" explanation the
+     * RAM-only ring could never carry across the reboot itself. */
+    db_storage_init();
     db_signals_init();
     db_graph_init();
     db_graph_set_transmit_handler(transmit_sink, NULL);

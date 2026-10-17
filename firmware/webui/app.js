@@ -590,6 +590,7 @@ function rerenderForLang() {
   renderHeader();
   renderSkewNotice(true);   /* an up banner must switch language too */
   renderCertNotice(true);
+  renderStorageNotice(true);
   if (S.recovery) { if (S.sys) buildRecovery(S.sys); return; }
   stopTabPolls();
   onTabEnter(S.tab, true);
@@ -908,6 +909,7 @@ function loadSystem() {
     if (sys.wifi_mode === "recovery" && !S.recovery) { enterRecovery(sys); return sys; }
     renderHeader();
     renderSkewNotice();
+    renderStorageNotice();
     if (sys.radio && sys.radio.present === false) {
       S.txBlock = "No CC1101 radio detected. Transmitting is impossible until the module answers on SPI -- see Diagnostics.";
       S.txBlockKind = "radio";
@@ -1237,6 +1239,56 @@ function renderCertNotice(force) {
 
   var m = $("main");
   if (m) { m.insertBefore(box, m.firstChild); certNote = box; }
+}
+
+/* ======================================================================
+   Storage-trouble banner -- the login-visible face of storage.last_trouble
+   ====================================================================== */
+
+/* Same shape as renderCertNotice, and for the same reason: the durable record
+   (the breadcrumb the firmware persisted when an NVS write hit a full
+   partition) is managed on the Diagnostics page, but the person it concerns
+   is whoever opens ANY page wondering why their settings did not stick -- so
+   it also surfaces as a banner everywhere, pointing at Diagnostics. The ✕ is
+   session-local; the one authoritative dismiss (DELETE /api/storage/trouble)
+   lives on the Diagnostics page next to the details. */
+var STORNOTE_KEY = "klingelbox-stornote-dismissed";
+var storNote = null;
+
+function renderStorageNotice(force) {
+  var sto = S.sys && S.sys.storage;
+  var tr = sto && sto.last_trouble;
+  var key = tr ? (tr.module + "|" + (tr.err || "?") + "|" + (tr.prev_boot ? "prev" : "now"))
+               : null;
+  var seen = null;
+  try { seen = sessionStorage.getItem(STORNOTE_KEY); } catch (e) { /* private mode */ }
+  if (!key || seen === key || S.recovery) {
+    if (storNote) { storNote.remove(); storNote = null; }
+    return;
+  }
+  if (storNote && storNote.__key === key && !force) return;
+  if (storNote) storNote.remove();
+
+  var box = el("div", "note warn skewnote");
+  box.__key = key;
+  var txt = el("div", "skew-text");
+  add(txt, el("div", null,
+    t("The box could not write to its settings storage — it is probably full. The "
+    + "doorbell keeps ringing, but changes may be lost at the next restart. Details "
+    + "and the dismiss button are under Diagnostics.")));
+  add(box, txt);
+  var x = el("button", "skew-x", "✕");
+  x.type = "button";
+  x.title = t("Dismiss");
+  x.setAttribute("aria-label", t("Dismiss"));
+  x.addEventListener("click", function () {
+    try { sessionStorage.setItem(STORNOTE_KEY, key); } catch (e) { /* shows again next load */ }
+    if (storNote) { storNote.remove(); storNote = null; }
+  });
+  add(box, x);
+
+  var m = $("main");
+  if (m) { m.insertBefore(box, m.firstChild); storNote = box; }
 }
 
 /* ======================================================================
@@ -7633,6 +7685,11 @@ function buildDiagnostics() {
   add(p, diagEls.sysline);
   diagEls.verdict = el("div");
   add(p, diagEls.verdict);
+  /* Settings storage (NVS) fill level + the persisted trouble record. Here
+     because "it stopped working" once meant a silently full partition, and
+     Diagnostics is the page that question gets asked on. */
+  diagEls.storage = el("div");
+  add(p, diagEls.storage);
   add(root, p);
 
   var p2 = el("div", "panel");
@@ -7745,9 +7802,65 @@ function renderDiagSysline() {
   add(line, el("div", (meta && meta.sev === "warn") ? "note warn" : "hint", text));
 }
 
+/* The settings-storage line + the trouble record, fed by /api/system
+   (S.sys.storage) like the sysline above it — an old firmware without the
+   field simply shows nothing here. Thresholds: a full NVS is a box that can
+   no longer save anything, so 80 % gets a warn tint and 90 % the full
+   note-warn treatment, the same escalation the reset reasons use. */
+function renderDiagStorage() {
+  if (!diagEls.storage) return;
+  var box = clear(diagEls.storage);
+  var sto = S.sys && S.sys.storage;
+  var total = sto ? numOr(sto.total_entries, 0) : 0;
+  if (!total) return;
+  var used = numOr(sto.used_entries, 0);
+  var pct = Math.round(used * 100 / total);
+  var cls = pct >= 90 ? "note warn" : (pct >= 80 ? "hint warn" : "hint");
+  add(box, el("div", cls, t("Settings storage: {pct}% used ({used} of {total} entries)",
+    { pct: pct, used: used, total: total })));
+  /* Said here on purpose, where storage is discussed: the feed costing no
+     flash is a design decision (zero write amplification per press), not an
+     omission, and this is where someone would come to doubt it. */
+  add(box, el("div", "hint",
+    t("The activity feed deliberately lives in RAM only — a doorbell press never "
+    + "writes to this storage, and the feed starts empty after a restart.")));
+
+  var tr = sto.last_trouble;
+  if (tr) {
+    var note = el("div", "note warn");
+    add(note, el("div", null, tr.prev_boot
+      ? t("Before the last restart, “{module}” could not write to storage "
+        + "({err}, after {bucket} of uptime). If the box seemed dead back then, "
+        + "this is why.",
+        { module: tr.module || "?", err: tr.err || "?", bucket: tr.uptime_bucket || "?" })
+      : t("During this run, “{module}” could not write to storage "
+        + "({err}, after {bucket} of uptime). Changes may not survive a restart.",
+        { module: tr.module || "?", err: tr.err || "?", bucket: tr.uptime_bucket || "?" })));
+    add(note, el("div", null,
+      t("Free space by deleting signals you no longer need, then dismiss this notice.")));
+    var row = el("div", "row");
+    var btn = el("button", "btn", t("Dismiss notice"));
+    btn.type = "button";
+    btn.addEventListener("click", function () {
+      btn.disabled = true;
+      /* The durable dismissal — the banner's ✕ is session-local, THIS is the
+         one place the stored record is removed (mirrors the TLS notice). */
+      delJSON("/api/storage/trouble").then(function () {
+        if (S.sys && S.sys.storage) delete S.sys.storage.last_trouble;
+        renderDiagStorage();
+        renderStorageNotice(true);
+      }).catch(function () { btn.disabled = false; });
+    });
+    add(row, btn);
+    add(note, row);
+    add(box, note);
+  }
+}
+
 function renderDiagnostics(err) {
   if (!diagEls.states) return;
   renderDiagSysline();
+  renderDiagStorage();
   var v = clear(diagEls.verdict);
 
   if (err || !S.diag) {

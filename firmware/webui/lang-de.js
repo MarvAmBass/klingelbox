@@ -1275,5 +1275,23 @@ window.KLINGELBOX_DE = {
     "Die Box hat dein hochgeladenes HTTPS-Zertifikat beim Start ersetzt, weil es nicht mehr nutzbar war \u2014 deshalb hat dein Browser eventuell vor einem neuen Zertifikat gewarnt:",
   "The box's stored certificate could not be loaded when it last started:":
     "Das gespeicherte Zertifikat der Box lie\u00df sich beim letzten Start nicht laden:",
-  "the interrupt watchdog": "der Interrupt-Watchdog"
+  "the interrupt watchdog": "der Interrupt-Watchdog",
+
+  /* v0.9.3 -- storage visibility + the storage-trouble black box: the
+     Diagnostics fill-level line, the RAM-only-feed explanation, the trouble
+     record in both tenses, its dismissal, and the global banner. Keys sorted
+     within the block. */
+  "Before the last restart, \u201c{module}\u201d could not write to storage ({err}, after {bucket} of uptime). If the box seemed dead back then, this is why.":
+    "Vor dem letzten Neustart konnte \u201e{module}\u201c nicht in den Speicher schreiben ({err}, nach {bucket} Laufzeit). Falls die Box damals tot wirkte: Das ist der Grund.",
+  "Dismiss notice": "Hinweis verwerfen",
+  "During this run, \u201c{module}\u201d could not write to storage ({err}, after {bucket} of uptime). Changes may not survive a restart.":
+    "In diesem Lauf konnte \u201e{module}\u201c nicht in den Speicher schreiben ({err}, nach {bucket} Laufzeit). \u00c4nderungen \u00fcberleben einen Neustart m\u00f6glicherweise nicht.",
+  "Free space by deleting signals you no longer need, then dismiss this notice.":
+    "Schaffe Platz, indem du nicht mehr ben\u00f6tigte Signale l\u00f6schst, und verwirf diesen Hinweis dann.",
+  "Settings storage: {pct}% used ({used} of {total} entries)":
+    "Einstellungs-Speicher: {pct}% belegt ({used} von {total} Eintr\u00e4gen)",
+  "The activity feed deliberately lives in RAM only \u2014 a doorbell press never writes to this storage, and the feed starts empty after a restart.":
+    "Die Aktivit\u00e4ten-Liste lebt bewusst nur im RAM \u2014 ein Klingeldruck schreibt nie in diesen Speicher, und die Liste beginnt nach einem Neustart leer.",
+  "The box could not write to its settings storage \u2014 it is probably full. The doorbell keeps ringing, but changes may be lost at the next restart. Details and the dismiss button are under Diagnostics.":
+    "Die Box konnte nicht in ihren Einstellungs-Speicher schreiben \u2014 er ist vermutlich voll. Die Klingel funktioniert weiter, aber \u00c4nderungen k\u00f6nnen beim n\u00e4chsten Neustart verloren gehen. Details und das Verwerfen findest du unter Diagnose."
 };

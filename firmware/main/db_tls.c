@@ -32,6 +32,7 @@
 #include "mbedtls/x509_crt.h"
 #include "nvs.h"
 
+#include "db_storage.h"   /* breadcrumb when a write hits a full partition */
 #include "pem_scan.h"
 
 static const char *TAG = "db_tls";
@@ -241,9 +242,13 @@ static esp_err_t persist(db_tls_source_t source)
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
 
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "persisting the TLS identity failed: %s",
                  esp_err_to_name(err));
+        /* The caller's 507 handling stays; this leaves the durable breadcrumb
+         * (db_storage.h filters for the storage-exhaustion verdicts itself). */
+        db_storage_note_write_failure("tls", err);
+    }
     return err;
 }
 
@@ -265,9 +270,14 @@ static void notice_persist(db_tls_source_t src, const char *why)
         if (err == ESP_OK) err = nvs_commit(h);
         nvs_close(h);
     }
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
         ESP_LOGW(TAG, "could not persist the rejection notice (%s) — the "
                       "replacement proceeds without it", esp_err_to_name(err));
+        /* Safe to report into the breadcrumb: db_storage never writes more
+         * than once per boot and never calls back into this module, so there
+         * is no recursion for a full partition to set off. */
+        db_storage_note_write_failure("tls", err);
+    }
 }
 
 static esp_err_t notice_erase(void)
@@ -334,13 +344,46 @@ esp_err_t db_tls_load(void)
     }
     nvs_close(h);
 
-    if (ec != ESP_OK || ek != ESP_OK) return ESP_OK;
+    if (ec != ESP_OK && ek != ESP_OK) return ESP_OK;   /* fresh box: no pair */
 
     s_cert_pem[sizeof(s_cert_pem) - 1] = '\0';
     s_key_pem[sizeof(s_key_pem) - 1] = '\0';
-    s_cert_len = strlen(s_cert_pem);
-    s_key_len = strlen(s_key_pem);
-    if (s_cert_len == 0 || s_key_len == 0) return ESP_OK;
+    s_cert_len = (ec == ESP_OK) ? strlen(s_cert_pem) : 0;
+    s_key_len  = (ek == ESP_OK) ? strlen(s_key_pem)  : 0;
+
+    /* THE HALF-PAIR GAP, closed (docs/security.md used to name it as open).
+     * Flash loss that takes exactly ONE of the two blobs used to read as "no
+     * pair" right here, and the next db_tls_ensure() re-minted as silently as
+     * a fresh box would — a changed fingerprint with no explanation, which is
+     * precisely the mystery the notice machinery exists to prevent. So a
+     * half-present pair (one blob gone, unreadable, or empty) now counts as a
+     * FAILED LOAD of the stored identity and goes through the same
+     * erase+notice+replace shape as a pair that fails validation below. The
+     * both-absent case above stays the ordinary fresh-box path: nothing was
+     * lost there, so there is nothing to explain. */
+    if (s_cert_len == 0 || s_key_len == 0) {
+        const char *why = DB_TLS_MSG_PAIR_INCOMPLETE;
+        db_tls_source_t bad = (src == DB_TLS_PROVIDED) ? DB_TLS_PROVIDED
+                                                       : DB_TLS_GENERATED;
+        state_lock();
+        s_custom_rejected = true;
+        s_rejected_this_boot = true;
+        s_rejected_source = bad;
+        snprintf(s_rejected_reason, sizeof(s_rejected_reason), "%s", why);
+        state_unlock();
+        ESP_LOGE(TAG, "stored %s TLS identity is INCOMPLETE (%s blob missing) "
+                      "— replacing it with a generated one",
+                 bad == DB_TLS_PROVIDED ? "uploaded" : "generated",
+                 s_cert_len == 0 ? "certificate" : "key");
+        /* Same order as the validation-failure path below, same reasons: the
+         * clear scrubs the surviving half out of RAM and flash (half a key is
+         * still a key, and its bytes free room on a tight partition), the
+         * notice is best-effort, the replacement arrives at the next
+         * db_tls_ensure(). */
+        db_tls_clear();
+        notice_persist(bad, why);
+        return ESP_OK;
+    }
 
     /* Anti-brick: a stored pair that no longer validates must NOT be served —
      * the HTTPS server would refuse to start with no recovery path. Either

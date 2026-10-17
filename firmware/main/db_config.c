@@ -27,6 +27,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include "db_storage.h"   /* breadcrumb when a save hits a full partition */
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -499,6 +500,10 @@ esp_err_t db_config_save(const db_config_t *cfg)
     esp_err_t err = nvs_open(DB_NS, NVS_READWRITE, &h);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "config save: nvs_open failed: %s", esp_err_to_name(err));
+        /* Even the open can hit the wall: creating a namespace entry costs
+         * space. The breadcrumb (db_storage.h) filters for the two storage
+         * verdicts itself, so every failure is simply reported. */
+        db_storage_note_write_failure("config", err);
         return err;
     }
 
@@ -517,7 +522,12 @@ esp_err_t db_config_save(const db_config_t *cfg)
 
     if (err == ESP_OK) ESP_LOGI(TAG, "config saved to NVS (%u bytes)",
                                 (unsigned)need);
-    else ESP_LOGE(TAG, "config save failed: %s", esp_err_to_name(err));
+    else {
+        ESP_LOGE(TAG, "config save failed: %s", esp_err_to_name(err));
+        /* The caller's handling stays as it was; this only leaves the durable
+         * breadcrumb a RAM-only event ring could never carry past a reboot. */
+        db_storage_note_write_failure("config", err);
+    }
     return err;
 }
 

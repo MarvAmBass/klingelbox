@@ -656,6 +656,29 @@ esp_err_t db_wifi_start(const db_config_t *cfg)
     wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&init));
 
+    /*
+     * KEEP THE WI-FI DRIVER OUT OF NVS. By default (WIFI_STORAGE_FLASH) every
+     * esp_wifi_set_config() persists the config into the "nvs.net80211"
+     * namespace — and this firmware never reads that copy back: every boot
+     * rebuilds both AP and STA configs from db_config right here, and every
+     * connect attempt (try_slot) sets the STA config again before connecting.
+     * So the driver's copy bought nothing and cost three real things on the
+     * NVS partition this box must defend (24 KB on the oldest fielded units):
+     *
+     *   - ~30 permanently-occupied entries of pure redundancy;
+     *   - a rewrite on EVERY connect attempt — in recovery mode that is every
+     *     configured network, every 3 minutes, indefinitely;
+     *   - and the failure mode that matters most: on a FULL partition the
+     *     driver's internal write fails, esp_wifi_set_config() propagates the
+     *     error, and the ESP_ERROR_CHECKs around the boot-time calls below
+     *     would turn "storage full" into "box aborts on boot". A full NVS must
+     *     degrade a doorbell's durability, never its reachability.
+     *
+     * RAM storage removes all three. PHY calibration data is unaffected — it
+     * lives under its own "phy" namespace with its own (write-once) logic.
+     */
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, on_wifi_event, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(

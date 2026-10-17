@@ -51,8 +51,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "db_storage.h"
 #include "db_tls.h"
 #include "esp_err.h"
+#include "esp_timer.h"
 #include "host_env.h"
 #include "mqtt_topic.h"
 #include "node_graph.h"
@@ -1725,6 +1727,376 @@ static void test_tls_notice_reason_is_structural_when_it_can_be(void)
           "and the persisted record carries the same words behind the marker");
 }
 
+/* ---- 5. TLS: the half-pair gap (one blob lost to flash) ------------------- */
+
+/* Seed only ONE half of a pair, the way flash loss leaves it. */
+static void tls_seed_half(const char *key_name, const char *pem, uint8_t src)
+{
+    nvs_handle_t h;
+    CHECK(nvs_open("db_tls", NVS_READWRITE, &h) == ESP_OK, "open db_tls ns");
+    CHECK(nvs_set_blob(h, key_name, pem, strlen(pem) + 1) == ESP_OK, "seed half");
+    CHECK(nvs_set_u8(h, "src", src) == ESP_OK, "seed src");
+    CHECK(nvs_commit(h) == ESP_OK, "commit seed");
+    nvs_close(h);
+}
+
+/* The shared body for both one-blob cases: `survivor` is the NVS key that is
+ * still there, `src` what the stored pair was, `want_src`/`marker` what the
+ * notice must say about it. This used to be the documented gap (security.md):
+ * half a pair read as "no pair" and re-minted silently — the one replacement
+ * with no explanation. */
+static void tls_half_pair_case(const char *survivor, const char *pem,
+                               uint8_t src, db_tls_source_t want_src,
+                               uint8_t marker)
+{
+    host_nvs_reset();
+    db_tls_hosttest_reset();
+    tls_seed_half(survivor, pem, src);
+
+    CHECK(db_tls_load() == ESP_OK, "load reports OK (anti-brick)");
+    CHECK(!db_tls_ready(), "half a pair must not serve");
+    char reason[DB_TLS_REJECT_REASON_MAX] = "";
+    CHECK(db_tls_custom_rejected(reason, sizeof(reason)),
+          "the half-pair raises the notice — no more silent re-mint");
+    CHECK(strcmp(reason, DB_TLS_MSG_PAIR_INCOMPLETE) == 0,
+          "reason IS the incomplete-pair sentence, got: %s", reason);
+    CHECK(db_tls_rejected_source() == want_src,
+          "the notice names the stored pair's kind");
+    CHECK(db_tls_rejection_is_fresh(), "the detection boot reports fresh");
+
+    char blob[512];
+    CHECK(tls_stored("cert", blob, sizeof(blob)) == 0 &&
+          tls_stored("key", blob, sizeof(blob)) == 0,
+          "the surviving half was erased — half a key is still a key");
+    size_t len = tls_stored("rej_why", blob, sizeof(blob));
+    CHECK(len == 1 + sizeof(DB_TLS_MSG_PAIR_INCOMPLETE) &&
+          (uint8_t)blob[0] == marker &&
+          memcmp(blob + 1, DB_TLS_MSG_PAIR_INCOMPLETE, len - 1) == 0,
+          "notice persisted: source marker 0x%02X + reason verbatim", marker);
+
+    /* The replacement is the ordinary persisted mint, stable across a boot. */
+    CHECK(db_tls_ensure("testbox") == ESP_OK, "replacement mints");
+    char fp0[65];
+    CHECK(db_tls_get_fingerprint(fp0, sizeof(fp0)) == ESP_OK, "fingerprint");
+    db_tls_hosttest_reset();
+    CHECK(db_tls_load() == ESP_OK && db_tls_ready(), "reboot loads it");
+    CHECK(db_tls_custom_rejected(NULL, 0) && !db_tls_rejection_is_fresh(),
+          "notice reloads, not fresh");
+    CHECK(db_tls_rejected_source() == want_src, "marker round-trips");
+    char fp1[65];
+    CHECK(db_tls_get_fingerprint(fp1, sizeof(fp1)) == ESP_OK &&
+          strcmp(fp0, fp1) == 0, "fingerprint stable across the reboot");
+}
+
+static void test_tls_half_pair_cert_only(void)
+{
+    CASE("half-pair: only the certificate survived (uploaded pair)");
+    tls_half_pair_case("cert", TLS_ALPHA_CERT, 1 /* PROVIDED */,
+                       DB_TLS_PROVIDED, 0x01);
+}
+
+static void test_tls_half_pair_key_only(void)
+{
+    CASE("half-pair: only the key survived (the box's own pair)");
+    tls_half_pair_case("key", TLS_ALPHA_KEY, 0 /* GENERATED */,
+                       DB_TLS_GENERATED, 0x02);
+}
+
+/* ---- 6. the storage black box (db_storage.c) ------------------------------ */
+
+/* Is the breadcrumb record on the fake flash right now? */
+static int breadcrumb_on_flash(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("dbstor", NVS_READONLY, &h) != ESP_OK)
+        return 0;
+    int present = (nvs_find_key(h, "trouble", NULL) == ESP_OK);
+    nvs_close(h);
+    return present;
+}
+
+static void test_storage_bucket_names(void)
+{
+    CASE("uptime bucket names");
+    CHECK(strcmp(db_storage_bucket_name(0), "<1m") == 0, "bucket 0");
+    CHECK(strcmp(db_storage_bucket_name(1), "1-10m") == 0, "bucket 1");
+    CHECK(strcmp(db_storage_bucket_name(2), "10m-1h") == 0, "bucket 2");
+    CHECK(strcmp(db_storage_bucket_name(3), "1-24h") == 0, "bucket 3");
+    CHECK(strcmp(db_storage_bucket_name(4), ">24h") == 0, "bucket 4");
+    CHECK(strcmp(db_storage_bucket_name(99), "?") == 0, "unknown bucket is '?'");
+}
+
+static void test_storage_breadcrumb_round_trip(void)
+{
+    CASE("breadcrumb: persists, survives a reboot, first failure wins");
+    host_nvs_reset();
+    db_storage_hosttest_reset();
+
+    /* Not a storage verdict: no record. Everything else has its own handling
+     * and would only dilute the black box. */
+    db_storage_note_write_failure("graph", ESP_FAIL);
+    db_storage_trouble_t tr;
+    CHECK(!db_storage_get_trouble(&tr), "ESP_FAIL leaves no record");
+    CHECK(!breadcrumb_on_flash(), "and nothing on flash");
+
+    db_storage_note_write_failure("graph", ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    CHECK(db_storage_get_trouble(&tr), "the storage verdict records");
+    CHECK(!tr.prev_boot, "this boot's failure is not prev_boot");
+    CHECK(strcmp(tr.module, "graph") == 0, "module tag kept, got '%s'", tr.module);
+    CHECK(tr.err == ESP_ERR_NVS_NOT_ENOUGH_SPACE, "err kept");
+    CHECK(breadcrumb_on_flash(), "and the record is on flash");
+
+    /* AT MOST ONCE PER BOOT, first failure wins: once the partition is full
+     * every writer fails, and the evidence worth keeping is the first. */
+    db_storage_note_write_failure("config", ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    CHECK(db_storage_get_trouble(&tr) && strcmp(tr.module, "graph") == 0,
+          "a second failure does not displace the first, got '%s'", tr.module);
+
+    /* Reboot: the record comes back FROM FLASH and says so. */
+    db_storage_hosttest_reset();
+    CHECK(!db_storage_get_trouble(&tr), "reset forgot the RAM record");
+    db_storage_init();
+    CHECK(db_storage_get_trouble(&tr), "init reloads the breadcrumb");
+    CHECK(tr.prev_boot, "and marks it as last boot's");
+    CHECK(strcmp(tr.module, "graph") == 0 &&
+          tr.err == ESP_ERR_NVS_NOT_ENOUGH_SPACE,
+          "module and err round-trip the reboot");
+
+    /* The explicit dismissal: RAM and flash both, idempotent, durable. */
+    CHECK(db_storage_clear_trouble() == ESP_OK, "clear accepted");
+    CHECK(!db_storage_get_trouble(&tr), "record gone from RAM");
+    CHECK(!breadcrumb_on_flash(), "and from flash");
+    CHECK(db_storage_clear_trouble() == ESP_OK, "clearing nothing is fine");
+    db_storage_hosttest_reset();
+    db_storage_init();
+    CHECK(!db_storage_get_trouble(&tr), "the dismissal outlives a reboot");
+}
+
+static void test_storage_breadcrumb_erase_first_makes_room(void)
+{
+    CASE("breadcrumb: erasing the previous one is what makes room on a full NVS");
+    host_nvs_reset();
+    db_storage_hosttest_reset();
+
+    /* Boot #1 leaves a breadcrumb; boot #2's partition then fills COMPLETELY. */
+    db_storage_note_write_failure("signals", ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    CHECK(breadcrumb_on_flash(), "boot #1's breadcrumb stored");
+    db_storage_hosttest_reset();
+    db_storage_init();
+    host_nvs_set_capacity(host_nvs_used_entries());   /* zero entries free */
+
+    /* An in-place overwrite needs room for old+new side by side (the fake
+     * models that NVS property faithfully) and would fail here. Erase-first
+     * needs room for one copy — which erasing the old record just freed. */
+    db_storage_note_write_failure("graph", ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    db_storage_trouble_t tr;
+    CHECK(db_storage_get_trouble(&tr) && strcmp(tr.module, "graph") == 0,
+          "the newer failure records");
+    CHECK(breadcrumb_on_flash(), "and still made it to the FULL flash");
+
+    db_storage_hosttest_reset();
+    db_storage_init();
+    CHECK(db_storage_get_trouble(&tr) && tr.prev_boot &&
+          strcmp(tr.module, "graph") == 0,
+          "the reboot reads the newer record back");
+    host_nvs_set_capacity(0);
+}
+
+static void test_storage_breadcrumb_degrades_to_ram(void)
+{
+    CASE("breadcrumb: a partition too full for even it degrades to RAM + event");
+    host_nvs_reset();
+    db_storage_hosttest_reset();
+
+    /* No previous breadcrumb to erase, zero entries free: the tiny write
+     * itself fails. The trouble must still be visible for THIS boot (RAM) and
+     * must not recurse or retry — this call returning at all, with no flash
+     * record, is the property. (Some filler first: a capacity of 0 means
+     * UNLIMITED to the fake, so "full" needs at least one stored item.) */
+    {
+        nvs_handle_t h;
+        uint8_t filler[64] = { 0 };
+        CHECK(nvs_open("dbfill", NVS_READWRITE, &h) == ESP_OK, "open filler ns");
+        CHECK(nvs_set_blob(h, "fill", filler, sizeof(filler)) == ESP_OK, "fill");
+        nvs_close(h);
+    }
+    host_nvs_set_capacity(host_nvs_used_entries());
+    db_storage_note_write_failure("tls", ESP_ERR_NVS_NOT_ENOUGH_SPACE);
+    db_storage_trouble_t tr;
+    CHECK(db_storage_get_trouble(&tr) && strcmp(tr.module, "tls") == 0,
+          "the RAM record stands for this boot");
+    CHECK(!tr.prev_boot, "and is honest about being this boot's");
+    CHECK(!breadcrumb_on_flash(), "nothing could be persisted");
+
+    /* The next "boot" has no evidence — which is exactly the failure mode the
+     * erase-first design minimises, pinned here so it stays a known cost
+     * rather than becoming a surprise. */
+    host_nvs_set_capacity(0);
+    db_storage_hosttest_reset();
+    db_storage_init();
+    CHECK(!db_storage_get_trouble(&tr), "a RAM-only record dies with the boot");
+}
+
+/* ---- 7. the hot path on a FULL partition ---------------------------------- */
+
+/* Test sinks: count calls and prove the TX side can still fetch its waveform
+ * from a full NVS (reads never need free space — pinned, not assumed). */
+static int      s_tx_calls, s_tx_frame_ok;
+static uint16_t s_tx_last_signal;
+static int      s_mqtt_calls;
+
+static void hot_tx_sink(const db_node_t *node, const db_trigger_t *trig, void *ctx)
+{
+    (void)ctx;
+    s_tx_calls++;
+    s_tx_last_signal = trig->signal_id;
+    static rf_frame_t frame;
+    if (db_signals_load_frame(node->signal_id, &frame) == ESP_OK &&
+        frame.count == 50)
+        s_tx_frame_ok++;
+}
+
+static void hot_mqtt_sink(const db_node_t *node, const db_trigger_t *trig, void *ctx)
+{
+    (void)node; (void)trig; (void)ctx;
+    s_mqtt_calls++;
+}
+
+/*
+ * THE DOORBELL MUST RING ON A FULL FLASH. This drives the real chain — the
+ * same functions the capture/dispatch/graph tasks run — against an NVS with
+ * ZERO free entries: match the burst (signal_store), walk the graph
+ * (node_graph, via the DB_HOSTTEST hook that calls the task's own handler),
+ * toggle the control switch, fire the TX sink (which loads its frame from
+ * the full NVS) and the MQTT sink. Everything RAM-first must succeed; the
+ * only thing allowed to degrade is the DURABILITY of the switch position,
+ * whose deferred save fails quietly and leaves a breadcrumb.
+ */
+static void test_hot_path_survives_full_storage(void)
+{
+    CASE("hot path: RX match -> traversal -> TX + switch on zero free NVS");
+    store_fresh();
+    db_storage_hosttest_reset();
+
+    uint16_t sig = 0;
+    CHECK(add_signal("Klingel", 50, &sig) == ESP_OK, "store the signal");
+
+    /* rx --> tx and rx --> mqtt; a switch bound to the same code as its
+     * CONTROL signal (not wired into the chain — control is not traversal). */
+    db_node_t n;
+    uint16_t rx = 0, tx = 0, sw = 0, mq = 0;
+    db_graph_node_defaults(&n, DB_NODE_SIGNAL_RX);
+    n.signal_id = sig;
+    snprintf(n.name, sizeof(n.name), "Taster");
+    CHECK(db_graph_add_node(&n, &rx) == ESP_OK, "add rx");
+    db_graph_node_defaults(&n, DB_NODE_SIGNAL_TX);
+    n.signal_id = sig;
+    snprintf(n.name, sizeof(n.name), "Gong");
+    CHECK(db_graph_add_node(&n, &tx) == ESP_OK, "add tx");
+    db_graph_node_defaults(&n, DB_NODE_LOGIC_SWITCH);
+    n.signal_id = sig;
+    snprintf(n.name, sizeof(n.name), "Alle Glocken");
+    CHECK(db_graph_add_node(&n, &sw) == ESP_OK, "add switch");
+    db_graph_node_defaults(&n, DB_NODE_SINK_MQTT);
+    snprintf(n.topic, sizeof(n.topic), "klingel_test");
+    CHECK(db_graph_add_node(&n, &mq) == ESP_OK, "add mqtt sink");
+    CHECK(db_graph_add_link(rx, tx) == ESP_OK, "wire rx -> tx");
+    CHECK(db_graph_add_link(rx, mq) == ESP_OK, "wire rx -> mqtt");
+
+    db_graph_set_transmit_handler(hot_tx_sink, NULL);
+    db_graph_set_mqtt_handler(hot_mqtt_sink, NULL);
+    s_tx_calls = s_tx_frame_ok = s_mqtt_calls = 0;
+    s_tx_last_signal = 0;
+
+    /* NOW the partition fills to the last entry. Everything below runs
+     * against zero free space. */
+    host_nvs_set_capacity(host_nvs_used_entries());
+
+    /* A burst exactly like the stored signal, analysed the way the capture
+     * path would analyse it. */
+    static rf_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    CHECK(db_signals_load_frame(sig, &ev.frame) == ESP_OK,
+          "waveform loads from the FULL partition (reads need no free space)");
+    rf_normalize(&ev.frame, &ev.norm);
+    rf_decode(&ev.frame, &ev.norm, &ev.decoded);
+    ev.fingerprint = rf_fingerprint(&ev.frame, &ev.norm);
+    ev.repeats  = 3;
+    ev.rssi_dbm = -42;
+    ev.ts_us    = esp_timer_get_time();
+
+    uint16_t matched = db_signals_match(&ev);
+    CHECK(matched == sig, "the burst matches (RAM-only, flash untouched)");
+
+    db_trigger_t trig;
+    memset(&trig, 0, sizeof(trig));
+    trig.signal_id   = matched;
+    trig.fingerprint = ev.fingerprint;
+    trig.rssi_dbm    = (int16_t)ev.rssi_dbm;
+    trig.repeats     = ev.repeats;
+    snprintf(trig.label, sizeof(trig.label), "Klingel");
+
+    CHECK(db_graph_hosttest_on_rf(&trig), "the burst moves the control switch");
+    CHECK(s_tx_calls == 1, "the TX sink fired, got %d", s_tx_calls);
+    CHECK(s_tx_frame_ok == 1, "and could load its frame from the full NVS");
+    CHECK(s_tx_last_signal == sig, "with the cause threaded through");
+    CHECK(s_mqtt_calls == 1, "the MQTT sink fired, got %d", s_mqtt_calls);
+
+    db_node_t copy;
+    CHECK(db_graph_node_copy(sw, &copy) == ESP_OK && !copy.enabled,
+          "switch position changed in RAM (was ON, toggled OFF)");
+
+    /* The deferred save comes due and fails — QUIETLY. The position must
+     * stay what the user set (durability degrades, behaviour does not) and
+     * the failure must leave the black-box breadcrumb naming the graph. */
+    host_time_advance_us(11 * 1000000LL);   /* past the 10 s debounce */
+    db_graph_hosttest_service();
+    CHECK(db_graph_node_copy(sw, &copy) == ESP_OK && !copy.enabled,
+          "a failed save does not move the switch back");
+    db_storage_trouble_t trouble;
+    CHECK(db_storage_get_trouble(&trouble) &&
+          strcmp(trouble.module, "graph") == 0 &&
+          trouble.err == ESP_ERR_NVS_NOT_ENOUGH_SPACE,
+          "the failed flush left the breadcrumb naming the graph");
+
+    /* Both switch-command paths stay usable on the full partition: the API
+     * one and the MQTT inbound one (matched by resolved suffix — the name
+     * slug, since the node has no explicit topic). */
+    CHECK(db_graph_switch_set(sw, true) == ESP_OK,
+          "API toggle still reports success — RAM-first, persistence owed");
+    CHECK(db_graph_node_copy(sw, &copy) == ESP_OK && copy.enabled, "and moved");
+    CHECK(db_graph_switch_set_topic("alle_glocken", false) == 1,
+          "MQTT inbound command still matches its node");
+    CHECK(db_graph_node_copy(sw, &copy) == ESP_OK && !copy.enabled, "and moved");
+
+    /* A second press keeps ringing: the degraded-save state must not wedge
+     * the chain. (750 ms fragment window is long past after the 11 s above.) */
+    ev.ts_us = esp_timer_get_time();
+    CHECK(db_signals_match(&ev) == sig, "second burst still matches");
+    db_graph_hosttest_on_rf(&trig);
+    CHECK(s_tx_calls == 2 && s_tx_frame_ok == 2 && s_mqtt_calls == 2,
+          "second press rings everything again (tx %d, frames %d, mqtt %d)",
+          s_tx_calls, s_tx_frame_ok, s_mqtt_calls);
+
+    /* Space returns: the owed position reaches flash with no further help. */
+    host_nvs_set_capacity(0);
+    host_time_advance_us(130 * 1000000LL);   /* past debounce AND the 2 min gap */
+    db_graph_hosttest_service();
+    uint32_t hdr_probe[3];
+    nvs_handle_t h;
+    CHECK(nvs_open("dbgraph", NVS_READONLY, &h) == ESP_OK, "graph ns exists");
+    size_t len = sizeof(hdr_probe);
+    /* Reading just the header is enough: the full blob was rewritten by the
+     * flush, so a successful partial read proves the write landed. */
+    CHECK(nvs_get_blob(h, "nodes", NULL, &len) == ESP_OK && len > 0,
+          "the recovered flush rewrote the nodes blob");
+    nvs_close(h);
+
+    /* Leave no handler behind for later tests. */
+    db_graph_set_transmit_handler(NULL, NULL);
+    db_graph_set_mqtt_handler(NULL, NULL);
+}
+
 /* ---- main ---------------------------------------------------------------- */
 
 int main(void)
@@ -1780,6 +2152,15 @@ int main(void)
     test_tls_legacy_notice_reads_as_provided();
     test_tls_dismissal_then_second_failure_recreates_notice();
     test_tls_notice_reason_is_structural_when_it_can_be();
+    test_tls_half_pair_cert_only();
+    test_tls_half_pair_key_only();
+
+    test_storage_bucket_names();
+    test_storage_breadcrumb_round_trip();
+    test_storage_breadcrumb_erase_first_makes_room();
+    test_storage_breadcrumb_degrades_to_ram();
+
+    test_hot_path_survives_full_storage();
 
     printf("---------------------\n");
     printf("%d checks passed, %d failed\n", g_pass, g_fail);

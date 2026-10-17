@@ -663,6 +663,18 @@ int db_graph_fire_topic(const char *topic);
  * touched. */
 esp_err_t db_graph_apply_gpio_inputs(void);
 
+#ifdef DB_HOSTTEST
+/* Host tests only (host-test/Makefile defines DB_HOSTTEST): the host binary is
+ * single-threaded and the graph task never runs, so these drive the task's own
+ * code synchronously. on_rf runs exactly what one RF burst does (switch
+ * control + every traversal) and returns whether a switch moved; service runs
+ * one pass of the deferred work (repeat emissions, the debounced switch
+ * save) at the fake clock's current time. They exist so the full-NVS hot-path
+ * proof exercises the REAL traversal, not a re-implementation. */
+bool db_graph_hosttest_on_rf(const db_trigger_t *trig);
+void db_graph_hosttest_service(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

@@ -195,10 +195,47 @@ to be fetchable before any trust exists.
   "wifi_mode": "normal|recovery|connecting",
   "sta_connected": true, "sta_ip": "192.168.1.42", "sta_ssid": "home",
   "ap_ip": "192.168.66.1", "ap_ssid": "Doorbell433",
-  "radio": { "present": true, "partnum": 0, "version": 20 } }
+  "radio": { "present": true, "partnum": 0, "version": 20 },
+  "storage": { "used_entries": 231, "free_entries": 389,
+               "total_entries": 620, "namespaces": 6,
+               "last_trouble": { "module": "graph",
+                                 "err": "ESP_ERR_NVS_NOT_ENOUGH_SPACE",
+                                 "uptime_bucket": "1-24h", "prev_boot": true } } }
 ```
 `wifi_mode == "recovery"` is the signal for the UI to replace the normal page
 with the first-run Wi-Fi wizard.
+
+`storage` (since v0.9.3) is the NVS partition every persistent thing lives on
+— config, signals, graph, TLS identity — in NVS's own 32-byte-entry units.
+The numbers matter because the partition is **small and fixed for the life of
+the box**: fresh flashes get 80 KB but boxes first flashed before the table
+grew keep 24 KB forever (OTA never rewrites a partition table), and a full
+partition is a box that can no longer save anything. The UI shows
+`used/total` on the Diagnostics page with a warning from 80 %. The activity
+feed is **not** in these entries — it is RAM-only by design (see
+`/api/events`).
+
+`storage.last_trouble` is the **black-box record**: present only after some
+module's NVS write actually failed for space
+(`ESP_ERR_NVS_NOT_ENOUGH_SPACE` / `ESP_ERR_NVS_NO_FREE_PAGES`). It is
+persisted as a tiny breadcrumb (written at most once per boot), so unlike the
+event feed it **survives the reboot that "fixes" the box** — the next boot
+both reports it here and pushes a `storage trouble last boot: <module>, <err>`
+event. `module` names the writer (`config`, `signals`, `graph`, `tls`),
+`err` is the stable ESP error name, `uptime_bucket` says how long the box had
+been up when it hit the wall (`<1m`, `1-10m`, `10m-1h`, `1-24h`, `>24h`), and
+`prev_boot` distinguishes a record read back at boot from one made during the
+current run. It stands until a newer failure overwrites it or it is
+explicitly dismissed:
+
+### `DELETE /api/storage/trouble`
+
+→ `{"ok":true}`
+
+Dismisses the storage-trouble record — RAM and the persisted breadcrumb both,
+so the dismissal survives a reboot. Same contract as
+`DELETE /api/tls/rejection`: idempotent, deleting a record that does not
+stand is still a `200`.
 
 `reset_reason` (since v0.9.0) + `uptime_s` together are the no-serial-cable
 crash report: a small uptime with `"panic"` (4), `"int-wdt"` (5),
@@ -1039,6 +1076,13 @@ Newest first. `serial` lets the UI poll cheaply and skip re-rendering.
 `kind`: `rf_unmatched`, `button_press`, `wired_press`, `node_fired`,
 `transmit`, `learn`, `system`. (`learn` is a wire name kept for compatibility;
 it means "a signal was registered".)
+
+The feed is a **RAM-only ring of the 48 most recent events, by design**: a
+doorbell press must never cost a flash write (zero write amplification on the
+NVS partition, however busy the band is), so the feed starts empty after every
+restart. It is a "what just happened?" view, not a history — the durable
+record of *storage* trouble specifically is `storage.last_trouble` in
+`GET /api/system`.
 
 ### MQTT sink payloads carry the trigger
 A `sink.mqtt` publishes what CAUSED it to fire, not merely that it fired:

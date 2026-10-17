@@ -49,7 +49,15 @@
 #                    identity (stable fingerprint across boots) plus a
 #                    persisted notice naming the reason and which kind was
 #                    replaced, which only an upload or an explicit ack
-#                    ends. DB_HOSTTEST
+#                    ends — including the half-pair case (exactly one blob
+#                    survives flash loss), which must raise the same notice
+#                    rather than re-mint silently. Plus the storage black box
+#                    (db_storage.c): the write-failure breadcrumb that must
+#                    survive a reboot, write at most once per boot, and
+#                    degrade to RAM-only on a partition too full to take even
+#                    it — and the hot-path proof that a doorbell press (RX
+#                    match -> traversal -> TX sink, switch toggle included)
+#                    completes on an NVS with ZERO free entries. DB_HOSTTEST
 #                    enables the reset hooks that let one process simulate
 #                    several boots.
 #
@@ -78,6 +86,7 @@ NG_SRCS := test_node_graph.c \
         $(MAIN)/mqtt_topic.c \
         $(MAIN)/node_graph.c \
         $(MAIN)/signal_store.c \
+        $(MAIN)/db_storage.c \
         $(MAIN)/db_tls.c \
         $(MAIN)/pem_scan.c \
         stubs/host_env.c \
@@ -100,7 +109,8 @@ test_rf_decode: $(RF_SRCS) $(RFPULSE)/include/rf_frame.h $(RFPULSE)/include/rf_d
 # and if either grows a NEW framework dependency this build breaks first —
 # which is the moment to decide whether it belongs in the testable core at all.
 test_node_graph: $(NG_SRCS) $(MAIN)/node_migrate.h $(MAIN)/node_graph.h \
-        $(MAIN)/mqtt_topic.h $(MAIN)/signal_store.h $(MAIN)/db_tls.h \
+        $(MAIN)/mqtt_topic.h $(MAIN)/signal_store.h $(MAIN)/db_storage.h \
+        $(MAIN)/db_tls.h \
         $(MAIN)/pem_scan.h stubs/esp_err.h \
         stubs/driver/gpio.h stubs/nvs.h stubs/host_env.h stubs/host_env.c \
         stubs/mbedtls/pk.h stubs/mbedtls/ecp.h stubs/mbedtls/ctr_drbg.h \

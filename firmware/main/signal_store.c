@@ -77,6 +77,7 @@
 #include <time.h>
 
 #include "db_diag.h"
+#include "db_storage.h"  /* breadcrumb when a write hits a full partition */
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -208,8 +209,16 @@ static esp_err_t save_index(void)
         err = nvs_commit(h);
     nvs_close(h);
 
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "index save failed: %s", esp_err_to_name(err));
+        /* An index save failing for SPACE should be unreachable — the flash
+         * budget below refuses adds first — so if it ever happens the budget's
+         * arithmetic is wrong somewhere and the breadcrumb is exactly the
+         * evidence that says so. (The deliberate budget REFUSAL in store() is
+         * NOT reported here: refusing with headroom left is the mechanism
+         * working, not storage trouble.) */
+        db_storage_note_write_failure("signals", err);
+    }
     return err;
 }
 
@@ -306,8 +315,12 @@ static esp_err_t save_frame(uint16_t id, const rf_frame_t *frame)
         err = nvs_commit(h);
     nvs_close(h);
 
-    if (err != ESP_OK)
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "frame save (%s) failed: %s", key, esp_err_to_name(err));
+        /* Same reasoning as save_index(): the budget should have refused the
+         * add before this write ever started. */
+        db_storage_note_write_failure("signals", err);
+    }
     return err;
 }
 

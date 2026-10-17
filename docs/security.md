@@ -158,10 +158,13 @@ originals (you uploaded them), and a blob the box cannot validate is
 worthless anyway. What survives instead is a **persisted notice**, raised
 for *any* replacement of a stored pair that failed validation — a changed
 fingerprint must never be a mystery, whether the dead pair was yours or the
-box's own. (One corner currently escapes that rule: if flash loss takes
-exactly **one** of the two blobs, the load path reads "no pair" and re-mints
-as silently as a fresh box would — a gap by this section's own standard,
-not a choice.) The notice is one event-feed entry at
+box's own. (One corner used to escape that rule: flash loss taking exactly
+**one** of the two blobs read as "no pair", and the box re-minted as silently
+as a fresh one would — a gap this section named as such for several releases.
+It is closed now: a half-present pair counts as a failed load, the surviving
+half is erased, and the same persisted notice is raised, stating that the
+stored pair was incomplete and which kind it was.) The notice is one
+event-feed entry at
 replacement time, and `GET /api/config` → `web.tls` carries
 `custom_rejected: true`, a `rejected_reason` sentence naming the actual
 problem — the same sentence an upload would have been refused with — and
