@@ -62,6 +62,7 @@
 #include "nvs.h"
 #include "pem_scan.h"
 #include "rf_raw_budget.h"
+#include "rf_unit.h"
 #include "signal_store.h"
 
 /* ---- micro test harness (same shape as test_rf_decode.c) ----------------- */
@@ -2392,15 +2393,351 @@ static void test_similarity_matching(void)
           "a second press after the gap rings again");
 }
 
+/* ---- unit matching ----------------------------------------------------------
+ *
+ * The continuously-repeating transmitter (the real Gartentor): a 52-pulse
+ * aperiodic word sent back to back with a 1.5 ms inter-repeat gap, so every
+ * capture is an arbitrary window of the stream and no two presses share a
+ * frame shape. The fixtures mirror host-test/test_rf_decode.c's.
+ */
+#define UNIT_WORD_PULSES 52
+
+/* One pulse per character — runs like "11" yield adjacent equal durations,
+ * which no pair-per-bit decoder reads, matching the undecodable field
+ * transmitter. Aperiodic, so no sub-period can masquerade as the word. */
+static void make_unit_word(rf_frame_t *w)
+{
+    static const char bits[] = "10110011100010110100101110011010001011101100100011";
+
+    rf_frame_reset(w);
+    w->first_level = 1;
+    for (unsigned i = 0; bits[i]; i++) {
+        rf_frame_push(w, bits[i] == '1' ? 900 : 300);
+    }
+    rf_frame_push(w, 300);    /* final high ... */
+    rf_frame_push(w, 1500);   /* ... and the inter-repeat gap */
+}
+
+/* Pulses [from, from+n) of the continuous stream, uniformly drifted the way a
+ * press-to-press oscillator moves. */
+static void make_unit_window(rf_frame_t *dst, const rf_frame_t *w,
+                             uint32_t from, uint16_t n, int drift_pct)
+{
+    rf_frame_reset(dst);
+    dst->first_level = rf_frame_level_at(w, (uint16_t)(from % w->count));
+    for (uint16_t i = 0; i < n; i++) {
+        uint32_t d = w->durations_us[(from + i) % w->count];
+        rf_frame_push(dst, (uint16_t)(d * (uint32_t)(100 + drift_pct) / 100u));
+    }
+}
+
+static void test_unit_matching(void)
+{
+    CASE("unit: continuously-repeating transmitter, learned as its word");
+    store_fresh();
+
+    static rf_frame_t word, win;
+    static rf_unit_t u;
+    static rf_event_t ev;
+    db_match_kind_t kind;
+    make_unit_word(&word);
+
+    /* LEARN: what the save endpoint stores for such a stream — the canonical
+     * word, with the observed repeat structure as metadata. */
+    make_unit_window(&win, &word, 13, 224, 0);
+    CHECK(rf_unit_extract(&win, 25, 120, &u), "the learn window yields a unit");
+    CHECK(u.unit.count == UNIT_WORD_PULSES && u.repeats == 4,
+          "a %u-pulse word, repeated %u times", u.unit.count, u.repeats);
+
+    uint16_t sig = 0;
+    CHECK(db_signals_add_frame_ex(&u.unit, NULL, "Gartentor", DB_ORIGIN_CAPTURED,
+                                  (uint8_t)u.repeats, u.gap_us, &sig) == ESP_OK &&
+          sig != 0, "store the unit");
+    const db_signal_meta_t *m = db_signals_get(sig);
+    CHECK(m && !m->decoded_valid, "the word decodes as nothing — it is raw");
+    CHECK(m && m->pulse_count == UNIT_WORD_PULSES, "pulse_count is the word's");
+    CHECK(m && m->unit_repeats == 4 && m->unit_gap_us == u.gap_us,
+          "repeat structure persisted");
+
+    /* Transmit defaults: the learned stream, not the global config. */
+    {
+        uint8_t r = 0;
+        uint32_t g = 0;
+        db_signals_tx_defaults(sig, 6, 8000, &r, &g);
+        CHECK(r == 4 && g == u.gap_us, "tx defaults are the learned structure");
+        db_signals_tx_defaults(999, 6, 8000, &r, &g);
+        CHECK(r == 6 && g == 8000, "an unknown id falls back to the config");
+    }
+
+    /* LIVE: fresh windows of the stream — different phase, length and drift on
+     * every press, exactly what the field data showed. Each press rings once. */
+    host_time_advance_us(2 * 1000 * 1000);
+    make_unit_window(&win, &word, 31, 257, 4);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig, "a 257-pulse window matches");
+    CHECK(kind == DB_MATCH_SIMILARITY, "...via similarity");
+
+    /* The same press keeps streaming: its next window is absorbed, not rung. */
+    host_time_advance_us(300 * 1000);
+    make_unit_window(&win, &word, 7, 196, 4);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0,
+          "the press's next window is absorbed by the press window");
+
+    /* A later press, including the ceiling-length window the capture layer
+     * now DELIVERS instead of dropping (truncated != dropped). */
+    host_time_advance_us(6 * 1000 * 1000);
+    make_unit_window(&win, &word, 40, RF_FRAME_MAX_PULSES, -3);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig && kind == DB_MATCH_SIMILARITY,
+          "a 512-pulse truncated window matches");
+
+    /* A SHORT reception — less than one word, a clean leading truncation of
+     * the stored unit — still matches through the v0.11.0 prefix stage. */
+    host_time_advance_us(6 * 1000 * 1000);
+    make_unit_window(&win, &word, 0, 46, 2);   /* 46/52 = 88 % >= 85 % */
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig && kind == DB_MATCH_SIMILARITY,
+          "a truncated single word still matches by prefix");
+
+    /* PRESETS. Strict demands two aligned repeats in one window... */
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_STRICT) == ESP_OK, "set strict");
+    host_time_advance_us(6 * 1000 * 1000);
+    make_unit_window(&win, &word, 0, 60, 0);   /* one full repeat only */
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0,
+          "strict refuses a window with a single repeat");
+    host_time_advance_us(6 * 1000 * 1000);
+    make_unit_window(&win, &word, 20, 224, 3);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig,
+          "strict accepts a window with four repeats");
+
+    /* ...normal takes one full unit (the press window absorbs the rest)... */
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_NORMAL) == ESP_OK, "set normal");
+    host_time_advance_us(6 * 1000 * 1000);
+    make_unit_window(&win, &word, 0, 60, 0);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig && kind == DB_MATCH_SIMILARITY,
+          "normal accepts one full unit");
+
+    /* ...drift beyond the normal per-pulse window needs loose (38 % uniform
+     * drift: the 900-class pulses land outside 25 %-of-larger but inside
+     * 30 %-of-larger)... */
+    host_time_advance_us(6 * 1000 * 1000);
+    make_unit_window(&win, &word, 11, 230, 38);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0,
+          "normal refuses a 38%%-drifted stream");
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_LOOSE) == ESP_OK, "set loose");
+    host_time_advance_us(6 * 1000 * 1000);
+    make_unit_window(&win, &word, 11, 230, 38);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig && kind == DB_MATCH_SIMILARITY,
+          "loose accepts what normal refused");
+
+    /* ...and off disables the whole similarity stage, unit included. */
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_OFF) == ESP_OK, "set off");
+    host_time_advance_us(6 * 1000 * 1000);
+    make_unit_window(&win, &word, 31, 257, 0);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0, "off matches no window");
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_NORMAL) == ESP_OK, "back to normal");
+
+    /* FALSE-POSITIVE DISCIPLINE: a different word over the same alphabet,
+     * same gap, same lengths, repeated the same way — synthetic noise streams
+     * must bounce off EVERY preset that matches anything. */
+    {
+        static rf_frame_t foreign, fwin;
+        static const char fbits[] = "11010100011101001011000110110001001110101100011010";
+        rf_frame_reset(&foreign);
+        foreign.first_level = 1;
+        for (unsigned i = 0; fbits[i]; i++) {
+            rf_frame_push(&foreign, fbits[i] == '1' ? 900 : 300);
+        }
+        rf_frame_push(&foreign, 300);
+        rf_frame_push(&foreign, 1500);
+
+        static const db_sig_tolerance_t tols[] = {
+            DB_SIG_TOL_STRICT, DB_SIG_TOL_NORMAL, DB_SIG_TOL_LOOSE
+        };
+        for (unsigned t = 0; t < sizeof(tols) / sizeof(tols[0]); t++) {
+            CHECK(db_signals_set_tolerance(sig, tols[t]) == ESP_OK, "set preset");
+            for (uint32_t off = 0; off < UNIT_WORD_PULSES; off += 9) {
+                host_time_advance_us(6 * 1000 * 1000);
+                make_unit_window(&fwin, &foreign, off, 230, 3);
+                make_event(&ev, &fwin, esp_timer_get_time());
+                CHECK(db_signals_match_ex(&ev, &kind) == 0,
+                      "foreign stream (preset %u, phase %u) must not match",
+                      (unsigned)tols[t], off);
+            }
+        }
+        CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_NORMAL) == ESP_OK,
+              "back to normal");
+    }
+
+    /* And a real press still rings after all of that. */
+    host_time_advance_us(6 * 1000 * 1000);
+    make_unit_window(&win, &word, 19, 243, -4);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig, "the real stream still rings");
+}
+
 /*
- * The v1 -> v2 index migration: a pre-tolerance firmware's index must come
- * forward with every field intact and the new preset at its default, be
+ * The migration/compat promise: the user's EXISTING 224-pulse signal — a
+ * stored window from the pre-unit firmware, full of repeats — derives its
+ * unit at LOAD time, in RAM only, and starts matching fresh windows without
+ * any re-learn. The stored waveform is never rewritten.
+ */
+static void test_unit_derived_at_load(void)
+{
+    CASE("unit: derived at load from a stored pre-unit window");
+    store_fresh();
+
+    static rf_frame_t word, win;
+    static rf_event_t ev;
+    db_match_kind_t kind;
+    make_unit_word(&word);
+
+    /* The pre-unit learn: a raw 224-pulse window stored verbatim, exactly
+     * what db_signals_add_frame() has always done. */
+    make_unit_window(&win, &word, 0, 224, 0);
+    uint16_t sig = 0;
+    CHECK(db_signals_add_frame(&win, NULL, "Gartentor alt", DB_ORIGIN_CAPTURED,
+                               &sig) == ESP_OK && sig != 0, "store the old window");
+    const db_signal_meta_t *m = db_signals_get(sig);
+    CHECK(m && m->pulse_count == 224 && m->unit_repeats == 0,
+          "stored as a plain window, no repeat structure claimed");
+
+    /* A reboot: the unit must come from the LOAD path (cache prefill), not
+     * from any state the add left behind. */
+    store_reboot();
+
+    /* The other field learn of the same transmitter: a 257-pulse window at a
+     * different phase and drift. Only the unit stage can explain a window
+     * LONGER than the stored frame, so a match here proves the derivation. */
+    host_time_advance_us(2 * 1000 * 1000);
+    make_unit_window(&win, &word, 31, 257, 5);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig,
+          "a 257-pulse window matches the stored 224-pulse signal");
+    CHECK(kind == DB_MATCH_SIMILARITY, "...via similarity");
+
+    /* Strict still works through the derived unit: windows of this stream
+     * carry four repeats. */
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_STRICT) == ESP_OK, "set strict");
+    host_time_advance_us(6 * 1000 * 1000);
+    make_unit_window(&win, &word, 17, 240, -3);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig,
+          "strict matches through the derived unit");
+
+    /* The stored waveform was NOT rewritten: deriving is RAM/cache only. */
+    {
+        static rf_frame_t stored;
+        CHECK(db_signals_load_frame(sig, &stored) == ESP_OK, "waveform loads");
+        CHECK(stored.count == 224, "flash still holds the 224-pulse window");
+        const db_signal_meta_t *m2 = db_signals_get(sig);
+        CHECK(m2 && m2->unit_repeats == 0,
+              "no repeat structure was invented into the metadata");
+    }
+
+    /* And the pre-unit signal that contains NO repeats (the aperiodic
+     * gartentor stand-in with its mid-frame silence) derives nothing and
+     * behaves exactly as v0.11.0 — pinned by test_similarity_matching. */
+}
+
+/*
+ * The v2 -> v3 index migration: a v0.11.0 index comes forward with the preset
+ * intact, live stats cleaned, no repeat structure invented, and is written
+ * back in the current layout once.
+ */
+static void test_signal_index_v2_migration(void)
+{
+    CASE("signal index: v2 -> v3 migration");
+    host_nvs_reset();
+    db_signals_hosttest_reset();
+
+    db_signal_meta_v2_t old;
+    memset(&old, 0, sizeof(old));
+    old.id = 3;
+    snprintf(old.name, sizeof(old.name), "Gartentor");
+    old.created_at      = 1758000000;
+    old.fingerprint     = 0xdd39b439u;
+    old.base_us         = 300;
+    old.confidence      = 24;
+    old.pulse_count     = 224;
+    old.match_tolerance = DB_SIG_TOL_LOOSE;   /* the user's choice must survive */
+    old.last_seen_us    = 4242;               /* stale live stats */
+    old.seen_count      = 9;
+    old.similarity_matches = 55;
+
+    unsigned char blob[12 + sizeof(old)];
+    {
+        uint32_t hdr[3] = { 2u, (uint32_t)sizeof(old), 1u };
+        memcpy(blob, hdr, sizeof(hdr));
+        memcpy(blob + 12, &old, sizeof(old));
+    }
+    static rf_frame_t gart;
+    make_gartentor(&gart);
+    unsigned char fblob[4 + 224 * sizeof(uint16_t)];
+    fblob[0] = (unsigned char)(gart.count & 0xFF);
+    fblob[1] = (unsigned char)(gart.count >> 8);
+    fblob[2] = gart.first_level;
+    fblob[3] = 0;
+    memcpy(fblob + 4, gart.durations_us, 224 * sizeof(uint16_t));
+
+    nvs_handle_t h;
+    CHECK(nvs_open("dbsig", NVS_READWRITE, &h) == ESP_OK, "open the namespace");
+    CHECK(nvs_set_blob(h, "index", blob, sizeof(blob)) == ESP_OK, "plant the v2 index");
+    CHECK(nvs_set_blob(h, "f3", fblob, sizeof(fblob)) == ESP_OK, "plant its frame");
+    CHECK(nvs_commit(h) == ESP_OK, "commit the v2 flash");
+    nvs_close(h);
+
+    CHECK(db_signals_init() == ESP_OK, "boot on the v2 flash");
+    CHECK(db_signals_count() == 1, "the signal survived the migration");
+    const db_signal_meta_t *m = db_signals_get(3);
+    CHECK(m != NULL, "id preserved");
+    if (m) {
+        CHECK(strcmp(m->name, "Gartentor") == 0 && m->fingerprint == 0xdd39b439u,
+              "identity preserved");
+        CHECK(m->pulse_count == 224 && m->base_us == 300 && m->confidence == 24,
+              "analysis fields preserved");
+        CHECK(m->match_tolerance == DB_SIG_TOL_LOOSE, "the chosen preset survives");
+        CHECK(m->seen_count == 0 && m->last_seen_us == 0 &&
+              m->similarity_matches == 0, "live stats come up clean");
+        CHECK(m->unit_repeats == 0 && m->unit_gap_us == 0,
+              "no repeat structure is invented");
+    }
+
+    /* Written back as v3, so the migration is a one-off. */
+    {
+        unsigned char back[12 + sizeof(db_signal_meta_t)];
+        size_t len = sizeof(back);
+        uint32_t ver = 0, msz = 0;
+        CHECK(nvs_open("dbsig", NVS_READONLY, &h) == ESP_OK, "re-open");
+        CHECK(nvs_get_blob(h, "index", back, &len) == ESP_OK, "index readable");
+        nvs_close(h);
+        memcpy(&ver, back, 4);
+        memcpy(&msz, back + 4, 4);
+        CHECK(ver == 3u && msz == sizeof(db_signal_meta_t),
+              "index rewritten as v3 (got v%u/%u)", (unsigned)ver, (unsigned)msz);
+    }
+    store_reboot();
+    m = db_signals_get(3);
+    CHECK(m && m->pulse_count == 224 && m->match_tolerance == DB_SIG_TOL_LOOSE,
+          "v3 index round-trips a reboot");
+}
+
+/*
+ * The v1 -> v3 index migration: a pre-tolerance firmware's index must come
+ * forward with every field intact and the new fields at their defaults, be
  * written back in the current layout exactly once, and a FUTURE index must
  * still be ignored-but-preserved (the rollback rule).
  */
 static void test_signal_index_v1_migration(void)
 {
-    CASE("signal index: v1 -> v2 migration");
+    CASE("signal index: v1 -> v3 migration");
     host_nvs_reset();
     db_signals_hosttest_reset();
 
@@ -2461,6 +2798,8 @@ static void test_signal_index_v1_migration(void)
         CHECK(m->seen_count == 0 && m->last_seen_us == 0 &&
               m->similarity_matches == 0,
               "live stats come up clean, stale persisted values discarded");
+        CHECK(m->unit_repeats == 0 && m->unit_gap_us == 0,
+              "no repeat structure is invented for a pre-unit signal");
     }
 
     /* The write-back: flash now holds the CURRENT layout, so the next boot
@@ -2474,16 +2813,16 @@ static void test_signal_index_v1_migration(void)
         nvs_close(h);
         memcpy(&ver, back, 4);
         memcpy(&msz, back + 4, 4);
-        CHECK(ver == 2u && msz == sizeof(db_signal_meta_t),
-              "index rewritten as v2 (got v%u/%u)", (unsigned)ver, (unsigned)msz);
+        CHECK(ver == 3u && msz == sizeof(db_signal_meta_t),
+              "index rewritten as v3 (got v%u/%u)", (unsigned)ver, (unsigned)msz);
     }
 
-    /* The round trip: a reboot reads the v2 index directly, and a changed
+    /* The round trip: a reboot reads the v3 index directly, and a changed
      * preset survives the next one. */
     store_reboot();
     m = db_signals_get(7);
     CHECK(m && m->pulse_count == 224 && m->match_tolerance == DB_SIG_TOL_NORMAL,
-          "v2 index round-trips a reboot");
+          "v3 index round-trips a reboot");
     CHECK(db_signals_set_tolerance(7, DB_SIG_TOL_LOOSE) == ESP_OK, "set loose");
     store_reboot();
     m = db_signals_get(7);
@@ -2494,10 +2833,10 @@ static void test_signal_index_v1_migration(void)
      * the firmware that wrote it must find its signals intact after a
      * rollback. */
     {
-        uint32_t hdr[3] = { 3u, (uint32_t)sizeof(old), 1u };
+        uint32_t hdr[3] = { 4u, (uint32_t)sizeof(old), 1u };
         memcpy(blob, hdr, sizeof(hdr));
-        CHECK(nvs_open("dbsig", NVS_READWRITE, &h) == ESP_OK, "open for the v3 plant");
-        CHECK(nvs_set_blob(h, "index", blob, sizeof(blob)) == ESP_OK, "plant a v3 index");
+        CHECK(nvs_open("dbsig", NVS_READWRITE, &h) == ESP_OK, "open for the v4 plant");
+        CHECK(nvs_set_blob(h, "index", blob, sizeof(blob)) == ESP_OK, "plant a v4 index");
         CHECK(nvs_commit(h) == ESP_OK, "commit it");
         nvs_close(h);
     }
@@ -2700,6 +3039,9 @@ int main(void)
 
     test_fragment_suppressor_never_latches();
     test_similarity_matching();
+    test_unit_matching();
+    test_unit_derived_at_load();
+    test_signal_index_v2_migration();
     test_signal_index_v1_migration();
     test_hot_path_survives_full_storage();
 

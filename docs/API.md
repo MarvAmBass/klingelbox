@@ -268,7 +268,7 @@ dead page. `name` is the stable machine name; `help` is the human sentence.
 ```json
 { "states": [ { "name": "CC1101_OK", "help": "The CC1101 responded...",
                 "count": 1, "last_us": 115000, "detail": "PARTNUM=0x00 VERSION=0x14" } ],
-  "capture": { "frames": 12, "dropped_short": 3, "dropped_full": 0, "overruns": 0 } }
+  "capture": { "frames": 12, "dropped_short": 3, "truncated": 0, "overruns": 0 } }
 ```
 
 ---
@@ -288,31 +288,49 @@ A signal is a stored waveform. A "button" is a signal referenced by a source nod
 ```
 `decoded` is `null` for an unknown protocol — a normal, fully supported state.
 
-A **raw** signal (`decoded: null`) carries two additional fields:
+A **raw** signal (`decoded: null`) carries additional fields:
 
 ```json
 { "...": "...", "decoded": null,
-  "match_tolerance": "normal", "similarity_matches": 3 }
+  "match_tolerance": "normal", "similarity_matches": 3,
+  "unit_pulses": 52, "unit_repeats": 4, "unit_gap_us": 1500 }
 ```
+
+The three `unit_*` fields are present only on a signal learned from a
+**continuously-repeating transmitter** (see the save endpoint): its stored
+waveform is the repeating *word*, `unit_pulses` is that word's length (always
+equal to `pulse_count`), `unit_repeats` how many copies the learn capture
+observed, and `unit_gap_us` the measured inter-repeat silence (also the stored
+waveform's own trailing low pulse). Transmit uses them as this signal's
+defaults, so a replay reproduces the stream the transmitter actually sends.
 
 `match_tolerance` controls the **similarity matching** a raw signal gets on
 top of its exact fingerprint: some transmitters (long patterns with mid-frame
 silences) fragment differently on every reception, so a live press arrives as
 a truncation or as several pieces and the exact fingerprint never matches.
 The box therefore also compares unmatched receptions against the stored
-waveform pulse by pulse — accepting a clean leading truncation, and
-reassembling pieces that arrive within one press's join window — and how
-loosely is this preset:
+waveform pulse by pulse — accepting a clean leading truncation, reassembling
+pieces that arrive within one press's join window, and, for a signal whose
+waveform is a repeating unit (learned as one, or derived in RAM from a stored
+window that itself contains ≥ 2 repeats), **sliding the unit over the
+incoming recording at any alignment** — a continuous repeater's recordings
+are arbitrary windows of its stream, so the word is matched wherever it
+starts. How loosely all of that compares is this preset:
 
-| preset | accepts | false-ring risk |
-|---|---|---|
-| `off` | exact fingerprint only (the previous behaviour) | none |
-| `strict` | near-exact receptions only (≥ 95 % of the stored pulses) | minimal |
-| `normal` | truncation and fragment reassembly down to 85 % (default) | low |
-| `loose` | heavy fragmentation down to 75 % and wider timing drift | **watch the Activity feed** |
+| preset | accepts (window vs stored) | accepts (repeating unit) | false-ring risk |
+|---|---|---|---|
+| `off` | exact fingerprint only (the previous behaviour) | — | none |
+| `strict` | near-exact receptions only (≥ 95 % of the stored pulses) | ≥ 2 aligned repeats in one recording | minimal |
+| `normal` | truncation and fragment reassembly down to 85 % (default) | ≥ 1 full unit (the press window absorbs the rest) | low |
+| `loose` | heavy fragmentation down to 75 % and wider timing drift | ≥ 1 full unit at the wider per-pulse window | **watch the Activity feed** |
 
-Decoded signals carry neither field: they match by protocol identity, which
-is never loosened. A press matched via similarity is labeled
+A unit match additionally requires the *entire* incoming recording to agree
+with the unit cyclically, pulse by pulse — one foreign pulse refuses the whole
+window — so the repeat minimum is evidence on top of agreement, never instead
+of it.
+
+Decoded signals carry none of these fields: they match by protocol identity,
+which is never loosened. A press matched via similarity is labeled
 `"<name> (similarity)"` in the event feed and counted in
 `similarity_matches` (a live counter next to `seen_count`, reset at boot), so
 a loosened preset can be audited before it is trusted.
@@ -329,6 +347,13 @@ decoded signal (it only applies to raw ones).
 ### `POST /api/signals/{id}/transmit` — `{"repeats":6,"gap_us":8000}` (both optional)
 **503** if no radio is present. Response `{"ok":true}` means *software-level*
 success only — it does not assert that any receiver reacted.
+
+An omitted field defaults to **the signal's own learned repeat structure**
+when it has one (`unit_repeats` copies, `unit_gap_us` between them — the
+stream its transmitter was observed to send), otherwise to the global
+`tx_repeats`/`tx_gap_us` from the config. The same rule applies to a
+`signal.tx` node whose `repeats`/`gap_us` are unset, and to an MQTT press
+command without a JSON body.
 
 `gap_us` is a **minimum** idle between copies, not an addition. If the frame's
 own last pulse is idle (carrier off) it already supplies part of that idle and
@@ -377,6 +402,8 @@ restore (see [Backup bundles](#backup-bundles) below).
 | `durations_us` | yes | 1..512 pulse widths, each 1..65535 µs, strictly alternating levels |
 | `first_level` | no | level of `durations_us[0]`; 0 or 1, default 0 |
 | `origin` | no | `captured` / `synthesized` / `imported`; anything else, or absent, becomes `imported` |
+| `unit_repeats` | no | repeat structure of a unit signal (see Signals above), so an exported one round-trips; 0/absent means an ordinary signal |
+| `unit_gap_us` | no | the inter-repeat gap that goes with `unit_repeats`; ignored without it |
 
 Returns the created signal, in exactly the shape `GET /api/signals/{id}` reports
 it (without the waveform).
@@ -570,8 +597,9 @@ nothing is allocated and capture is left exactly as it was.
   "stop_reason": "",
   "settings": { "seconds": 30, "idle_us": 8000, "min_pulses": 4,
                 "rssi_floor_dbm": -80, "squelch_off": false },
-  "dropped": { "below_floor": 118, "too_short": 39, "too_long": 0,
+  "dropped": { "below_floor": 118, "too_short": 39,
                "overruns": 0, "no_room": 0 },
+  "truncated": 0,
   "radio": { "heard": 2, "carrier_seen": true, "peak_rssi_dbm": -41,
              "quiet_rssi_dbm": -85, "present": true },
   "fragmentation": { "detected": true, "runs": 3, "frames": 6, "rejoined": 1,
@@ -580,7 +608,7 @@ nothing is allocated and capture is left exactly as it was.
   "candidates": [ { "id": 1, "seen": 3, "merged": false, "pulse_count": 49,
                     "airtime_us": 24310, "base_us": 292, "confidence": 88,
                     "rssi_dbm": -41, "score": 3714, "age_s": 1.2,
-                    "truncated": false, "frames": [1,3,5],
+                    "truncated": false, "frames": [1,3,5], "unit": null,
                     "why": "seen 3 times, decoded ev1527, 88% confidence",
                     "decoded": { "protocol":"ev1527", "id":681562, "button":8,
                                  "text":"EV1527 id=0xA685A btn=0x8" } } ],
@@ -599,9 +627,13 @@ nothing is allocated and capture is left exactly as it was.
 **The `dropped` object is the diagnostic**, and it is split by cause on purpose:
 "nothing was received" and "something was received but did not fit our
 assumptions" are completely different faults and only the second one is fixable
-by trimming. `too_long` counts frames that hit the 512-pulse ceiling and were
-therefore thrown away whole — a truncated recording would replay as a different
-waveform. `radio.carrier_seen` plus `peak_rssi_dbm` answer "did the radio see
+by trimming. The top-level `truncated` counter is deliberately **not** in
+`dropped`: frames that hit the 512-pulse ceiling are now **kept** with their
+tail cut off (each appears in `frames` with `truncated: true`), because a
+transmitter that repeats its code continuously produces almost nothing else
+and the repeating word inside such a window is fully learnable. (Before
+v0.11.0+units these frames were discarded as `dropped.too_long`.)
+`radio.carrier_seen` plus `peak_rssi_dbm` answer "did the radio see
 *any* energy", which is what separates a wrong frequency or a missing antenna
 from a wrong threshold. `peak_rssi_dbm`/`quiet_rssi_dbm` are `null` until the
 band has been sampled at least once.
@@ -637,6 +669,7 @@ still listed and still fully usable.
 | `score` | the ranking number. Exposed for debugging; `why` is what to show a human. |
 | `why` | e.g. `"seen 5 times, decoded ev1527, 92% confidence"` |
 | `decoded` | `null` for an unknown protocol, which is an ordinary supported state |
+| `unit` | `null`, or `{"pulse_count","repeats","gap_us"}` when the candidate's waveform is one word repeating continuously — saving such a candidate stores the **word** (see the save endpoint) |
 
 The weights guarantee that **one extra repeat outranks every decode and
 confidence bonus combined**, so a candidate no decoder understands legitimately
@@ -700,6 +733,22 @@ re-analyses it exactly as it would any registration, so a trim that turns out to
 be a known protocol acquires its decoded identity at this point. **400** without
 a name, **404** for an unknown frame or an empty selection, **409** when the
 signal store is full.
+
+**The repeating-unit case.** If the selection is *undecodable* and one word
+repeats inside it (≥ 2 full repeats explaining ≥ 80 % of it), what gets
+stored is the canonical **word** — each pulse the median of its occurrences
+across all repeats, so the stored waveform is cleaner than any single capture
+— with the observed repeat count and inter-repeat gap kept as the signal's
+transmit defaults. A selection without internal repetition is stored verbatim
+exactly as before. The response says which happened:
+
+```json
+{ "...the GET /api/signals shape...",
+  "unit_pulses": 52, "unit_repeats": 4, "unit_gap_us": 1500,
+  "learned_unit": true, "learned_from_pulses": 224 }
+```
+
+`learned_unit: false` (and no `learned_from_pulses`) on an ordinary save.
 
 ---
 

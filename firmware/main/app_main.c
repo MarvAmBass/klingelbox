@@ -130,10 +130,19 @@ static void transmit_sink(const db_node_t *node, const db_trigger_t *trig, void 
     (void)ctx;
     if (!node->signal_id)
         return;
+    /* The fallback for an unset node value is the SIGNAL's own default, not
+     * the global one: a signal learned from a continuously-repeating
+     * transmitter carries the repeat count and gap its receiver expects
+     * (db_signals_tx_defaults), and a node that never set either should send
+     * what actually rings. An explicit node value still wins. */
+    uint8_t  def_repeats;
+    uint32_t def_gap_us;
+    db_signals_tx_defaults(node->signal_id, s_cfg.tx_repeats, s_cfg.tx_gap_us,
+                           &def_repeats, &def_gap_us);
     tx_req_t req = {
         .signal_id = node->signal_id,
-        .repeats   = node->repeats ? node->repeats : s_cfg.tx_repeats,
-        .gap_us    = node->gap_us ? node->gap_us : s_cfg.tx_gap_us,
+        .repeats   = node->repeats ? node->repeats : def_repeats,
+        .gap_us    = node->gap_us ? node->gap_us : def_gap_us,
         .node_id   = node->id,
     };
     if (xQueueSend(s_tx_q, &req, 0) != pdTRUE)

@@ -1602,6 +1602,12 @@ function signalBlock(sig, opts) {
   kvAdd(t("Fingerprint"), sig.fingerprint);
   kvAdd(t("Base pulse"), typeof sig.base_us === "number" ? sig.base_us + " us" : null);
   kvAdd(t("Pulses"), sig.pulse_count);
+  /* A signal learned from a continuously-repeating transmitter: its stored
+     waveform is the WORD, and transmit defaults to the observed stream. */
+  kvAdd(t("Repeating word"), (typeof sig.unit_repeats === "number" && sig.unit_repeats > 0)
+    ? t("{k}× with a {gap} µs gap (as learned)",
+        { k: sig.unit_repeats, gap: numOr(sig.unit_gap_us, 0) })
+    : null);
   kvAdd("RSSI", typeof sig.rssi_dbm === "number" ? sig.rssi_dbm + " dBm" : null);
   kvAdd(t("Seen"), typeof sig.seen_count === "number" ? t("{count} times", { count: sig.seen_count }) : null);
   /* Only when the fuzzier mechanism has actually fired: a zero row would read
@@ -1704,7 +1710,9 @@ function signalBlock(sig, opts) {
           device: { hostname: sysm.hostname || "", version: sysm.version || "", idf: sysm.idf || "" },
           signals: [{
             id: full.id, name: full.name, origin: full.origin,
-            first_level: full.first_level, durations_us: full.durations_us || []
+            first_level: full.first_level, durations_us: full.durations_us || [],
+            unit_repeats: numOr(full.unit_repeats, 0),
+            unit_gap_us: numOr(full.unit_gap_us, 0)
           }],
           graph: { nodes: [], links: [] }
         };
@@ -2141,7 +2149,7 @@ function rawVerdict(st) {
   var set = (st && st.settings) || {};
   var heard = numOr(r.heard, 0);
   var floor = numOr(d.below_floor, 0);
-  var tooLong = numOr(d.too_long, 0);
+  var truncated = numOr(st && st.truncated, 0);
   var tooShort = numOr(d.too_short, 0);
   var count = numOr(st && st.count, 0);
   var cands = (st && st.candidates) || [];
@@ -2221,18 +2229,21 @@ function rawVerdict(st) {
             ? t(" (the band peaked at {dbm} dBm)", { dbm: r.peak_rssi_dbm }) : "" })
     };
   }
-  if (tooLong > 0) {
+  if (truncated > 0) {
+    /* Reachable only when every truncated frame was then lost to another
+       filter (the floor, usually): the frames themselves are KEPT now, so
+       with any of them recorded the count>0 verdicts above already spoke. */
     return {
       kind: "warn",
-      text: t(tooLong === 1
-        ? "{n} frame was longer than the 512-pulse limit and were discarded before they "
-          + "reached us — a truncated recording would replay as a different waveform. "
-          + "Lower the frame boundary so each transmission ends sooner instead of "
-          + "running into the next one."
-        : "{n} frames were longer than the 512-pulse limit and were discarded before they "
-          + "reached us — a truncated recording would replay as a different waveform. "
-          + "Lower the frame boundary so each transmission ends sooner instead of "
-          + "running into the next one.", { n: tooLong })
+      text: t(truncated === 1
+        ? "{n} frame hit the 512-pulse limit and was kept with its tail cut off. "
+          + "A transmitter that repeats its code continuously looks exactly like "
+          + "this — the box finds the repeating word inside such a recording, so "
+          + "the candidates are still usable."
+        : "{n} frames hit the 512-pulse limit and were kept with their tails cut off. "
+          + "A transmitter that repeats its code continuously looks exactly like "
+          + "this — the box finds the repeating word inside such recordings, so "
+          + "the candidates are still usable.", { n: truncated })
     };
   }
   if (tooShort > 0) {
@@ -2573,6 +2584,12 @@ function openListenFlow(opts) {
         if (c.merged && c.frames && c.frames.length) {
           det += t(" · rejoined from frames {list}", { list: c.frames.join(" + ") });
         }
+        /* The repeat-structure verdict, up front: saving such a candidate
+           stores the WORD, and the user should know before pressing save. */
+        if (c.unit && c.unit.repeats >= 2) {
+          det += t(" · repeats a {n}-pulse word {k}×",
+                   { n: c.unit.pulse_count, k: c.unit.repeats });
+        }
         if (c.truncated) det += t(" · TRUNCATED at the 512-pulse limit");
         add(main, el("div", "li-sub", det));
         add(b, main);
@@ -2723,6 +2740,10 @@ function openWaveform(kind, id, onSaved) {
       add(chips, el("span", "chip ok", t("seen {n}×", { n: f.seen })));
     }
     if (f.merged) add(chips, el("span", "chip accent", t("🧩 rejoined from {n} pieces", { n: (f.frames || []).length })));
+    if (f.unit && f.unit.repeats >= 2) {
+      add(chips, el("span", "chip accent", t("🔁 {n}-pulse word × {k}",
+        { n: f.unit.pulse_count, k: f.unit.repeats })));
+    }
     if (f.decoded && f.decoded.text) add(chips, el("span", "chip accent mono", f.decoded.text));
     else add(chips, el("span", "chip warn", t("Unknown protocol — raw pulses only")));
     add(chips, el("span", "chip mono", numOr(f.rssi_dbm, 0) + " dBm"));
@@ -2837,6 +2858,15 @@ function openWaveform(kind, id, onSaved) {
     add(sh.body, el("div", "hint",
       t("Saves the SELECTION as an ordinary stored signal: it can then be bound to a node, "
       + "renamed, transmitted and matched against like any other — decoded or not.")));
+    if (f.unit && f.unit.repeats >= 2) {
+      add(sh.body, el("div", "note",
+        t("This transmitter repeats a {n}-pulse word continuously — this recording is {k} "
+        + "copies of it in a row, cut wherever the recording happened to start and end. "
+        + "Saving stores the WORD itself (averaged over all {k} copies), so matching and "
+        + "replay lock onto what the transmitter actually sends instead of onto one "
+        + "arbitrary window of it.",
+        { n: f.unit.pulse_count, k: f.unit.repeats })));
+    }
     var nameIn = inputEl("text", "", { maxlength: "31", placeholder: t("e.g. Front door") });
     add(sh.body, field(t("Name"), nameIn));
     var smsg = el("div", "formmsg");
@@ -2850,9 +2880,16 @@ function openWaveform(kind, id, onSaved) {
       setMsg(smsg, t("Saving…"));
       postJSON(base + id + "/save", { name: nm, from: from, to: to })
         .then(function (sig) {
-          setMsg(smsg, t("Saved as “{name}”.", { name: sig.name }), "ok");
+          if (sig.learned_unit) {
+            setMsg(smsg, t("Saved as “{name}”: this transmitter repeats a {n}-pulse word "
+              + "continuously, so the word itself was learned ({k} repeats observed).",
+              { name: sig.name, n: sig.unit_pulses || sig.pulse_count,
+                k: sig.unit_repeats || 0 }), "ok");
+          } else {
+            setMsg(smsg, t("Saved as “{name}”.", { name: sig.name }), "ok");
+          }
           if (onSaved) onSaved(sig);
-          setTimeout(function () { sh.close(); }, 700);
+          setTimeout(function () { sh.close(); }, sig.learned_unit ? 2600 : 700);
         }).catch(function (e) {
           saveBtn.disabled = false;
           setMsg(smsg, e.message, "err");
@@ -7048,6 +7085,10 @@ function openImportSignal() {
       name: trimOf(nameIn) || pending.name || t("Imported signal"),
       first_level: numOr(pending.first_level, 0),
       durations_us: pending.durations_us,
+      /* Repeat structure rides along so a unit signal survives the round
+         trip — without it, long live recordings would stop matching it. */
+      unit_repeats: numOr(pending.unit_repeats, 0),
+      unit_gap_us: numOr(pending.unit_gap_us, 0),
       origin: "imported"
     }).then(function (created) {
       loadSignals();
@@ -7151,7 +7192,12 @@ function buildBundle(onStep) {
           name: sig.name,
           origin: sig.origin,
           first_level: numOr(sig.first_level, 0),
-          durations_us: sig.durations_us || []
+          durations_us: sig.durations_us || [],
+          /* Repeat structure (unit signals): without it a restore would keep
+             the word but forget that it repeats, and live matching of long
+             recordings would silently degrade. 0 = ordinary signal. */
+          unit_repeats: numOr(sig.unit_repeats, 0),
+          unit_gap_us: numOr(sig.unit_gap_us, 0)
         });
         tick(t("Read “{name}”…", { name: signalLabel(meta) }));
       });
@@ -7302,6 +7348,8 @@ function runImport(bundle, mode, withRadio, onStep, onLog) {
         name: label,
         first_level: numOr(s.first_level, 0),
         durations_us: pulses,
+        unit_repeats: numOr(s.unit_repeats, 0),
+        unit_gap_us: numOr(s.unit_gap_us, 0),
         origin: s.origin || "imported"
       }).then(function (created) {
         if (s.id) sigMap[s.id] = created.id;
@@ -7681,7 +7729,7 @@ var DIAG_META = {
 var CAPTURE_HELP = {
   frames: "Complete raw frames handed to the decoders since boot.",
   dropped_short: "Bursts thrown away for being too short to be a real frame. A steadily rising number on a quiet band is normal -- that is the noise filter working.",
-  dropped_full: "Frames lost because the capture queue was full. Anything other than zero means the box could not keep up.",
+  truncated: "Frames that hit the 512-pulse ceiling and were kept with their tail cut off. A transmitter that repeats its code continuously produces these constantly — that is normal, and the repeating word inside them still matches.",
   overruns: "Hardware capture overruns. Should stay at zero; a rising count points at interrupt starvation."
 };
 
@@ -7963,7 +8011,7 @@ function renderDiagnostics(err) {
   /* counters */
   var c = clear(diagEls.counters);
   var cap = S.diag.capture || {};
-  ["frames", "dropped_short", "dropped_full", "overruns"].forEach(function (k) {
+  ["frames", "dropped_short", "truncated", "overruns"].forEach(function (k) {
     var box = el("div", "counter");
     add(box, el("div", "c-num", String(numOr(cap[k], 0))));
     add(box, el("div", "c-lbl", k.replace(/_/g, " ")));

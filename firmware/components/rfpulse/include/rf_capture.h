@@ -79,7 +79,10 @@ esp_err_t rf_capture_receive(rf_frame_t *out, TickType_t wait);
 typedef struct {
     uint32_t frames;          /* delivered to the consumer */
     uint32_t dropped_short;   /* below min_pulses (noise) */
-    uint32_t dropped_full;    /* hit RF_FRAME_MAX_PULSES, truncated */
+    uint32_t truncated;       /* hit RF_FRAME_MAX_PULSES; DELIVERED anyway with
+                                 the tail cut off (count == the ceiling marks
+                                 it), and also counted in `frames` — truncated
+                                 is a condition, not a drop */
     uint32_t overruns;        /* consumer too slow; frame discarded */
 } rf_capture_stats_t;
 

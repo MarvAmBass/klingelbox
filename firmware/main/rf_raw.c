@@ -14,7 +14,7 @@
  * 2. THE CAPTURE LAYER'S COUNTERS RESET UNDERNEATH US. rf_capture_init()
  *    memsets its whole state, and the channel is torn down and re-created on
  *    every transmit (GDO0 cannot be bound by RX and TX at once). A session that
- *    replayed a frame halfway through would therefore see dropped_full go
+ *    replayed a frame halfway through would therefore see `truncated` go
  *    backwards. note_capture_stats() accumulates across those resets instead of
  *    assigning, which is the only way these numbers stay honest.
  *
@@ -53,6 +53,7 @@
 #include <string.h>
 
 #include "rf_raw_budget.h"
+#include "rf_unit.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -95,6 +96,9 @@ typedef struct {
     /* Where a merged candidate is stitched together, so neither an httpd
      * worker's stack nor a second permanent kilobyte has to carry it. */
     rf_frame_t         joined;
+    /* Scratch for repeating-unit detection over each candidate (rf_unit.h) —
+     * session-owned like everything here, so an idle box pays nothing. */
+    rf_unit_t          unit;
     /* The frame count the analysis was built from. A session only ever appends,
      * so "unchanged" is a sufficient cache key and needs no dirty flag. */
     uint16_t           built_for;
@@ -362,9 +366,9 @@ void db_raw_stop(const char *reason)
         s.stop_reason = reason ? reason
                                : (s.count >= DB_RAW_MAX_FRAMES ? "full" : "time");
         ESP_LOGI(TAG, "session stopped (%s): %u frames, %" PRIu32 " below floor, "
-                      "%" PRIu32 " too long, %" PRIu32 " too short",
+                      "%" PRIu32 " truncated (kept), %" PRIu32 " too short",
                  s.stop_reason, (unsigned)s.count, s.dropped_floor,
-                 s.acc.dropped_full + s.last.dropped_full,
+                 s.acc.truncated + s.last.truncated,
                  s.acc.dropped_short + s.last.dropped_short);
     }
     unlock();
@@ -534,7 +538,7 @@ void db_raw_note_capture_stats(const rf_capture_stats_t *st)
     if (s.running) {
         accumulate(&s.acc.frames,        &s.last.frames,        st->frames);
         accumulate(&s.acc.dropped_short, &s.last.dropped_short, st->dropped_short);
-        accumulate(&s.acc.dropped_full,  &s.last.dropped_full,  st->dropped_full);
+        accumulate(&s.acc.truncated,     &s.last.truncated,     st->truncated);
         accumulate(&s.acc.overruns,      &s.last.overruns,      st->overruns);
     }
     unlock();
@@ -549,6 +553,22 @@ void db_raw_note_capture_stats(const rf_capture_stats_t *st)
 
 /* Defined with the other readers below; needed here too. Caller holds the lock. */
 static const db_raw_slot_t *find(uint16_t index);
+
+/* Annotate one candidate with its repeat structure, if its waveform is a word
+ * repeating continuously. A decoded candidate is a complete protocol word by
+ * construction and is never offered to the detector. Caller holds the lock. */
+static void cand_unit_fill(db_raw_candidate_t *c, const rf_frame_t *f)
+{
+    if (c->decoded_valid || f == NULL || s_an == NULL) {
+        return;
+    }
+    if (!rf_unit_extract(f, DB_RAW_UNIT_TOL_PCT, DB_RAW_UNIT_TOL_US, &s_an->unit)) {
+        return;
+    }
+    c->unit_pulses  = s_an->unit.unit.count;
+    c->unit_repeats = s_an->unit.repeats;
+    c->unit_gap_us  = s_an->unit.gap_us;
+}
 
 /* Caller holds the lock. Fills the candidate table from the current slots. */
 static void build_analysis(void)
@@ -616,6 +636,7 @@ static void build_analysis(void)
             c->decoded_id     = sum->decoded_id;
             c->decoded_button = sum->decoded_button;
         }
+        cand_unit_fill(c, rep->frame);
     }
 
     /* --- transmissions the frame boundary cut into pieces --- */
@@ -704,6 +725,14 @@ static void build_analysis(void)
             memcpy(c->text, bs->text, sizeof(c->text));
             c->decoded_id     = bs->decoded_id;
             c->decoded_button = bs->decoded_button;
+        }
+
+        /* A rejoined whole is the shape a continuously-repeating transmitter
+         * produces when a chance gap splits one of its windows, so it gets
+         * the same repeat-structure annotation as a plain candidate — on the
+         * stitched waveform, which is what saving would store. */
+        if (!c->decoded_valid && rf_frame_join_run(&s_an->joined, s_an->obs, run)) {
+            cand_unit_fill(c, &s_an->joined);
         }
 
         /* Scored on the same scale as an ordinary group, so the two kinds sort
@@ -902,7 +931,7 @@ void db_raw_get_state(db_raw_state_t *out)
     out->dropped_floor    = s.dropped_floor;
     out->dropped_capacity = s.dropped_capacity;
     out->dropped_short    = s.acc.dropped_short + s.last.dropped_short;
-    out->dropped_full     = s.acc.dropped_full  + s.last.dropped_full;
+    out->truncated        = s.acc.truncated     + s.last.truncated;
     out->overruns         = s.acc.overruns      + s.last.overruns;
     out->heard            = s.acc.frames        + s.last.frames;
 

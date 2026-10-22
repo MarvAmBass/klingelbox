@@ -141,6 +141,7 @@
 #include "rf_frame.h"
 #include "rf_raw.h"
 #include "rf_service.h"
+#include "rf_unit.h"
 #include "signal_store.h"
 #include "update_check.h"
 #include "wifi_mgr.h"
@@ -757,7 +758,9 @@ static esp_err_t api_diagnostics(httpd_req_t *req)
     cJSON *cap = cJSON_AddObjectToObject(root, "capture");
     cJSON_AddNumberToObject(cap, "frames", (double)st.frames);
     cJSON_AddNumberToObject(cap, "dropped_short", (double)st.dropped_short);
-    cJSON_AddNumberToObject(cap, "dropped_full", (double)st.dropped_full);
+    /* Renamed from dropped_full when ceiling-length frames stopped being
+     * dropped (they are delivered truncated — see rf_capture.h). */
+    cJSON_AddNumberToObject(cap, "truncated", (double)st.truncated);
     cJSON_AddNumberToObject(cap, "overruns", (double)st.overruns);
 
     return send_json(req, root, "200 OK");
@@ -867,6 +870,17 @@ static cJSON *signal_json(const db_signal_meta_t *m)
                                 tolerance_str(m->match_tolerance));
         cJSON_AddNumberToObject(o, "similarity_matches",
                                 (double)m->similarity_matches);
+        /* Repeat structure, when the stored waveform is the repeating UNIT of
+         * a continuous transmitter (rf_unit.h): the word length (== this
+         * signal's pulse_count — stated anyway, so a client never has to know
+         * that identity), the repeats observed at learn time, and the
+         * inter-repeat silence. Present only when it means something, like
+         * the two fields above. */
+        if (m->unit_repeats != 0) {
+            cJSON_AddNumberToObject(o, "unit_pulses", m->pulse_count);
+            cJSON_AddNumberToObject(o, "unit_repeats", m->unit_repeats);
+            cJSON_AddNumberToObject(o, "unit_gap_us", (double)m->unit_gap_us);
+        }
     }
     return o;
 }
@@ -1050,8 +1064,15 @@ static esp_err_t api_signal_transmit(httpd_req_t *req, uint16_t id)
     cJSON *j = read_json(req);
     if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
     double d;
-    uint8_t repeats = s_cfg->tx_repeats;
-    uint32_t gap_us = s_cfg->tx_gap_us;
+    /* Defaults come from the signal first: one learned as a repeating unit
+     * carries the repeat count and inter-repeat gap its transmitter was
+     * observed to use, and replaying THAT stream is what its receiver was
+     * built to hear. Signals without one get the config defaults as ever,
+     * and an explicit body value overrides either. */
+    uint8_t repeats;
+    uint32_t gap_us;
+    db_signals_tx_defaults(id, s_cfg->tx_repeats, s_cfg->tx_gap_us,
+                           &repeats, &gap_us);
     if (json_num(j, "repeats", &d)) repeats = (uint8_t)clampl(d, 1, 32);
     if (json_num(j, "gap_us", &d))  gap_us = (uint32_t)clampl(d, 0, 200000);
     cJSON_Delete(j);
@@ -1272,10 +1293,23 @@ static esp_err_t api_signal_import(httpd_req_t *req)
         frame->durations_us[i++] = (uint16_t)it->valuedouble;
     }
     frame->count = (uint16_t)i;
+
+    /* Repeat structure, so an exported unit signal round-trips: without these
+     * two fields a re-import would keep the word but lose the knowledge that
+     * it IS one, and long live windows would stop matching it. Clamped like
+     * the save path; absent or zero means an ordinary signal, and the store
+     * discards them anyway if the waveform turns out to decode. */
+    uint8_t  unit_repeats = 0;
+    uint32_t unit_gap_us  = 0;
+    if (json_num(j, "unit_repeats", &d)) unit_repeats = (uint8_t)clampl(d, 0, 32);
+    if (json_num(j, "unit_gap_us", &d))  unit_gap_us = (uint32_t)clampl(d, 0, 65535);
+    if (unit_repeats == 0)
+        unit_gap_us = 0;   /* a gap without repeats is not a structure */
     cJSON_Delete(j);
 
     uint16_t id = 0;
-    esp_err_t err = db_signals_add_frame(frame, NULL, name, origin, &id);
+    esp_err_t err = db_signals_add_frame_ex(frame, NULL, name, origin,
+                                            unit_repeats, unit_gap_us, &id);
     uint16_t stored = frame->count;
     free(frame);
 
@@ -1383,9 +1417,15 @@ static cJSON *raw_state_json(const db_raw_state_t *st)
     cJSON *d = cJSON_AddObjectToObject(o, "dropped");
     cJSON_AddNumberToObject(d, "below_floor", (double)st->dropped_floor);
     cJSON_AddNumberToObject(d, "too_short", (double)st->dropped_short);
-    cJSON_AddNumberToObject(d, "too_long", (double)st->dropped_full);
     cJSON_AddNumberToObject(d, "overruns", (double)st->overruns);
     cJSON_AddNumberToObject(d, "no_room", (double)st->dropped_capacity);
+
+    /* NOT in `dropped` — that is the point. Frames that hit the 512-pulse
+     * ceiling used to be thrown away as `too_long`; they are now kept with
+     * their tail cut off (each is in the frame list, flagged `truncated`),
+     * because a continuously-repeating transmitter produces almost nothing
+     * else and the repeating word inside such a window is fully learnable. */
+    cJSON_AddNumberToObject(o, "truncated", (double)st->truncated);
 
     /*
      * The fragmentation verdict. Not a statistic — a diagnosis with a fix
@@ -1481,12 +1521,28 @@ static cJSON *raw_candidate_json(const db_raw_candidate_t *c, int64_t now_us)
         cJSON_AddStringToObject(d, "text", c->text);
     }
 
-    char why[160];
+    /* Repeat structure (rf_unit.h), or null — same convention as `decoded`.
+     * This is what tells a client "saving this candidate stores the WORD,
+     * not the window" before anyone presses save. */
+    if (c->unit_repeats >= 2) {
+        cJSON *u = cJSON_AddObjectToObject(o, "unit");
+        cJSON_AddNumberToObject(u, "pulse_count", c->unit_pulses);
+        cJSON_AddNumberToObject(u, "repeats", c->unit_repeats);
+        cJSON_AddNumberToObject(u, "gap_us", (double)c->unit_gap_us);
+    } else {
+        cJSON_AddNullToObject(o, "unit");
+    }
+
+    char why[200];
     int n = snprintf(why, sizeof(why), "seen %u%s", (unsigned)c->seen,
                      c->seen == 1 ? " time" : " times");
     if (c->merged && n < (int)sizeof(why))
         n += snprintf(why + n, sizeof(why) - (size_t)n,
                       ", rejoined from %u fragments", (unsigned)c->part_count);
+    if (c->unit_repeats >= 2 && n < (int)sizeof(why))
+        n += snprintf(why + n, sizeof(why) - (size_t)n,
+                      ", repeats a %u-pulse word %ux",
+                      (unsigned)c->unit_pulses, (unsigned)c->unit_repeats);
     if (c->decoded_valid && n < (int)sizeof(why))
         n += snprintf(why + n, sizeof(why) - (size_t)n, ", decoded %s", c->protocol);
     if (n < (int)sizeof(why))
@@ -1847,6 +1903,19 @@ static esp_err_t api_raw_transmit_any(httpd_req_t *req, uint16_t index, bool can
  * The store re-analyses it (base width, confidence, fingerprint, a decode
  * attempt) exactly as it would any registration, so a trimmed frame that DOES
  * turn out to be a known protocol gets its identity at this point.
+ *
+ * THE UNIT PATH. If the selection is an undecoded window in which one word
+ * repeats (rf_unit.h) — the shape a continuously-repeating transmitter
+ * produces — what gets stored is the canonical WORD, with the observed repeat
+ * count and inter-repeat gap kept as that signal's transmit defaults. Storing
+ * the window instead would store an arbitrary cut of the stream: unmatchable
+ * by anything frame-shaped (the live box proved it twice) and unreplayable at
+ * the right period. The canonical word — per-pulse medians across every
+ * repeat in the selection — is also simply a better recording than any single
+ * window, which is why its confidence comes out meaningfully higher. A
+ * selection without internal repetition is stored verbatim, exactly as
+ * before, and the response says which happened (`learned_unit`) so the UI can
+ * tell the user what was kept.
  */
 static esp_err_t api_raw_save_any(httpd_req_t *req, uint16_t index, bool candidate)
 {
@@ -1870,9 +1939,40 @@ static esp_err_t api_raw_save_any(httpd_req_t *req, uint16_t index, bool candida
                             : "no such frame in this session, or the selection is empty");
     }
 
-    uint16_t id = 0;
-    esp_err_t err = db_signals_add_frame(frame, NULL, name, DB_ORIGIN_CAPTURED, &id);
+    /* Unit detection, under the same per-pulse window the recorder's own
+     * analysis uses (DB_RAW_UNIT_TOL_*, rf_raw.h — one capture, one
+     * oscillator). Heap, not stack: an rf_unit_t is ~1 KB and httpd workers
+     * run tight stacks; heap, not static, per the 2026-10 RAM audit. Decoded
+     * selections skip it — a decoded word is already a complete unit. */
     uint16_t saved = frame->count;
+    uint8_t  unit_repeats = 0;
+    uint32_t unit_gap_us  = 0;
+    bool     learned_unit = false;
+    {
+        static rf_norm_t norm;        /* httpd serializes handlers; ~600 B */
+        rf_decoded_t dec;
+        rf_normalize(frame, &norm);
+        if (!rf_decode(frame, &norm, &dec)) {
+            rf_unit_t *u = malloc(sizeof(*u));
+            if (u && rf_unit_extract(frame, DB_RAW_UNIT_TOL_PCT,
+                                     DB_RAW_UNIT_TOL_US, u)) {
+                *frame = u->unit;
+                /* uint8 metadata, and the transmit API's own repeat bound is
+                 * 32 — a 512-pulse window of a very short word can observe
+                 * more, but replaying more than 32 copies is a jam, not a
+                 * press. */
+                unit_repeats = (uint8_t)(u->repeats > 32 ? 32 : u->repeats);
+                unit_gap_us  = u->gap_us;
+                learned_unit = true;
+            }
+            free(u);
+        }
+    }
+
+    uint16_t id = 0;
+    esp_err_t err = db_signals_add_frame_ex(frame, NULL, name, DB_ORIGIN_CAPTURED,
+                                            unit_repeats, unit_gap_us, &id);
+    uint16_t stored_pulses = frame->count;
     free(frame);
     if (err == ESP_ERR_NO_MEM)
         return send_error(req, "409 Conflict",
@@ -1884,10 +1984,23 @@ static esp_err_t api_raw_save_any(httpd_req_t *req, uint16_t index, bool candida
 
     const db_signal_meta_t *m = db_signals_get(id);
     if (!m) return send_error(req, "500 Internal Server Error", "signal vanished after creation");
-    db_events_push(DB_EV_LEARN, id, 0, 0, 0, "registered \"%s\" from %s %u (%u pulses)",
-                   name, candidate ? "candidate" : "frame",
-                   (unsigned)index, (unsigned)saved);
-    return send_json(req, signal_json(m), "200 OK");
+    if (learned_unit)
+        db_events_push(DB_EV_LEARN, id, 0, 0, 0,
+                       "registered \"%s\": %u-pulse word (repeated %ux in the recording)",
+                       name, (unsigned)stored_pulses, (unsigned)unit_repeats);
+    else
+        db_events_push(DB_EV_LEARN, id, 0, 0, 0, "registered \"%s\" from %s %u (%u pulses)",
+                       name, candidate ? "candidate" : "frame",
+                       (unsigned)index, (unsigned)saved);
+
+    /* The signal, plus what the save DID — a client that just posted a
+     * 230-pulse selection and gets a 52-pulse signal back deserves the
+     * explanation in the same response. */
+    cJSON *o = signal_json(m);
+    cJSON_AddBoolToObject(o, "learned_unit", learned_unit);
+    if (learned_unit)
+        cJSON_AddNumberToObject(o, "learned_from_pulses", saved);
+    return send_json(req, o, "200 OK");
 }
 
 /* The four public spellings. A candidate and a bare frame differ only in how the

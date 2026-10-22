@@ -121,7 +121,8 @@ firmware/
 ├── components/
 │   ├── cc1101/     chip driver: SPI, registers, async OOK, RSSI. No app knowledge.
 │   └── rfpulse/    pulse frames, RMT capture/replay, normalization, decoders,
-│                    similarity grouping, candidate ranking, fragment rejoin.
+│                    similarity grouping, candidate ranking, fragment rejoin,
+│                    repeating-unit extraction for continuous transmitters.
 ├── main/
 │   ├── board_pins.h      every GPIO, in one place
 │   ├── db_diag.*         the shared diagnostic vocabulary

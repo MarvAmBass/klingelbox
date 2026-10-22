@@ -98,6 +98,30 @@
  *      gap is that low), so the comparison is always joined-live against
  *      stored, whole waveform against whole waveform.
  *
+ * UNIT MATCHING (field data, 2026-10) — the stage that finally fits the
+ * Gartentor-class transmitter. That button repeats its word CONTINUOUSLY with
+ * inter-repeat gaps below the capture idle threshold, so its "frames" are
+ * arbitrary multi-word windows cut wherever the 512-pulse ceiling or a chance
+ * gap lands — different pulse counts and fingerprints on every press, which
+ * is why even stages 1 and 2 above could not be stable for it (they compare
+ * window shapes, and this transmitter has none). The stable object is the
+ * repeating WORD, so that is what gets compared:
+ *
+ *   3. SLIDING UNIT ALIGNMENT. A signal whose stored waveform is such a unit
+ *      — learned directly by the Listen flow (db_signals_add_frame_ex), or
+ *      derived at load time from a long stored window that itself contains
+ *      >= 2 repeats (so the user's existing signals start working without a
+ *      re-learn; the derived unit lives in the RAM cache only and the stored
+ *      waveform is never rewritten) — is matched by rf_unit_match(): does the
+ *      incoming window consist of this unit repeating, starting at ANY
+ *      phase? Every pulse of the window must agree cyclically, endpoints'
+ *      clipping excepted, and the per-signal preset sets both the per-pulse
+ *      window and the minimum number of FULL aligned repeats (SIM_PRESETS).
+ *      The stage composes with 1 and 2 unchanged: an assembled run is slid
+ *      over exactly like a single burst, the press window absorbs the stream
+ *      of windows one held button produces, and decoded signals never
+ *      participate.
+ *
  * HOW THIS COMPOSES WITH THE FRAGMENT SUPPRESSOR ABOVE — read carefully, the
  * two look like rivals and are not. The suppressor answers "is this burst the
  * TAIL of the press I just handled?" (sub-75 % of its predecessor, inside
@@ -148,17 +172,19 @@
 #include "nvs.h"
 #include "nvs_flash.h"   /* NVS_DEFAULT_PART_NAME, for stats and the sweep */
 #include "rf_group.h"    /* the run machinery's tolerances and join primitives */
+#include "rf_unit.h"     /* repeating-unit extraction and sliding alignment */
 
 static const char *TAG = "db_signals";
 
 #define DB_SIG_NS        "dbsig"
 #define DB_SIG_INDEX_KEY "index"
 /* v1: the original record (db_signal_meta_v1_t, frozen in signal_store.h).
- * v2: match_tolerance + similarity_matches appended. A v1 index is migrated
- *     on load and written back (graph discipline, node_graph.c); anything
+ * v2: match_tolerance + similarity_matches appended (db_signal_meta_v2_t).
+ * v3: unit_repeats + unit_gap_us appended. Older indexes are migrated on
+ *     load and written back (graph discipline, node_graph.c); anything
  *     NEWER or unrecognized is ignored-but-preserved exactly as before, so a
  *     rollback still finds its signals intact. */
-#define DB_SIG_VERSION   2u
+#define DB_SIG_VERSION   3u
 
 /* Trailing-fragment rejection — see the file header for the bench data.
  * 750 ms: the tail is flushed one burst-window (250 ms) after its parent, so the
@@ -377,6 +403,56 @@ static esp_err_t load_index(void)
         return ESP_OK;
     }
 
+    /* A v2 index (the preset-era layout, v0.11.0) comes forward the same way.
+     * The two new fields default to 0 — "no repeat structure known", which is
+     * exactly true of a signal stored before units existed; load-time unit
+     * DERIVATION (sim_slot_derive below) is what makes such a signal match a
+     * repeating transmitter anyway, without touching its stored bytes. */
+    if (hdr.version == 2u && hdr.meta_size == sizeof(db_signal_meta_v2_t)) {
+        uint32_t n = hdr.count;
+        if (n > DB_SIGNAL_MAX)
+            n = DB_SIGNAL_MAX;
+        if (len < sizeof(hdr) + (size_t)n * sizeof(db_signal_meta_v2_t)) {
+            ESP_LOGE(TAG, "v2 signal index truncated — starting empty");
+            return ESP_OK;
+        }
+        s_count = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            /* Copied out first: blob records are not guaranteed aligned for
+             * in-place int64 reads (same note as the v1 branch). */
+            db_signal_meta_v2_t old;
+            memcpy(&old, s_blob + sizeof(hdr) + (size_t)i * sizeof(old),
+                   sizeof(old));
+            if (old.id == 0)
+                continue;
+
+            db_signal_meta_t *m = &s_meta[s_count];
+            memset(m, 0, sizeof(*m));
+            m->id          = old.id;
+            memcpy(m->name, old.name, sizeof(m->name));
+            m->name[DB_SIGNAL_NAME_MAX - 1] = '\0';
+            m->origin      = old.origin;
+            m->created_at  = old.created_at;
+            m->fingerprint = old.fingerprint;
+            m->base_us     = old.base_us;
+            m->confidence  = old.confidence;
+            m->pulse_count = old.pulse_count;
+            m->decoded_valid = old.decoded_valid;
+            memcpy(m->protocol, old.protocol, sizeof(m->protocol));
+            m->protocol[RF_PROTOCOL_NAME_MAX - 1] = '\0';
+            m->decoded_id      = old.decoded_id;
+            m->decoded_button  = old.decoded_button;
+            m->match_tolerance = (old.match_tolerance < DB_SIG_TOL__COUNT)
+                                     ? old.match_tolerance : DB_SIG_TOL_NORMAL;
+            s_count++;
+        }
+        s_index_authoritative = true;
+        ESP_LOGI(TAG, "signal index migrated v2 -> v%u (%d signal(s))",
+                 (unsigned)DB_SIG_VERSION, s_count);
+        save_index();   /* one-off write-back, best effort (see the v1 branch) */
+        return ESP_OK;
+    }
+
     /* Beyond that, only an exact layout match is reinterpreted (same rule as
      * db_config.c). A NEWER or unknown index is left on flash untouched — a
      * rollback to the firmware that wrote it must find its signals intact —
@@ -575,6 +651,22 @@ static esp_err_t load_frame_locked(uint16_t id, rf_frame_t *out);
  *                   accepts only a whisker of clipping — "near-exact or
  *                   nothing", for a signal whose owner has seen a false ring.
  *
+ *   min_rep         the UNIT stage's bar (rf_unit_match): the fewest FULL
+ *                   aligned repeats of the signal's unit an incoming window
+ *                   must carry. The unit stage already demands that the
+ *                   WHOLE window agree with the unit cyclically, pulse by
+ *                   pulse — one foreign pulse refuses it — so min_rep is
+ *                   about how much positive evidence rides on top of that:
+ *                   NORMAL takes one full unit (the press window then absorbs
+ *                   the rest of the stream, exactly as it absorbs repeats of
+ *                   a prefix match); STRICT demands two aligned repeats —
+ *                   repetition in ONE window, the same "repeats prove a
+ *                   transmitter" bar rf_group ranks by, for a signal whose
+ *                   owner has seen a false ring; LOOSE stays at one unit and
+ *                   gets its slack from the wider per-pulse window instead,
+ *                   because lowering BOTH bars at once is how a preset stops
+ *                   meaning anything.
+ *
  * Run gap agreement comes for free and is therefore not a third knob: an
  * assembled run embeds its measured silences as ordinary low pulses (see
  * sim_run_offer), and the stored frame — joined by the Listen flow from the
@@ -586,14 +678,24 @@ typedef struct {
     uint8_t  tol_pct;
     uint16_t tol_us;
     uint8_t  min_pct;   /* 0 disables the preset (OFF) */
+    uint8_t  min_rep;   /* unit stage: fewest full aligned repeats */
 } sim_preset_t;
 
 static const sim_preset_t SIM_PRESETS[DB_SIG_TOL__COUNT] = {
-    [DB_SIG_TOL_NORMAL] = { 25, 120, 85 },
-    [DB_SIG_TOL_OFF]    = {  0,   0,  0 },
-    [DB_SIG_TOL_STRICT] = { 25, 120, 95 },
-    [DB_SIG_TOL_LOOSE]  = { RF_GROUP_TOL_PCT, RF_GROUP_TOL_US, DB_FRAG_MIN_PCT },
+    [DB_SIG_TOL_NORMAL] = { 25, 120, 85, 1 },
+    [DB_SIG_TOL_OFF]    = {  0,   0,  0, 0 },
+    [DB_SIG_TOL_STRICT] = { 25, 120, 95, 2 },
+    [DB_SIG_TOL_LOOSE]  = { RF_GROUP_TOL_PCT, RF_GROUP_TOL_US, DB_FRAG_MIN_PCT, 1 },
 };
+
+/* The per-pulse window for DERIVING a unit from one stored capture: within a
+ * single recording the oscillator barely moves, so this is the same 25 % /
+ * 120 us "same transmission" window burst coalescing trusts (BURST_TOL_PCT/_US
+ * in rf_service.c — repeated because that module owns the radio and this one
+ * must not include it). Matching against the derived unit then runs under the
+ * per-signal preset above, which is where cross-press drift belongs. */
+#define SIM_UNIT_TOL_PCT 25
+#define SIM_UNIT_TOL_US  120
 
 /*
  * THE WAVEFORM CACHE. The hot path may not read NVS per burst, but similarity
@@ -614,13 +716,63 @@ static const sim_preset_t SIM_PRESETS[DB_SIG_TOL__COUNT] = {
  */
 #define DB_SIM_CACHE_SLOTS 8
 
+/*
+ * THE DERIVED-UNIT SIDECAR. A pre-unit signal whose stored waveform is a long
+ * window of a repeating stream (the user's 224-pulse Gartentor) gets its unit
+ * derived HERE, when the frame enters the cache — RAM only, the stored bytes
+ * are never rewritten, so deriving beats re-learning and a rollback sees the
+ * flash it wrote. 128 pulses of sidecar (256 bytes a slot, ~2 KB over the
+ * cache) covers any real word — EV1527-class is ~50 — where a second full
+ * rf_frame_t per slot would double the cache's 8.4 KB for tail that no unit
+ * ever uses; a unit longer than the sidecar is simply not kept, and that
+ * signal matches by the v0.11.0 whole/prefix stages exactly as before.
+ */
+#define DB_SIM_UNIT_MAX_PULSES 128
+
+typedef struct {
+    bool     tried;        /* extraction attempted for this slot's frame */
+    uint16_t count;        /* 0: no derived unit */
+    uint8_t  first_level;
+    uint16_t repeats;      /* repeats observed in the stored window */
+    uint16_t durations_us[DB_SIM_UNIT_MAX_PULSES];
+} sim_unit_t;
+
 typedef struct {
     uint16_t   id;        /* 0 = empty slot */
     int64_t    used_us;   /* LRU stamp */
     rf_frame_t frame;
+    sim_unit_t unit;      /* derived from `frame` — see the sidecar note */
 } sim_slot_t;
 
 static sim_slot_t s_sim_cache[DB_SIM_CACHE_SLOTS];
+
+/* Derive the slot's unit from its frame, once per fill. A signal stored AS a
+ * unit (meta->unit_repeats != 0) needs no sidecar — its frame is the unit —
+ * and extraction over it would only find sub-structure that is not there.
+ * Caller holds the lock. */
+static void sim_slot_derive(sim_slot_t *s)
+{
+    static rf_unit_t u;   /* ~1 KB — static by the no-malloc policy; the lock
+                             serializes every caller */
+    const db_signal_meta_t *m = find_meta(s->id);
+
+    s->unit.tried = true;
+    s->unit.count = 0;
+    if (m == NULL || m->unit_repeats != 0)
+        return;
+    if (!rf_unit_extract(&s->frame, SIM_UNIT_TOL_PCT, SIM_UNIT_TOL_US, &u))
+        return;
+    if (u.unit.count > DB_SIM_UNIT_MAX_PULSES)
+        return;   /* longer than the sidecar: whole/prefix matching remains */
+    s->unit.count       = u.unit.count;
+    s->unit.first_level = u.unit.first_level;
+    s->unit.repeats     = u.repeats;
+    memcpy(s->unit.durations_us, u.unit.durations_us,
+           (size_t)u.unit.count * sizeof(uint16_t));
+    ESP_LOGI(TAG, "signal %u '%s': derived a %u-pulse repeating unit from the "
+                  "stored %u-pulse window (%u repeats observed)",
+             (unsigned)s->id, m->name, u.unit.count, s->frame.count, u.repeats);
+}
 
 /*
  * THE RUN ASSEMBLER. Unmatched bursts arriving close enough together to be
@@ -691,18 +843,22 @@ static void sim_cache_put(uint16_t id, const rf_frame_t *frame)
     s->id      = id;
     s->used_us = esp_timer_get_time();
     s->frame   = *frame;
+    sim_slot_derive(s);
 }
 
-/* The waveform of raw signal `id`, from RAM when cached, from NVS when not —
- * the one sanctioned flash read on the match path, promoted into the LRU slot
- * so a signal that is actually being pressed stays resident. NULL only when
- * the frame is unreadable, which the boot reconcile makes nearly unreachable. */
-static const rf_frame_t *sim_cache_get(uint16_t id)
+/* The slot of raw signal `id` — frame plus derived unit — from RAM when
+ * cached, from NVS when not: the one sanctioned flash read on the match path,
+ * promoted into the LRU slot so a signal that is actually being pressed stays
+ * resident. NULL only when the frame is unreadable, which the boot reconcile
+ * makes nearly unreachable. */
+static const sim_slot_t *sim_slot_get(uint16_t id)
 {
     for (int i = 0; i < DB_SIM_CACHE_SLOTS; i++) {
         if (s_sim_cache[i].id == id) {
             s_sim_cache[i].used_us = esp_timer_get_time();
-            return &s_sim_cache[i].frame;
+            if (!s_sim_cache[i].unit.tried)
+                sim_slot_derive(&s_sim_cache[i]);
+            return &s_sim_cache[i];
         }
     }
     {
@@ -713,13 +869,15 @@ static const rf_frame_t *sim_cache_get(uint16_t id)
         }
         s->id      = id;
         s->used_us = esp_timer_get_time();
-        return &s->frame;
+        sim_slot_derive(s);
+        return s;
     }
 }
 
 /* Boot-time fill: the first DB_SIM_CACHE_SLOTS raw signals, in store order —
  * at boot there are no seen-stats to rank by, and the LRU corrects any wrong
- * guess at the cost of one flash read on that signal's first press. */
+ * guess at the cost of one flash read on that signal's first press. Units are
+ * derived here too, so the first press after boot pays no extraction. */
 static void sim_cache_prefill(void)
 {
     int cached = 0;
@@ -731,6 +889,7 @@ static void sim_cache_prefill(void)
             continue;
         s->id      = s_meta[i].id;
         s->used_us = esp_timer_get_time();
+        sim_slot_derive(s);
         cached++;
     }
 }
@@ -775,22 +934,28 @@ static bool sim_waveform_match(const rf_frame_t *stored, const rf_frame_t *in,
 /*
  * Scan the stored RAW signals for one that `in` is a reception of. When
  * several qualify (a stored truncation next to the stored whole, say), the
- * strongest claim wins: an exact pulse-count match beats a prefix match, and
- * among prefix matches the highest covered fraction (= the shortest stored
- * frame) beats the rest. `in_base_us` 0 skips the base prefilter — an
+ * strongest claim wins, ranked by how much of the comparison was anchored:
+ * an exact pulse-count match (rank 2) beats a unit match (rank 1 — the whole
+ * window agreed, but cyclically), which beats a prefix match (rank 0 — only
+ * part of the stored frame was covered). Among unit matches more aligned
+ * repeats win; among prefix matches the highest covered fraction (= the
+ * shortest stored frame) wins. `in_base_us` 0 skips the base prefilter — an
  * assembled run is never re-normalized, because its full per-pulse comparison
  * is the stronger test anyway and runs on a handful of candidates at most.
  */
 static db_signal_meta_t *sim_scan(const rf_frame_t *in, uint16_t in_base_us)
 {
     db_signal_meta_t *best = NULL;
-    bool best_exact = false;
+    int      best_rank = -1;
+    uint32_t best_key  = 0;    /* rank 1: repeats (more wins);
+                                  rank 0: 65535 - stored count (shorter wins) */
 
     for (int i = 0; i < s_count; i++) {
         db_signal_meta_t *m = &s_meta[i];
         const sim_preset_t *p;
-        const rf_frame_t *stored;
-        bool exact;
+        const sim_slot_t *slot;
+        int      rank = -1;
+        uint32_t key  = 0;
 
         if (m->decoded_valid)
             continue;      /* identity territory; similarity never applies */
@@ -799,23 +964,60 @@ static db_signal_meta_t *sim_scan(const rf_frame_t *in, uint16_t in_base_us)
         if (p->min_pct == 0)
             continue;      /* OFF: this signal matches by fingerprint alone */
 
-        /* Resident-metadata prefilters, before any frame is touched. */
-        if (in->count > m->pulse_count)
-            continue;
-        if ((uint32_t)in->count * 100u < (uint32_t)m->pulse_count * p->min_pct)
-            continue;
+        /* Resident-metadata prefilter, before any frame is touched. The base
+         * width is a property of the transmitter, so it gates every stage. */
         if (!sim_base_close(in_base_us, m->base_us))
             continue;
 
-        stored = sim_cache_get(m->id);
-        if (!stored || !sim_waveform_match(stored, in, p))
-            continue;
+        /* Window-shaped stages (whole frame / leading truncation), exactly
+         * v0.11.0's: only when the incoming window is not LONGER than the
+         * stored frame — matching more than was stored is a claim the stored
+         * evidence cannot support, and the unit stage below is the honest way
+         * a longer window gets matched. */
+        if (in->count <= m->pulse_count &&
+            (uint32_t)in->count * 100u >= (uint32_t)m->pulse_count * p->min_pct) {
+            slot = sim_slot_get(m->id);
+            if (slot && sim_waveform_match(&slot->frame, in, p)) {
+                rank = (in->count == m->pulse_count) ? 2 : 0;
+                key  = 65535u - m->pulse_count;
+            }
+        }
 
-        exact = (in->count == m->pulse_count);
-        if (!best || (exact && !best_exact) ||
-            (exact == best_exact && m->pulse_count < best->pulse_count)) {
-            best       = m;
-            best_exact = exact;
+        /* The unit stage: slide the signal's unit over the incoming window
+         * (any phase), requiring the preset's minimum of full repeats. The
+         * unit is the stored frame itself when the signal was LEARNED as one
+         * (unit_repeats != 0), else the sidecar derived at load time. */
+        if (rank < 2) {
+            const uint16_t *ud = NULL;
+            uint16_t uc = 0;
+            uint8_t  ul = 0;
+
+            slot = sim_slot_get(m->id);
+            if (slot && m->unit_repeats != 0) {
+                ud = slot->frame.durations_us;
+                uc = slot->frame.count;
+                ul = slot->frame.first_level;
+            } else if (slot && slot->unit.count != 0) {
+                ud = slot->unit.durations_us;
+                uc = slot->unit.count;
+                ul = slot->unit.first_level;
+            }
+            if (ud != NULL && in->count >= uc) {
+                uint16_t reps = rf_unit_match(in, ud, uc, ul,
+                                              p->tol_pct, p->tol_us);
+                if (reps >= p->min_rep && reps > 0 && (rank < 1 || reps > key)) {
+                    rank = 1;
+                    key  = reps;
+                }
+            }
+        }
+
+        if (rank < 0)
+            continue;
+        if (rank > best_rank || (rank == best_rank && key > best_key)) {
+            best      = m;
+            best_rank = rank;
+            best_key  = key;
         }
     }
     return best;
@@ -1307,9 +1509,10 @@ esp_err_t db_signals_add_event(const rf_event_t *ev, const char *name,
     return err;
 }
 
-esp_err_t db_signals_add_frame(const rf_frame_t *frame, const rf_decoded_t *decoded,
-                               const char *name, db_signal_origin_t origin,
-                               uint16_t *id_out)
+esp_err_t db_signals_add_frame_ex(const rf_frame_t *frame, const rf_decoded_t *decoded,
+                                  const char *name, db_signal_origin_t origin,
+                                  uint8_t unit_repeats, uint32_t unit_gap_us,
+                                  uint16_t *id_out)
 {
     if (!frame || frame->count == 0)
         return ESP_ERR_INVALID_ARG;
@@ -1339,6 +1542,13 @@ esp_err_t db_signals_add_frame(const rf_frame_t *frame, const rf_decoded_t *deco
 
     db_signal_meta_t m;
     meta_from_parts(&m, id, name, origin, frame, &norm, dec, fp);
+    /* Repeat structure travels only with an UNDECODED unit: a frame a decoder
+     * claims has an identity, and bolting observed repeats onto it would be a
+     * second source of truth for how that protocol transmits. */
+    if (!m.decoded_valid) {
+        m.unit_repeats = unit_repeats;
+        m.unit_gap_us  = unit_gap_us;
+    }
     esp_err_t err = store(&m, frame, id_out);
 
     /* Copy out what the report needs before dropping the lock. */
@@ -1370,6 +1580,40 @@ esp_err_t db_signals_add_frame(const rf_frame_t *frame, const rf_decoded_t *deco
                            rep_name, rep_pulses, (unsigned long)rep_fp);
     }
     return err;
+}
+
+esp_err_t db_signals_add_frame(const rf_frame_t *frame, const rf_decoded_t *decoded,
+                               const char *name, db_signal_origin_t origin,
+                               uint16_t *id_out)
+{
+    /* The ordinary path: a single transmission, no repeat structure. */
+    return db_signals_add_frame_ex(frame, decoded, name, origin, 0, 0, id_out);
+}
+
+void db_signals_tx_defaults(uint16_t id, uint8_t cfg_repeats, uint32_t cfg_gap_us,
+                            uint8_t *repeats_out, uint32_t *gap_us_out)
+{
+    uint8_t  reps = cfg_repeats;
+    uint32_t gap  = cfg_gap_us;
+
+    lock();
+    const db_signal_meta_t *m = find_meta(id);
+    if (m && m->unit_repeats != 0) {
+        /* The learned stream: as many copies as the learn capture observed,
+         * separated by the measured inter-repeat gap. The stored frame ends
+         * in that gap already and rf_transmit treats gap_us as a floor, so
+         * the emitted period is exactly the learned one — passing the config
+         * default here instead would STRETCH every gap to it and hand the
+         * receiver a stream its transmitter never sends. */
+        reps = m->unit_repeats;
+        gap  = m->unit_gap_us;
+    }
+    unlock();
+
+    if (repeats_out)
+        *repeats_out = reps;
+    if (gap_us_out)
+        *gap_us_out = gap;
 }
 
 esp_err_t db_signals_rename(uint16_t id, const char *name)

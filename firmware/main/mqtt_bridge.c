@@ -1695,13 +1695,19 @@ static void announce(bool resub)
  * "ON", whatever an automation happens to send — means "transmit with the
  * configured defaults", because requiring a body would make the topic useless
  * from a plain `mosquitto_pub -n`. */
-static void parse_tx_args(const char *payload, uint8_t *repeats, uint32_t *gap_us)
+static void parse_tx_args(const char *payload, uint16_t signal_id,
+                          uint8_t *repeats, uint32_t *gap_us)
 {
     /* Read live from the config on purpose (like mqtt_homeassistant): both are
      * single aligned words, which cannot tear, and a changed transmit default
-     * should apply to the next press rather than wait for a bridge restart. */
-    *repeats = s_cfg->tx_repeats ? s_cfg->tx_repeats : 6;
-    *gap_us  = s_cfg->tx_gap_us  ? s_cfg->tx_gap_us  : 8000;
+     * should apply to the next press rather than wait for a bridge restart.
+     * The signal's own learned repeat structure outranks the config default
+     * (db_signals_tx_defaults) — same rule as the REST transmit endpoint, so
+     * a Home Assistant press rings the same stream a UI press does. */
+    db_signals_tx_defaults(signal_id,
+                           s_cfg->tx_repeats ? s_cfg->tx_repeats : 6,
+                           s_cfg->tx_gap_us  ? s_cfg->tx_gap_us  : 8000,
+                           repeats, gap_us);
     if (!payload) return;
     while (*payload == ' ') payload++;
     if (*payload != '{') return;
@@ -1735,7 +1741,7 @@ static void handle_transmit(const char *slug, const char *payload)
         return;
     }
     uint8_t repeats; uint32_t gap_us;
-    parse_tx_args(payload, &repeats, &gap_us);
+    parse_tx_args(payload, id, &repeats, &gap_us);
 
     /* Blocks for the airtime of the burst — which is precisely why this runs
      * here and not in the esp-mqtt event handler. */

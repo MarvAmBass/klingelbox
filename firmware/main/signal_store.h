@@ -17,16 +17,20 @@
  * claimed it (protocol + id + button is far stronger evidence than timing),
  * otherwise by fingerprint over the normalized timing structure, and — for
  * RAW signals only — by waveform SIMILARITY as the last resort, including a
- * burst that is a clean leading truncation of the stored frame and a press
+ * burst that is a clean leading truncation of the stored frame, a press
  * that arrived chopped into several bursts (reassembled with the measured
- * silences, exactly like the Listen flow's run machinery). Raw durations are
- * never compared exactly — cheap transmitters drift several percent between
- * presses and as their batteries age — and how LOOSELY the similarity stage
- * may compare is a per-signal setting (db_sig_tolerance_t below), because the
- * need differs per transmitter: a long pattern that fragments differently on
- * every reception needs the slack, while a clean signal gains nothing from it
- * but false-ring risk. Decoded signals ignore the setting entirely; identity
- * matching is never loosened.
+ * silences, exactly like the Listen flow's run machinery), and — for a
+ * signal whose waveform is a repeating UNIT, learned or derived (rf_unit.h)
+ * — a burst that is that unit repeating at ANY phase, found by sliding
+ * alignment, because a continuously-repeating transmitter's windows are cut
+ * arbitrarily and no frame-shaped comparison can be stable for them. Raw
+ * durations are never compared exactly — cheap transmitters drift several
+ * percent between presses and as their batteries age — and how LOOSELY the
+ * similarity stage may compare is a per-signal setting (db_sig_tolerance_t
+ * below), because the need differs per transmitter: a long pattern that
+ * fragments differently on every reception needs the slack, while a clean
+ * signal gains nothing from it but false-ring risk. Decoded signals ignore
+ * the setting entirely; identity matching is never loosened.
  *
  * WHERE SIGNALS COME FROM, AND WHAT IS NOT HERE ANY MORE. This module used to
  * own a second entry point called learn mode: an armed window during which an
@@ -133,6 +137,17 @@ typedef struct {
     uint32_t         similarity_matches; /* live stat: seen_count's similarity
                                             subset — honest observability for a
                                             fuzzier mechanism. Not persisted.  */
+    /* v3 fields — appended, same discipline. Repeat structure for a signal
+     * whose stored waveform is the repeating UNIT of a continuous transmitter
+     * (rf_unit.h): how many repeats the learn capture observed and the
+     * inter-repeat silence. Both 0 for an ordinary one-word signal. Transmit
+     * uses them as that signal's defaults so a replay reproduces the stream
+     * the way the transmitter sends it; matching uses unit_repeats != 0 as
+     * "the stored frame IS the unit — slide it over incoming windows". The
+     * gap is also the stored frame's own trailing LOW; it is kept as a field
+     * so the API can say it without loading the frame. */
+    uint8_t          unit_repeats;
+    uint32_t         unit_gap_us;
 } db_signal_meta_t;
 
 /*
@@ -160,6 +175,28 @@ typedef struct {
     int64_t          last_seen_us;       /* persisted as 0 — live stat */
     uint32_t         seen_count;         /* persisted as 0 — live stat */
 } db_signal_meta_v1_t;
+
+/* FROZEN v2 record layout — what the preset-era (v0.11.0) firmware wrote.
+ * Same discipline as v1 above: this describes flash in the field, nothing in
+ * it may move, sizes are literals. */
+typedef struct {
+    uint16_t         id;
+    char             name[32];
+    uint8_t          origin;
+    int64_t          created_at;
+    rf_fingerprint_t fingerprint;
+    uint16_t         base_us;
+    uint8_t          confidence;
+    uint16_t         pulse_count;
+    bool             decoded_valid;
+    char             protocol[16];
+    uint32_t         decoded_id;
+    uint8_t          decoded_button;
+    int64_t          last_seen_us;       /* persisted as 0 — live stat */
+    uint32_t         seen_count;         /* persisted as 0 — live stat */
+    uint8_t          match_tolerance;
+    uint32_t         similarity_matches; /* persisted as 0 — live stat */
+} db_signal_meta_v2_t;
 
 esp_err_t db_signals_init(void);
 
@@ -211,6 +248,28 @@ esp_err_t db_signals_add_event(const rf_event_t *ev, const char *name,
 esp_err_t db_signals_add_frame(const rf_frame_t *frame, const rf_decoded_t *decoded,
                                const char *name, db_signal_origin_t origin,
                                uint16_t *id_out);
+
+/* As db_signals_add_frame(), for a frame that is the repeating UNIT extracted
+ * from a continuous transmission (rf_unit_extract): `unit_repeats` is the
+ * repeat count observed in the learn capture and `unit_gap_us` the measured
+ * inter-repeat silence (also the unit's own trailing LOW). Both are kept in
+ * the metadata so transmit can reproduce the stream faithfully and matching
+ * knows to slide this waveform over incoming windows. Ignored (zeroed) if a
+ * decoder claims the frame — a decoded word has an identity, and inventing
+ * repeat structure on top of it would be a second source of truth. */
+esp_err_t db_signals_add_frame_ex(const rf_frame_t *frame, const rf_decoded_t *decoded,
+                                  const char *name, db_signal_origin_t origin,
+                                  uint8_t unit_repeats, uint32_t unit_gap_us,
+                                  uint16_t *id_out);
+
+/* The transmit parameters a replay of signal `id` should default to when the
+ * caller has none of its own: the signal's learned repeat structure when it
+ * has one (unit_repeats as the copy count, unit_gap_us as the inter-copy
+ * floor — the stored frame already ends in that gap, so the emitted period is
+ * exactly the learned one), otherwise the passed config defaults. Safe from
+ * any task (copies under the lock); unknown ids get the config defaults. */
+void db_signals_tx_defaults(uint16_t id, uint8_t cfg_repeats, uint32_t cfg_gap_us,
+                            uint8_t *repeats_out, uint32_t *gap_us_out);
 
 esp_err_t db_signals_load_frame(uint16_t id, rf_frame_t *out);
 esp_err_t db_signals_rename(uint16_t id, const char *name);

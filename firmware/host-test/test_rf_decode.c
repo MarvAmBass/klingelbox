@@ -11,7 +11,8 @@
  * timings we choose, including the pathological ones a real remote produces only
  * on a cold morning with a flat battery.
  *
- * This binary deliberately links ONLY rf_frame.c, rf_decode.c and rf_ev1527.c.
+ * This binary deliberately links ONLY the rfpulse component's portable files
+ * (rf_frame.c, rf_decode.c, rf_ev1527.c, rf_group.c, rf_unit.c).
  * If it ever stops compiling because one of them grew an ESP-IDF include, that
  * is the layering violation the test is also there to catch.
  *
@@ -24,6 +25,7 @@
 #include "rf_decode.h"
 #include "rf_frame.h"
 #include "rf_group.h"
+#include "rf_unit.h"
 
 /* ---- micro test harness -------------------------------------------------- */
 
@@ -1231,6 +1233,267 @@ static void test_frame_join_refusals(void)
     CHECK(!rf_frame_join_run(&out, NULL, NULL), "join_run NULL");
 }
 
+/* ---- repeating-unit extraction and matching (rf_unit.h) --------------------
+ *
+ * The synthetic transmitter below reproduces the field shape (Gartentor,
+ * 2026-10): a 52-pulse word — 25 aperiodic data bits as 300/900 pulse pairs
+ * plus a final high and a 1.5 ms inter-repeat gap — sent CONTINUOUSLY, so a
+ * "frame" is an arbitrary 180..260-pulse window cut anywhere in the stream,
+ * exactly what the live box recorded (224 pulses one month, 257 the next,
+ * 196-pulse windows live). The word is deliberately aperiodic inside, so a
+ * scrambled imitation can never match by coincidence, and the gap is unique
+ * and dominant, so the canonical rotation is stable across windows.
+ */
+
+#define WORD_PULSES 52
+
+/* One pulse per character, NOT EV1527's pair-per-bit shape: runs like "11"
+ * put two equal durations next to each other, which no 1x/Nx pair decoder can
+ * read — matching the field transmitter, which the live box could never
+ * decode (confidence 24 %). Aperiodic, so no sub-period can masquerade as the
+ * word. */
+static void make_word(rf_frame_t *w)
+{
+    static const char bits[] = "10110011100010110100101110011010001011101100100011";
+
+    rf_frame_reset(w);
+    w->first_level = 1;
+    for (unsigned i = 0; bits[i]; i++) {
+        rf_frame_push(w, bits[i] == '1' ? 900 : 300);
+    }
+    rf_frame_push(w, 300);    /* final high ... */
+    rf_frame_push(w, 1500);   /* ... and the inter-repeat gap, the longest LOW */
+}
+
+/* Pulses [from, from+n) of the continuous stream `word word word ...`, each
+ * duration independently jittered by +/- jitter_pct — a window the capture
+ * layer could have handed up. */
+static void make_window(rf_frame_t *dst, const rf_frame_t *word,
+                        uint32_t from, uint16_t n, uint32_t jitter_pct)
+{
+    rf_frame_reset(dst);
+    dst->first_level = rf_frame_level_at(word, (uint16_t)(from % word->count));
+    for (uint16_t i = 0; i < n; i++) {
+        rf_frame_push(dst, word->durations_us[(from + i) % word->count]);
+    }
+    if (jitter_pct) {
+        jitter_frame(dst, jitter_pct);
+    }
+}
+
+static void test_unit_extract_recovers_word(void)
+{
+    static rf_frame_t word, win;
+    static rf_unit_t u;
+
+    CASE("unit: extraction recovers the word from any window");
+    make_word(&word);
+
+    /* Clean, word-aligned window first: the canonical unit must BE the word. */
+    make_window(&win, &word, 0, 224, 0);
+    CHECK(rf_unit_extract(&win, 25, 120, &u), "clean 224-pulse window extracts");
+    CHECK(u.unit.count == WORD_PULSES, "unit is %u pulses, expected %u",
+          u.unit.count, WORD_PULSES);
+    CHECK(u.repeats == 224 / WORD_PULSES, "repeats %u, expected %u",
+          u.repeats, 224 / WORD_PULSES);
+    CHECK(u.gap_us >= 1400 && u.gap_us <= 1600, "gap %lu us, expected ~1500",
+          (unsigned long)u.gap_us);
+    CHECK(u.coverage_pct >= RF_UNIT_COVERAGE_PCT, "coverage %u%%", u.coverage_pct);
+    CHECK(rf_frame_similar(&u.unit, &word, 2, 10),
+          "a clean extraction reproduces the word exactly");
+
+    /* Arbitrary offsets and lengths, +/- 8 % per-pulse jitter — the field
+     * shape. Every window must yield the word, canonically rotated. */
+    rng_seed(20261022u);
+    {
+        static const uint32_t offs[] = { 0, 13, 27, 51, 80 };
+        static const uint16_t lens[] = { 180, 224, 257, 260 };
+        for (unsigned a = 0; a < sizeof(offs) / sizeof(offs[0]); a++) {
+            for (unsigned b = 0; b < sizeof(lens) / sizeof(lens[0]); b++) {
+                make_window(&win, &word, offs[a], lens[b], 8);
+                CHECK(rf_unit_extract(&win, 25, 120, &u),
+                      "window off=%u len=%u extracts", offs[a], lens[b]);
+                CHECK(u.unit.count == WORD_PULSES,
+                      "off=%u len=%u: unit %u pulses", offs[a], lens[b], u.unit.count);
+                CHECK(u.repeats >= 3, "off=%u len=%u: %u repeats seen",
+                      offs[a], lens[b], u.repeats);
+                CHECK(rf_frame_similar(&u.unit, &word, 10, 60),
+                      "off=%u len=%u: canonical unit is the word", offs[a], lens[b]);
+            }
+        }
+    }
+
+    /* Two different windows of one stream — the 224-vs-257 scenario — must
+     * produce the SAME canonical unit: same length, same rotation, timings
+     * agreeing within a hair, because both are medians over the same word. */
+    {
+        static rf_frame_t win2;
+        static rf_unit_t u2;
+        make_window(&win,  &word,  5, 224, 8);
+        make_window(&win2, &word, 31, 257, 8);
+        CHECK(rf_unit_extract(&win, 25, 120, &u), "window A extracts");
+        CHECK(rf_unit_extract(&win2, 25, 120, &u2), "window B extracts");
+        CHECK(u.unit.count == u2.unit.count, "same unit length (%u vs %u)",
+              u.unit.count, u2.unit.count);
+        CHECK(rf_frame_similar(&u.unit, &u2.unit, 10, 60),
+              "two windows of one stream yield one canonical unit");
+        /* ...and each unit explains the OTHER window: the cross-check that
+         * makes the two field learns ('Gartentor', 'Gartentor 2') one button. */
+        CHECK(rf_unit_match_frame(&win2, &u.unit, 25, 120) >= 3,
+              "unit from A found in window B");
+        CHECK(rf_unit_match_frame(&win, &u2.unit, 25, 120) >= 3,
+              "unit from B found in window A");
+    }
+
+    /* The canonical unit is a BETTER recording than the window it came from:
+     * medians across repeats cancel per-pulse jitter, so normalization trusts
+     * it at least as much as the raw window. */
+    {
+        static rf_norm_t nw, nu;
+        make_window(&win, &word, 17, 240, 8);
+        CHECK(rf_unit_extract(&win, 25, 120, &u), "jittered window extracts");
+        rf_normalize(&win, &nw);
+        rf_normalize(&u.unit, &nu);
+        CHECK(nu.confidence >= nw.confidence,
+              "unit confidence %u >= window confidence %u",
+              nu.confidence, nw.confidence);
+    }
+
+    /* A truncated capture — exactly RF_FRAME_MAX_PULSES, the shape the live
+     * path delivers for a held button now that the ceiling keeps frames —
+     * carries ~9 repeats and must extract like any other window. */
+    make_window(&win, &word, 40, RF_FRAME_MAX_PULSES, 8);
+    CHECK(rf_unit_extract(&win, 25, 120, &u), "a 512-pulse truncated window extracts");
+    CHECK(u.unit.count == WORD_PULSES && u.repeats >= 8,
+          "truncated window: %u pulses x%u", u.unit.count, u.repeats);
+
+    /* Clipped endpoints: the first and last pulse of a window routinely lose
+     * part of their duration to the re-arm / the cut. Short there is fine. */
+    make_window(&win, &word, 9, 220, 0);
+    win.durations_us[0] /= 2;
+    win.durations_us[win.count - 1] /= 2;
+    CHECK(rf_unit_extract(&win, 25, 120, &u) && u.unit.count == WORD_PULSES,
+          "clipped first/last pulses do not break extraction");
+}
+
+static void test_unit_extract_refuses_nonrepeats(void)
+{
+    static rf_frame_t f;
+    static rf_unit_t u;
+
+    CASE("unit: no unit is invented where nothing repeats");
+
+    /* A single EV1527 word: one transmission, no internal repetition. This is
+     * the Haustür class, which must keep learning exactly as today. */
+    CHECK(rf_ev1527_build(0xA685Au, 0x8u, 350, &f), "build an EV1527 word");
+    CHECK(!rf_unit_extract(&f, 25, 120, &u), "a single EV1527 word has no unit");
+
+    /* Random noise: nothing periodic at any lag. */
+    rng_seed(77u);
+    rf_frame_reset(&f);
+    f.first_level = 1;
+    for (int i = 0; i < 220; i++) {
+        rf_frame_push(&f, (uint16_t)rng_range(80, 1400));
+    }
+    CHECK(!rf_unit_extract(&f, 25, 120, &u), "random noise has no unit");
+
+    /* A bare 300/900 alternation is periodic at EVERY even lag — fundamental
+     * period 2, i.e. rhythm, not a word. Accepting it (or rounding it up to
+     * a floor-sized pseudo-word) would hand rhythmic interference a matchable
+     * identity, so it must be refused outright. */
+    rf_frame_reset(&f);
+    f.first_level = 1;
+    for (int i = 0; i < 240; i++) {
+        rf_frame_push(&f, (uint16_t)((i & 1) ? 900 : 300));
+    }
+    CHECK(!rf_unit_extract(&f, 25, 120, &u), "a two-pulse rhythm is not a word");
+
+    /* Too short to hold two repeats of anything acceptable. */
+    rf_frame_reset(&f);
+    f.first_level = 1;
+    for (int i = 0; i < 12; i++) {
+        rf_frame_push(&f, (uint16_t)((i & 1) ? 900 : 300));
+    }
+    CHECK(!rf_unit_extract(&f, 25, 120, &u), "12 pulses cannot prove repetition");
+}
+
+static void test_unit_match_slides(void)
+{
+    static rf_frame_t word, win;
+    static rf_unit_t u;
+
+    CASE("unit: sliding match finds the unit at any phase, never in noise");
+    make_word(&word);
+
+    /* The stored unit, learned from one window of the stream. */
+    make_window(&win, &word, 0, 224, 5);
+    CHECK(rf_unit_extract(&win, 25, 120, &u), "learn the unit");
+
+    /* Fresh windows at every phase of the word: each must match, with the
+     * full-repeat count the window actually holds. */
+    rng_seed(424242u);
+    for (uint32_t off = 0; off < WORD_PULSES; off += 7) {
+        make_window(&win, &word, off, 230, 8);
+        uint16_t reps = rf_unit_match_frame(&win, &u.unit, 25, 120);
+        CHECK(reps >= 3, "phase %u: %u repeats found", off, reps);
+    }
+
+    /* Exactly one word, phase-aligned: one repeat. One pulse less: zero FULL
+     * repeats (and a window shorter than the unit can never match). */
+    make_window(&win, &word, 0, WORD_PULSES, 0);
+    CHECK(rf_unit_match_frame(&win, &u.unit, 25, 120) == 1, "one aligned word = 1");
+    make_window(&win, &word, 0, WORD_PULSES - 1, 0);
+    CHECK(rf_unit_match_frame(&win, &u.unit, 25, 120) == 0,
+          "a window shorter than the unit matches nothing");
+    /* Two words, cut mid-word: still only 1 FULL aligned repeat. */
+    make_window(&win, &word, 30, 2 * WORD_PULSES - 10, 0);
+    CHECK(rf_unit_match_frame(&win, &u.unit, 25, 120) == 1,
+          "partial copies at the edges do not count as repeats");
+
+    /* Clipped endpoints are tolerated — shorter only. */
+    make_window(&win, &word, 11, 230, 0);
+    win.durations_us[0] /= 3;
+    win.durations_us[win.count - 1] /= 3;
+    CHECK(rf_unit_match_frame(&win, &u.unit, 25, 120) >= 3,
+          "clipped first/last pulses still match");
+
+    /* FALSE-POSITIVE DISCIPLINE, the part that rings bells when wrong. A
+     * different word over the same 300/900 alphabet, same length, same gap,
+     * repeated and jittered exactly like the real one: one foreign pulse
+     * sequence must refuse the whole window, at the loose window too. */
+    {
+        static rf_frame_t foreign, fwin;
+        static const char fbits[] = "11010100011101001011000110110001001110101100011010";
+        rf_frame_reset(&foreign);
+        foreign.first_level = 1;
+        for (unsigned i = 0; fbits[i]; i++) {
+            rf_frame_push(&foreign, fbits[i] == '1' ? 900 : 300);
+        }
+        rf_frame_push(&foreign, 300);
+        rf_frame_push(&foreign, 1500);
+
+        for (uint32_t off = 0; off < WORD_PULSES; off += 5) {
+            make_window(&fwin, &foreign, off, 230, 8);
+            CHECK(rf_unit_match_frame(&fwin, &u.unit, 25, 120) == 0,
+                  "foreign stream (phase %u) at 25%% window", off);
+            CHECK(rf_unit_match_frame(&fwin, &u.unit, 30, 150) == 0,
+                  "foreign stream (phase %u) at the loose window", off);
+        }
+
+        /* Random noise, and the degenerate self-test of an empty unit. */
+        rng_seed(99u);
+        rf_frame_reset(&fwin);
+        fwin.first_level = 1;
+        for (int i = 0; i < 230; i++) {
+            rf_frame_push(&fwin, (uint16_t)rng_range(80, 1400));
+        }
+        CHECK(rf_unit_match_frame(&fwin, &u.unit, 30, 150) == 0,
+              "random noise never matches");
+        CHECK(rf_unit_match(&fwin, u.unit.durations_us, 0, 1, 25, 120) == 0,
+              "an empty unit matches nothing");
+    }
+}
+
 int main(void)
 {
     printf("rfpulse host tests\n");
@@ -1264,6 +1527,10 @@ int main(void)
     test_frag_three_way_run();
     test_frame_join_levels();
     test_frame_join_refusals();
+
+    test_unit_extract_recovers_word();
+    test_unit_extract_refuses_nonrepeats();
+    test_unit_match_slides();
 
     printf("------------------\n");
     printf("%d checks passed, %d failed\n", g_pass, g_fail);

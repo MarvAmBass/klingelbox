@@ -46,11 +46,20 @@
  * cannot remove is handled upstream by min_pulses and by rf_normalize()'s
  * outlier rejection, which is where noise rejection belongs anyway.
  *
- * TRUNCATED FRAMES ARE DROPPED, NOT DELIVERED. A capture that hit
- * RF_FRAME_MAX_PULSES is missing its tail and would replay as a different
- * waveform, so it is counted in dropped_full and thrown away. Delivering it
- * would put a subtly wrong recording into the signal store, which is worse than
- * delivering nothing.
+ * TRUNCATED FRAMES ARE DELIVERED, MARKED BY THEIR COUNT. A capture that hit
+ * RF_FRAME_MAX_PULSES used to be thrown away as unrepresentative — and for a
+ * transmitter that sends one word per press that reasoning holds. But the
+ * field data (2026-10) showed the OTHER kind: a transmitter that repeats its
+ * word continuously with gaps below the idle threshold produces NOTHING BUT
+ * ceiling-length frames, so "drop what is truncated" meant "discard every
+ * byte of evidence this button produces" (one 30 s learn session lost 18 of
+ * 26 frames that way). A truncated window still carries several full repeats
+ * of the word, which is everything unit extraction (rf_unit.h) and sliding
+ * matching need. So the frame is delivered as-is and counted in `truncated`;
+ * count == RF_FRAME_MAX_PULSES is the marker consumers (and the API's
+ * `truncated` flags) key off, and verbatim replay of such a window remains
+ * as wrong as it always was — which the UI says at the frame, where the
+ * decision is made, instead of this layer deciding for everyone.
  */
 #include <inttypes.h>
 #include <string.h>
@@ -250,10 +259,14 @@ static void rf_capture_task(void *arg)
         }
 
         if (!rf_symbols_to_frame(msg.syms, msg.num, s_cap.resolution_hz, &frame)) {
-            s_cap.stats.dropped_full++;
-            ESP_LOGW(TAG, "frame truncated at %d pulses, discarded",
+            /* Keep it: a ceiling-length window of a continuously-repeating
+             * transmitter is evidence, not garbage (see the file header).
+             * Debug level, not warn — a held button produces one of these
+             * every few hundred milliseconds, and that is working as
+             * intended, not a condition to alarm about. */
+            s_cap.stats.truncated++;
+            ESP_LOGD(TAG, "frame truncated at %d pulses, delivered as-is",
                      RF_FRAME_MAX_PULSES);
-            continue;
         }
         if (frame.count < s_cap.min_pulses) {
             s_cap.stats.dropped_short++;   /* RF energy, but no pulse stream */
@@ -478,9 +491,9 @@ void rf_capture_release(void)
         return;   /* idempotent: releasing twice, or before init, is a no-op */
     }
     ESP_LOGI(TAG, "releasing GPIO %d (frames=%" PRIu32 " short=%" PRIu32
-                  " full=%" PRIu32 " overruns=%" PRIu32 ")",
+                  " truncated=%" PRIu32 " overruns=%" PRIu32 ")",
              (int)s_cap.pin, s_cap.stats.frames, s_cap.stats.dropped_short,
-             s_cap.stats.dropped_full, s_cap.stats.overruns + s_isr_overruns);
+             s_cap.stats.truncated, s_cap.stats.overruns + s_isr_overruns);
     rf_capture_teardown();
 }
 

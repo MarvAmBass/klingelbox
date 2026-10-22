@@ -89,7 +89,8 @@ RF_SRCS := test_rf_decode.c \
         $(RFPULSE)/rf_frame.c \
         $(RFPULSE)/rf_decode.c \
         $(RFPULSE)/rf_ev1527.c \
-        $(RFPULSE)/rf_group.c
+        $(RFPULSE)/rf_group.c \
+        $(RFPULSE)/rf_unit.c
 
 NG_SRCS := test_node_graph.c \
         $(MAIN)/node_migrate.c \
@@ -104,7 +105,8 @@ NG_SRCS := test_node_graph.c \
         $(RFPULSE)/rf_frame.c \
         $(RFPULSE)/rf_decode.c \
         $(RFPULSE)/rf_ev1527.c \
-        $(RFPULSE)/rf_group.c
+        $(RFPULSE)/rf_group.c \
+        $(RFPULSE)/rf_unit.c
 
 BINS := test_rf_decode test_node_graph test_version_cmp test_http_auth
 
@@ -112,7 +114,7 @@ BINS := test_rf_decode test_node_graph test_version_cmp test_http_auth
 all: $(BINS)
 
 test_rf_decode: $(RF_SRCS) $(RFPULSE)/include/rf_frame.h $(RFPULSE)/include/rf_decode.h \
-        $(RFPULSE)/include/rf_group.h
+        $(RFPULSE)/include/rf_group.h $(RFPULSE)/include/rf_unit.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ $(RF_SRCS)
 
 # -Istubs comes LAST so a real header always wins if one is ever added; the

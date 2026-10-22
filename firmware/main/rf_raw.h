@@ -36,8 +36,11 @@
  * reports, separately: whether carrier energy was ever sensed at all, the peak
  * and quietest RSSI over the session, how many frames were rejected by the
  * (much lower) noise floor, how many were too SHORT even for the relaxed
- * minimum, and how many were too LONG for RF_FRAME_MAX_PULSES and therefore
- * thrown away by the capture layer before we ever saw them.
+ * minimum, and how many hit the RF_FRAME_MAX_PULSES ceiling — those are KEPT
+ * with their tail cut off (truncated != dropped; the capture layer used to
+ * throw them away, which for a continuously-repeating transmitter meant
+ * discarding nearly the whole session), and the count is reported so the UI
+ * can say what the ceiling did.
  *
  * MEMORY. RAM only, never flash: a session is scratch data for a person staring
  * at a screen, and writing 36 KB of noise to NVS would wear it out for nothing.
@@ -173,6 +176,19 @@ typedef struct {
  * Frankenstein of sixteen scraps. */
 #define DB_RAW_MAX_PARTS 8
 
+/*
+ * Per-pulse window for "the same pulse, one repeat later" INSIDE one capture
+ * (rf_unit_extract over a recorded window — the candidate annotation here and
+ * the save endpoint's learn step both use it). 25 % / 120 us is the window
+ * rf_service's burst coalescing already trusts for "this frame is the
+ * previous frame again" (BURST_TOL_PCT/_US; repeated because that module owns
+ * the radio and must not be included for two numbers) — and within a single
+ * recording the oscillator has drifted even less than between the frames of a
+ * burst, so the window is generous rather than tight.
+ */
+#define DB_RAW_UNIT_TOL_PCT 25
+#define DB_RAW_UNIT_TOL_US  120
+
 /* Runs of fragments tracked per session. */
 #define DB_RAW_MAX_RUNS 16
 
@@ -210,6 +226,17 @@ typedef struct {
     uint32_t decoded_id;
     uint8_t  decoded_button;
     char     text[RF_DECODE_TEXT_MAX];
+
+    /* Repeat structure (rf_unit.h), when the candidate's waveform is one word
+     * repeating continuously: how long the word is, how often it repeats
+     * inside this recording, and the inter-repeat silence. unit_repeats == 0
+     * means no such structure — the candidate is a single transmission and
+     * saving stores it verbatim; >= 2 means saving will store the WORD. The
+     * UI needs this up front so "this transmitter repeats a 52-pulse word"
+     * can be said at the list, not discovered after the save. */
+    uint16_t unit_pulses;
+    uint16_t unit_repeats;
+    uint32_t unit_gap_us;
 } db_raw_candidate_t;
 
 typedef struct {
@@ -230,7 +257,8 @@ typedef struct {
     /* Why frames did not make it, split by cause — see the file header. */
     uint32_t dropped_floor;      /* below rssi_floor_dbm (we saw and rejected)  */
     uint32_t dropped_short;      /* below min_pulses (capture layer rejected)   */
-    uint32_t dropped_full;       /* hit RF_FRAME_MAX_PULSES, thrown away        */
+    uint32_t truncated;          /* hit RF_FRAME_MAX_PULSES — kept, tail cut;
+                                    NOT a drop (these frames are in the list)  */
     uint32_t overruns;           /* consumer too slow; frame lost               */
     uint32_t dropped_capacity;   /* arrived after every slot was taken          */
     uint32_t heard;              /* frames handed up by the capture layer       */
