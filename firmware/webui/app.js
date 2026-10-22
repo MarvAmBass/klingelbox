@@ -2385,6 +2385,18 @@ function openListenFlow(opts) {
         add(state, el("span", "pulse"), el("span", null,
           t("Listening — press your button now, several times. {used} of {cap} slots used.",
             { used: numOr(st.count, 0), cap: numOr(st.capacity, 32) })));
+        /* Degraded capacity, said out loud: a box low on memory starts the
+           session anyway and grows its buffer frame by frame (firmware
+           rf_raw.h), so the honest line here is how many slots TODAY'S heap
+           can reach. Only shown when that is below the design maximum —
+           on a healthy box the two are equal and this line never appears. */
+        var capMax = numOr(st.capacity, 32);
+        var capNow = numOr(st.slots_possible, capMax);
+        if (capNow < capMax) {
+          add(state, el("div", "hint", t("Recording with {n} of {cap} frame "
+            + "slots available — the box is low on memory, so this session "
+            + "holds fewer frames than usual.", { n: capNow, cap: capMax })));
+        }
       } else {
         count.textContent = "—";
         count.className = "countdown idle";
@@ -7800,6 +7812,24 @@ function renderDiagSysline() {
     ? t("Up {d} — last restart: {reason}.", { d: durText(up), reason: reason })
     : t("Up {d}.", { d: durText(up) });
   add(line, el("div", (meta && meta.sev === "warn") ? "note warn" : "hint", text));
+
+  /* Memory, with the two numbers plain free_heap cannot tell apart: the lowest
+     the heap has EVER been since boot (how deep the transient peaks dip), and
+     the largest single free block (fragmentation — "80 KB free" can coexist
+     with "nothing contiguous over 10 KB", which is what an old uptime feels
+     like). Older firmware omits the two extra fields; the line degrades to the
+     plain free number rather than disappearing. */
+  var freeB = numOr(sys.free_heap, null);
+  if (freeB !== null) {
+    var kb = function (b) { return Math.round(b / 1024); };
+    var minB = numOr(sys.min_free_heap, null);
+    var blkB = numOr(sys.largest_free_block, null);
+    var mtext = (minB !== null && blkB !== null)
+      ? t("Free RAM {free} KB — lowest since boot {min} KB, largest free block {blk} KB.",
+          { free: kb(freeB), min: kb(minB), blk: kb(blkB) })
+      : t("Free RAM {free} KB.", { free: kb(freeB) });
+    add(line, el("div", "hint", mtext));
+  }
 }
 
 /* The settings-storage line + the trouble record, fed by /api/system

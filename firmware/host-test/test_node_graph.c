@@ -61,6 +61,7 @@
 #include "node_migrate.h"
 #include "nvs.h"
 #include "pem_scan.h"
+#include "rf_raw_budget.h"
 #include "signal_store.h"
 
 /* ---- micro test harness (same shape as test_rf_decode.c) ----------------- */
@@ -1962,6 +1963,90 @@ static void hot_mqtt_sink(const db_node_t *node, const db_trigger_t *trig, void 
     s_mqtt_calls++;
 }
 
+/* ---- the raw-session memory budget (rf_raw_budget.h) ----------------------
+ *
+ * Pure arithmetic with exactly one job: decide what a capture session may take
+ * from the heap while leaving the Wi-Fi/lwIP reserve untouched. The cases
+ * pinned here are the ones a live box cannot reproduce on demand: the
+ * one-byte-short boundary on each side of every comparison, the free-heap-
+ * below-reserve underflow that a naive `free - reserve` would wrap on, and
+ * the exact slot-count projection the UI's "N of 32 slots available" line is
+ * built from. The numbers mirror the real module: 48 KB reserve, ~7 KB
+ * analysis scratch, ~1.1 KB slots, a floor of 4 — including the live
+ * regression this logic exists to fix, a box idling at 86 KB free that the
+ * old all-32-up-front gate refused outright.
+ */
+
+static void test_raw_budget_start(void)
+{
+    const size_t scratch = 7 * 1024, slot = 1136, reserve = 48 * 1024;
+    const size_t need = scratch + 4 * slot;   /* the floor allocation */
+
+    CASE("raw budget: start gate");
+    /* The regression case: 86 KB free must start a session (the old gate
+     * needed scratch + 32 slots + reserve ~= 91.5 KB and said no). */
+    CHECK(db_raw_budget_start_ok(86 * 1024, scratch, slot, 4, reserve),
+          "86 KB free starts a floor-sized session");
+    /* Exact boundary, both sides. */
+    CHECK(db_raw_budget_start_ok(reserve + need, scratch, slot, 4, reserve),
+          "exactly reserve+need is enough");
+    CHECK(!db_raw_budget_start_ok(reserve + need - 1, scratch, slot, 4, reserve),
+          "one byte short refuses");
+    /* Below the reserve the subtraction must not wrap. */
+    CHECK(!db_raw_budget_start_ok(reserve - 1, 0, 0, 0, reserve),
+          "free below the reserve refuses even a zero-byte ask");
+    CHECK(!db_raw_budget_start_ok(0, scratch, slot, 4, reserve),
+          "an empty heap refuses");
+    /* Degenerate floors. */
+    CHECK(db_raw_budget_start_ok(reserve + scratch, scratch, slot, 0, reserve),
+          "a floor of zero slots asks only for the scratch");
+    CHECK(db_raw_budget_start_ok(reserve + scratch, scratch, slot, -3, reserve),
+          "a negative floor is clamped to zero, not wrapped huge");
+}
+
+static void test_raw_budget_grow(void)
+{
+    const size_t slot = 1136, reserve = 48 * 1024;
+
+    CASE("raw budget: per-frame growth");
+    CHECK(db_raw_budget_grow_ok(reserve + slot, slot, reserve),
+          "exactly reserve+slot may grow");
+    CHECK(!db_raw_budget_grow_ok(reserve + slot - 1, slot, reserve),
+          "one byte short may not");
+    CHECK(!db_raw_budget_grow_ok(reserve - 1, slot, reserve),
+          "below the reserve may not (and must not wrap)");
+    CHECK(!db_raw_budget_grow_ok(0, slot, reserve), "empty heap may not");
+    CHECK(db_raw_budget_grow_ok(reserve, 0, reserve),
+          "a zero-byte slot is trivially affordable at the reserve line");
+}
+
+static void test_raw_budget_slots_possible(void)
+{
+    const size_t slot = 1136, reserve = 48 * 1024;
+
+    CASE("raw budget: slots projection");
+    /* A healthy box projects the full 32 whatever it currently holds. */
+    CHECK(db_raw_budget_slots_possible(90 * 1024, slot, reserve, 4, 32) == 32,
+          "90 KB free projects all 32 slots");
+    /* The tight box gets a smaller, exact number: (60K-48K)/1136 = 10 more. */
+    CHECK(db_raw_budget_slots_possible(60 * 1024, slot, reserve, 4, 32) == 14,
+          "60 KB free projects 4 held + 10 affordable = 14");
+    /* Boundary: room for exactly one more, and one byte less than that. */
+    CHECK(db_raw_budget_slots_possible(reserve + slot, slot, reserve, 4, 32) == 5,
+          "exactly one slot of room projects have+1");
+    CHECK(db_raw_budget_slots_possible(reserve + slot - 1, slot, reserve, 4, 32) == 4,
+          "one byte short of a slot projects only what is held");
+    /* Floors and caps. */
+    CHECK(db_raw_budget_slots_possible(reserve - 1, slot, reserve, 4, 32) == 4,
+          "below the reserve the projection is the held count");
+    CHECK(db_raw_budget_slots_possible(0, slot, reserve, 32, 32) == 32,
+          "already at the maximum stays the maximum");
+    CHECK(db_raw_budget_slots_possible(1024 * 1024, slot, reserve, 31, 32) == 32,
+          "a huge heap still caps at the maximum");
+    CHECK(db_raw_budget_slots_possible(1024 * 1024, 0, reserve, 4, 32) == 4,
+          "a zero slot size cannot divide — the guard answers the held count");
+}
+
 /*
  * THE DOORBELL MUST RING ON A FULL FLASH. This drives the real chain — the
  * same functions the capture/dispatch/graph tasks run — against an NVS with
@@ -2154,6 +2239,10 @@ int main(void)
     test_tls_notice_reason_is_structural_when_it_can_be();
     test_tls_half_pair_cert_only();
     test_tls_half_pair_key_only();
+
+    test_raw_budget_start();
+    test_raw_budget_grow();
+    test_raw_budget_slots_possible();
 
     test_storage_bucket_names();
     test_storage_breadcrumb_round_trip();

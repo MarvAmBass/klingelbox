@@ -40,7 +40,11 @@
 #                    save/rollback discipline, the delete ordering that a
 #                    power cut must not turn into a ghost signal, the
 #                    boot-time flash reconciliation, and the store-full
-#                    budget check. Also db_tls.c's load-path decisions —
+#                    budget check. Plus the raw capture session's heap-budget
+#                    arithmetic (main/rf_raw_budget.h, header-only): the
+#                    start/grow/projection decisions that let a session start
+#                    small and grow per frame instead of refusing outright on
+#                    a tight box. Also db_tls.c's load-path decisions —
 #                    activate vs replace vs discard — against the same fake
 #                    NVS plus a content-driven fake mbedTLS
 #                    (stubs/host_mbedtls.c): the property pinned there is
@@ -110,7 +114,7 @@ test_rf_decode: $(RF_SRCS) $(RFPULSE)/include/rf_frame.h $(RFPULSE)/include/rf_d
 # which is the moment to decide whether it belongs in the testable core at all.
 test_node_graph: $(NG_SRCS) $(MAIN)/node_migrate.h $(MAIN)/node_graph.h \
         $(MAIN)/mqtt_topic.h $(MAIN)/signal_store.h $(MAIN)/db_storage.h \
-        $(MAIN)/db_tls.h \
+        $(MAIN)/db_tls.h $(MAIN)/rf_raw_budget.h \
         $(MAIN)/pem_scan.h stubs/esp_err.h \
         stubs/driver/gpio.h stubs/nvs.h stubs/host_env.h stubs/host_env.c \
         stubs/mbedtls/pk.h stubs/mbedtls/ecp.h stubs/mbedtls/ctr_drbg.h \

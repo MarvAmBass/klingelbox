@@ -190,6 +190,7 @@ to be fetchable before any trust exists.
 ```json
 { "version": "0.1.0", "idf": "v5.3.1", "hostname": "doorbell",
   "uptime_s": 1234, "free_heap": 210000,
+  "min_free_heap": 68000, "largest_free_block": 55000,
   "reset_reason": 1, "reset_reason_text": "power-on",
   "partition": "ota_0",
   "wifi_mode": "normal|recovery|connecting",
@@ -498,8 +499,13 @@ mis-decoded — it is *invisible*, with nothing said about it anywhere.
 | frame boundary (idle) | 8000 µs, fixed | `idle_us`, 1000–32000, default 8000 |
 | burst coalescing | 250 ms after the last copy, fuzzy merge | none — every frame kept separately |
 
-A session holds **32 frames in RAM, never flash**, and stops when the slots are
-full or the time runs out, whichever comes first. Stopping does **not** free the
+A session holds **up to 32 frames in RAM, never flash**, and stops when the
+slots are full or the time runs out, whichever comes first. The buffer starts
+small (4 slots plus the analysis scratch) and **grows one slot per captured
+frame**, each step gated on leaving a heap reserve untouched — so a box low on
+memory still records, just with fewer slots. `slots` is what the session holds
+now, `slots_possible` what today's heap would let it reach; frames arriving
+past that are counted in `dropped.no_room`. Stopping does **not** free the
 frames — you cannot trim what has been freed — so the memory goes back on
 `DELETE /api/raw`, when the next session starts, or after 10 minutes with no
 `GET /api/raw`.
@@ -519,8 +525,9 @@ opposite level; `first_level` is adjusted for you.
 ```
 Out-of-range values are clamped, not rejected. Returns the session state below.
 **409** if a session is already running, **503** with no radio, and **503** with
-a sentence about memory if the ~36 KB of frame slots cannot be allocated (in
-which case nothing is allocated and capture is left exactly as it was).
+a sentence naming the actual numbers if not even the minimal session (analysis
+scratch plus 4 slots, ~12 KB, plus the 48 KB reserve) fits — in which case
+nothing is allocated and capture is left exactly as it was.
 
 ### `POST /api/raw/stop` — `{}` → the session state. Stops recording, keeps the frames.
 ### `DELETE /api/raw` — `{}` → `{"ok":true}`. Stops if needed, then frees the frames.
@@ -528,7 +535,8 @@ which case nothing is allocated and capture is left exactly as it was).
 ### `GET /api/raw`
 ```json
 { "running": true, "held": true, "elapsed_s": 3, "remaining_s": 27,
-  "count": 2, "capacity": 32, "stop_reason": "",
+  "count": 2, "capacity": 32, "slots": 4, "slots_possible": 32,
+  "stop_reason": "",
   "settings": { "seconds": 30, "idle_us": 8000, "min_pulses": 4,
                 "rssi_floor_dbm": -80, "squelch_off": false },
   "dropped": { "below_floor": 118, "too_short": 39, "too_long": 0,

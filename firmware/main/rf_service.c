@@ -361,7 +361,8 @@ static void check_idle_health(void)
 
     /* A finished raw session is kept so it can be inspected, trimmed and saved
      * — but only for as long as somebody is looking at it. This is where its
-     * ~36 KB goes back to a box nobody came back to. */
+     * slots (up to ~36 KB on a roomy heap) go back to a box nobody came back
+     * to. */
     if (db_raw_stale()) {
         ESP_LOGI(TAG, "discarding a raw session nobody read for %d s",
                  DB_RAW_HOLD_SECS);

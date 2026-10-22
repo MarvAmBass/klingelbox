@@ -18,11 +18,18 @@
  *    backwards. note_capture_stats() accumulates across those resets instead of
  *    assigning, which is the only way these numbers stay honest.
  *
- * 3. THE SLOTS ARE 32 SEPARATE ALLOCATIONS, NOT ONE ARRAY. ~36 KB in one
- *    contiguous block is a lot to ask of an internal heap that is also carrying
- *    Wi-Fi buffers; 32 x ~1.1 KB is not. Fragmentation is exactly the condition
- *    a diagnostic feature has to survive, since the box has been up for days by
- *    the time anyone reaches for it.
+ * 3. THE SLOTS ARE 32 SEPARATE ALLOCATIONS, NOT ONE ARRAY — AND THEY ARRIVE
+ *    ONE AT A TIME. ~36 KB in one contiguous block is a lot to ask of an
+ *    internal heap that is also carrying Wi-Fi buffers; 32 x ~1.1 KB is not.
+ *    Fragmentation is exactly the condition a diagnostic feature has to
+ *    survive, since the box has been up for days by the time anyone reaches
+ *    for it. The per-slot shape also carries the availability rework: a session
+ *    starts with only DB_RAW_FLOOR_SLOTS slots and grows one slot per captured
+ *    frame, each growth gated on leaving DB_RAW_HEAP_RESERVE untouched
+ *    (rf_raw_budget.h). A box with room still reaches all 32; a box that has
+ *    drifted down to ~86 KB free — which the old all-32-up-front gate refused
+ *    outright — now gets a smaller but WORKING session, and the only true
+ *    refusal left is "not even the scratch plus four slots fit".
  *
  * 4. THE ANALYSIS SCRATCH IS PART OF THE SESSION, NOT PART OF THE MODULE.
  *    Grouping 32 frames needs ~7 KB of working arrays. Holding that permanently
@@ -44,6 +51,8 @@
 #include <inttypes.h>
 #include <stdio.h>
 #include <string.h>
+
+#include "rf_raw_budget.h"
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -68,6 +77,10 @@ typedef struct {
 } db_raw_slot_t;
 
 static db_raw_slot_t *s_slot[DB_RAW_MAX_FRAMES];
+/* How many of s_slot[] are currently allocated. Slots are only ever appended
+ * (grow_one_slot) or freed wholesale (free_slots), so s_slot[0..s_slots) are
+ * non-NULL and the rest are NULL — the invariant every reader below relies on. */
+static int s_slots;
 
 /* The grouping/ranking working set — see note (4). One allocation, alive for
  * exactly as long as the frames it describes. */
@@ -181,24 +194,48 @@ static void free_slots(void)
             s_slot[i] = NULL;
         }
     }
+    s_slots = 0;
     if (s_an != NULL) {
         heap_caps_free(s_an);
         s_an = NULL;
     }
 }
 
-/* Caller holds the lock. All-or-nothing: a partial allocation is rolled back so
- * a session never runs with fewer slots than it advertises. */
-static esp_err_t alloc_slots(void)
+/* Add one slot to the session, if the budget allows it RIGHT NOW. Caller holds
+ * the lock. "No" is never latched: the heap breathes (a TLS connection closing
+ * hands back ~20 KB at a stroke), so the next frame simply asks again. */
+static bool grow_one_slot(void)
 {
-    for (int i = 0; i < DB_RAW_MAX_FRAMES; i++) {
+    if (s_slots >= DB_RAW_MAX_FRAMES) {
+        return false;
+    }
+    if (!db_raw_budget_grow_ok(heap_caps_get_free_size(MALLOC_CAP_8BIT),
+                               sizeof(db_raw_slot_t), DB_RAW_HEAP_RESERVE)) {
+        return false;
+    }
+    db_raw_slot_t *slot = heap_caps_malloc(sizeof(db_raw_slot_t), MALLOC_CAP_8BIT);
+    if (slot == NULL) {
+        return false;   /* the budget said yes but the heap is too fragmented */
+    }
+    s_slot[s_slots++] = slot;
+    return true;
+}
+
+/* Caller holds the lock. The session's STARTING set: the analysis scratch plus
+ * DB_RAW_FLOOR_SLOTS slots — everything else arrives per frame (grow_one_slot).
+ * Still all-or-nothing at this size: a session that cannot even analyse what it
+ * records is not a smaller session, it is a broken one. */
+static esp_err_t alloc_floor(void)
+{
+    for (int i = 0; i < DB_RAW_FLOOR_SLOTS; i++) {
         s_slot[i] = heap_caps_malloc(sizeof(db_raw_slot_t), MALLOC_CAP_8BIT);
         if (s_slot[i] == NULL) {
-            ESP_LOGE(TAG, "out of memory at slot %d of %d (%u bytes each)",
-                     i, DB_RAW_MAX_FRAMES, (unsigned)sizeof(db_raw_slot_t));
+            ESP_LOGE(TAG, "out of memory at floor slot %d of %d (%u bytes each)",
+                     i, DB_RAW_FLOOR_SLOTS, (unsigned)sizeof(db_raw_slot_t));
             free_slots();
             return ESP_ERR_NO_MEM;
         }
+        s_slots = i + 1;
     }
     s_an = heap_caps_calloc(1, sizeof(*s_an), MALLOC_CAP_8BIT);
     if (s_an == NULL) {
@@ -208,6 +245,17 @@ static esp_err_t alloc_slots(void)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+void db_raw_mem_floor(size_t *floor_bytes, size_t *reserve_bytes)
+{
+    if (floor_bytes != NULL) {
+        *floor_bytes = sizeof(db_raw_analysis_t) +
+                       (size_t)DB_RAW_FLOOR_SLOTS * sizeof(db_raw_slot_t);
+    }
+    if (reserve_bytes != NULL) {
+        *reserve_bytes = DB_RAW_HEAP_RESERVE;
+    }
 }
 
 /* ---- session lifecycle --------------------------------------------------- */
@@ -262,16 +310,23 @@ esp_err_t db_raw_start(const db_raw_cfg_t *cfg)
     free_slots();
     reset_session();
 
-    size_t need = (size_t)DB_RAW_MAX_FRAMES * sizeof(db_raw_slot_t) +
-                  sizeof(db_raw_analysis_t);
+    /* The gate asks only for what a session actually needs to START: the
+     * analysis scratch plus DB_RAW_FLOOR_SLOTS slots (~12 KB), with the reserve
+     * intact. The other 28 slots are requested one at a time as frames arrive
+     * (db_raw_offer), each against the same reserve — capacity degrades on a
+     * tight box, availability does not. */
+    size_t need = sizeof(db_raw_analysis_t) +
+                  (size_t)DB_RAW_FLOOR_SLOTS * sizeof(db_raw_slot_t);
     size_t free_now = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    if (free_now < need + DB_RAW_HEAP_RESERVE) {
+    if (!db_raw_budget_start_ok(free_now, sizeof(db_raw_analysis_t),
+                                sizeof(db_raw_slot_t), DB_RAW_FLOOR_SLOTS,
+                                DB_RAW_HEAP_RESERVE)) {
         ESP_LOGE(TAG, "refusing to start: %u bytes free, %u needed plus a %u reserve",
                  (unsigned)free_now, (unsigned)need, (unsigned)DB_RAW_HEAP_RESERVE);
         unlock();
         return ESP_ERR_NO_MEM;
     }
-    esp_err_t err = alloc_slots();
+    esp_err_t err = alloc_floor();
     if (err != ESP_OK) {
         unlock();
         return err;
@@ -287,9 +342,10 @@ esp_err_t db_raw_start(const db_raw_cfg_t *cfg)
     unlock();
 
     ESP_LOGI(TAG, "session started: %" PRIu32 " s, idle %" PRIu32 " us, "
-                  "min %u pulses, floor %d dBm, %d slots (%u bytes)",
+                  "min %u pulses, floor %d dBm, %d of %d slots up front (%u bytes)",
              want.seconds, want.idle_us, (unsigned)want.min_pulses,
-             (int)want.rssi_floor_dbm, DB_RAW_MAX_FRAMES, (unsigned)need);
+             (int)want.rssi_floor_dbm, DB_RAW_FLOOR_SLOTS, DB_RAW_MAX_FRAMES,
+             (unsigned)need);
     return ESP_OK;
 }
 
@@ -378,6 +434,27 @@ void db_raw_offer(const rf_frame_t *frame, int rssi_dbm)
     }
 
     if (s.count >= DB_RAW_MAX_FRAMES) {
+        s.dropped_capacity++;
+        unlock();
+        return;
+    }
+
+    /* Out of allocated slots: grow by one, here, before accepting the frame.
+     *
+     * Yes, that is a malloc on the capture task — and it is fine, for the same
+     * reason the rf_normalize()+rf_decode() pass two lines down is fine: this
+     * runs at most once per captured frame, frames arrive no faster than one
+     * per ~11 ms even at the relaxed thresholds (rf_service.c's fairness note),
+     * and a 1.1 KB heap_caps_malloc is microseconds against that. Deferring the
+     * allocation to a service point would instead mean dropping the very frame
+     * that asked for the slot — the one the user just pressed a button for.
+     *
+     * A refusal (budget says no, or the heap is too fragmented) is counted as
+     * dropped_capacity, exactly like hitting the 32-slot ceiling: "the session
+     * had no room" is one answer to the user whichever limit produced it. It is
+     * also NOT final — the next frame asks again, so a session that started
+     * tight picks up slots as the heap breathes. */
+    if (s.count >= s_slots && !grow_one_slot()) {
         s.dropped_capacity++;
         unlock();
         return;
@@ -799,6 +876,18 @@ void db_raw_get_state(db_raw_state_t *out)
     out->count       = s.count;
     out->capacity    = DB_RAW_MAX_FRAMES;
     out->stop_reason = s.stop_reason ? s.stop_reason : "";
+
+    /* What the session HAS and what it could still REACH on today's heap. The
+     * projection, not the allocated count, is what the UI's "N of 32 frame
+     * slots available" line shows: a quiet session on a healthy box holds only
+     * the floor slots but could reach all 32, and telling its user "4 of 32"
+     * would be alarming and wrong. Below-32 projections wobble a little with
+     * the heap; that is honest, and the UI only shows them at all when the
+     * session genuinely cannot reach the maximum. */
+    out->slots          = (uint16_t)s_slots;
+    out->slots_possible = (uint16_t)db_raw_budget_slots_possible(
+        heap_caps_get_free_size(MALLOC_CAP_8BIT), sizeof(db_raw_slot_t),
+        DB_RAW_HEAP_RESERVE, s_slots, DB_RAW_MAX_FRAMES);
 
     if (s.held) {
         int64_t end = s.running ? now : s.stopped_us;

@@ -41,11 +41,15 @@
  *
  * MEMORY. RAM only, never flash: a session is scratch data for a person staring
  * at a screen, and writing 36 KB of noise to NVS would wear it out for nothing.
- * The slots are allocated when a session starts and freed when it is discarded,
- * so an idle box pays 128 bytes of pointers and nothing else. The allocation is
- * checked and refused cleanly — this heap also carries Wi-Fi buffers and an open
- * HTTP connection, and an out-of-memory crash while diagnosing a radio fault
- * would be a spectacularly unhelpful thing to do.
+ * A session starts with its analysis scratch plus DB_RAW_FLOOR_SLOTS slots and
+ * GROWS one slot per captured frame, each step gated on leaving the heap
+ * reserve untouched (rf_raw_budget.h) — so a box with room reaches all 32
+ * slots, a tight box gets a smaller but working session, and only "not even
+ * the floor fits" refuses outright. Everything is freed when the session is
+ * discarded, so an idle box pays 132 bytes of pointers and nothing else. The
+ * budget discipline exists because this heap also carries Wi-Fi buffers and an
+ * open HTTP connection, and an out-of-memory crash while diagnosing a radio
+ * fault would be a spectacularly unhelpful thing to do.
  *
  * WHY STOP DOES NOT FREE. Recording and inspecting are separate phases. A
  * session auto-stops (buffer full or time up) and the frames must survive that,
@@ -64,6 +68,7 @@
 #define DB_RF_RAW_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -79,6 +84,13 @@ extern "C" {
 /* Slots in a session. 32 x ~1.1 KB is ~36 KB — a large but affordable bite out
  * of the ~140 KB this box has free, and it is handed straight back afterwards. */
 #define DB_RAW_MAX_FRAMES 32
+
+/* Slots allocated UP FRONT when a session starts; the rest arrive one per
+ * captured frame, budget permitting (see MEMORY above). Four is enough to
+ * record a press or two before the first growth decision ever has to be made,
+ * and small enough (~4.5 KB with the ~7 KB scratch) that the start gate clears
+ * on any box that is alive at all. */
+#define DB_RAW_FLOOR_SLOTS 4
 
 /* A stopped session is kept this long for inspection, then freed on its own so
  * a box nobody came back to does not hold 36 KB until the next reboot. */
@@ -207,7 +219,12 @@ typedef struct {
     uint32_t     elapsed_s;
     uint32_t     remaining_s;    /* 0 once stopped */
     uint16_t     count;
-    uint16_t     capacity;
+    uint16_t     capacity;       /* the design maximum, DB_RAW_MAX_FRAMES */
+    uint16_t     slots;          /* slots allocated right now */
+    uint16_t     slots_possible; /* slots reachable on today's heap, <= capacity.
+                                  * Below capacity it is a live projection and
+                                  * may wobble a little between reads — the UI
+                                  * shows it only when it IS below capacity. */
     const char  *stop_reason;    /* "", "time", "full", "user", "radio" */
 
     /* Why frames did not make it, split by cause — see the file header. */
@@ -257,6 +274,13 @@ void db_raw_stop(const char *reason);
 
 /* Free everything. Safe at any time. */
 void db_raw_discard(void);
+
+/* What a session needs at minimum: the floor allocation (analysis scratch +
+ * DB_RAW_FLOOR_SLOTS slots) and the heap reserve the budget protects. Served
+ * as a function because the slot and scratch types are private to rf_raw.c —
+ * this is how http_api's refusal message names the ACTUAL numbers instead of
+ * hard-coding a figure that goes stale. Either pointer may be NULL. */
+void db_raw_mem_floor(size_t *floor_bytes, size_t *reserve_bytes);
 
 /* True while frames are being recorded. */
 bool db_raw_active(void);

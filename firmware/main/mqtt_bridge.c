@@ -217,9 +217,23 @@ static int      s_slug_count;
  * STATIC, NOT STACK, deliberately: together they are ~6 KB against a 6 KB
  * task stack that also carries cJSON. Single-buffer reuse is safe for the
  * same reason s_tx_frame's is — only the bridge task ever touches them.
+ *
+ * ONE UNION, NOT TWO ARRAYS (2026-10 RAM audit): their useful lives never
+ * overlap, so they share the storage and the smaller array's ~2.5 KB goes
+ * back to the heap. The invariant that makes this safe is SEQUENCING on the
+ * one bridge task: a signal snapshot (slug_table_build) is consumed before
+ * the first node snapshot of the same pass is taken — in announce() the
+ * s_snap.sig reads end in the HA loop, and sync_trigger_subs()/
+ * sync_switch_subs(), the only writers of s_snap.node, run strictly after
+ * it; everything later re-reads nodes via db_graph_node_copy(), never the
+ * snapshot. IF YOU ADD A READ of s_snap.sig after a sync_*_subs() call (or
+ * vice versa), split the union back into two arrays — the compiler cannot
+ * catch that mistake for you.
  */
-static db_signal_meta_t s_sig_snap[DB_SIGNAL_MAX];   /* slug_table_build/announce */
-static db_node_t        s_node_snap[DB_NODE_MAX];    /* sync_*_subs               */
+static union {
+    db_signal_meta_t sig[DB_SIGNAL_MAX];   /* slug_table_build/announce */
+    db_node_t        node[DB_NODE_MAX];    /* sync_*_subs               */
+} s_snap;
 
 /* Discovery snapshot: what we last announced, so a rename or a delete can clear
  * the retained config of the topic that went away. */
@@ -445,8 +459,8 @@ static void slug_table_build(void)
      * one signal's name with another's id — and id_for_slug() then keyed the
      * WRONG waveform onto the air (finding #11). The snapshot is one locked
      * memcpy; announce() reads the same records by index afterwards. */
-    const db_signal_meta_t *list = s_sig_snap;
-    int n = db_signals_snapshot(s_sig_snap, DB_SIGNAL_MAX);
+    const db_signal_meta_t *list = s_snap.sig;
+    int n = db_signals_snapshot(s_snap.sig, DB_SIGNAL_MAX);
     s_slug_count = 0;
 
     for (int i = 0; i < n; i++) {
@@ -1404,8 +1418,8 @@ static void sync_trigger_subs(bool resub)
      * and half of another — a subscription to a garbage suffix. The snapshot
      * may be stale the moment it is taken, which is fine: the mutation that
      * staled it also queued the MSG_ANNOUNCE that reruns this. */
-    const db_node_t *nodes = s_node_snap;
-    int n = db_graph_nodes_snapshot(s_node_snap, DB_NODE_MAX);
+    const db_node_t *nodes = s_snap.node;
+    int n = db_graph_nodes_snapshot(s_snap.node, DB_NODE_MAX);
 
     if (resub)
         s_sub_count = 0;   /* the broker dropped them; nothing to unsubscribe */
@@ -1498,8 +1512,8 @@ static void sync_switch_subs(bool resub)
     char t[DB_MQTT_TOPIC_MAX];
     /* Snapshot for the same reason as sync_trigger_subs() — one shared static
      * buffer is fine, the two passes run sequentially on this one task. */
-    const db_node_t *nodes = s_node_snap;
-    int n = db_graph_nodes_snapshot(s_node_snap, DB_NODE_MAX);
+    const db_node_t *nodes = s_snap.node;
+    int n = db_graph_nodes_snapshot(s_snap.node, DB_NODE_MAX);
 
     if (resub)
         s_sw_count = 0;
@@ -1592,11 +1606,11 @@ static void announce(bool resub)
 
     if (ha) {
         for (int i = 0; i < s_slug_count; i++) {
-            /* s_sig_snap[i] and s_slug[i] describe the same signal by
+            /* s_snap.sig[i] and s_slug[i] describe the same signal by
              * construction: slug_table_build() (just above) appends exactly
              * one slug per snapshot record, in order. The snapshot, not
              * db_signals_get() — bridge task, see signal_store.h. */
-            const db_signal_meta_t *m = &s_sig_snap[i];
+            const db_signal_meta_t *m = &s_snap.sig[i];
             announce_signal_trigger(m, s_slug[i]);
             announce_tx_button(m, s_slug[i]);
         }

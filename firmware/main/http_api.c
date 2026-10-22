@@ -107,6 +107,7 @@
 
 #include "cJSON.h"
 #include "esp_app_desc.h"
+#include "esp_heap_caps.h"      /* largest_free_block in GET /api/system */
 #include "esp_http_server.h"
 #include "esp_https_server.h"
 #include "esp_log.h"
@@ -457,6 +458,19 @@ static esp_err_t api_system_get(httpd_req_t *req)
     cJSON_AddStringToObject(root, "hostname", s_cfg->hostname);
     cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000));
     cJSON_AddNumberToObject(root, "free_heap", (double)esp_get_free_heap_size());
+    /* The two numbers free_heap alone cannot tell apart (2026-10 RAM audit):
+     * min_free_heap is the deepest the heap has EVER dipped since boot — a
+     * steady free_heap with a scary minimum means transient peaks (TLS
+     * handshakes, OTA checks), while a sinking minimum tracking a sinking
+     * free_heap is the signature of a leak. largest_free_block is the
+     * fragmentation readout: free_heap can report 80 KB while no single
+     * allocation bigger than 10 KB would succeed, which is exactly the state
+     * a days-old box is in when a capture session's ~1.1 KB slots still fit
+     * and anything contiguous does not. */
+    cJSON_AddNumberToObject(root, "min_free_heap",
+                            (double)esp_get_minimum_free_heap_size());
+    cJSON_AddNumberToObject(root, "largest_free_block",
+                            (double)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
     /* Why the last boot happened — the no-serial-cable crash diagnosis (the
      * design notes' §7 pairing with uptime_s: a small uptime plus "panic" or
@@ -1273,6 +1287,12 @@ static cJSON *raw_state_json(const db_raw_state_t *st)
     cJSON_AddNumberToObject(o, "remaining_s", (double)st->remaining_s);
     cJSON_AddNumberToObject(o, "count", st->count);
     cJSON_AddNumberToObject(o, "capacity", st->capacity);
+    /* The degrading-capacity story (rf_raw.h MEMORY): slots the session holds
+     * now, and the ceiling today's heap would let it reach. The UI mentions
+     * slots_possible only when it is below capacity — on a healthy box the two
+     * are equal and nothing is said. */
+    cJSON_AddNumberToObject(o, "slots", st->slots);
+    cJSON_AddNumberToObject(o, "slots_possible", st->slots_possible);
     cJSON_AddStringToObject(o, "stop_reason", st->stop_reason);
 
     cJSON *c = cJSON_AddObjectToObject(o, "settings");
@@ -1416,17 +1436,29 @@ static cJSON *raw_candidate_json(const db_raw_candidate_t *c, int64_t now_us)
  * `candidates_total` says when something was left out, so a client is never
  * silently shown a truncated list.
  */
-static void add_candidates(cJSON *root, int max)
+/* HEAP, NOT STATIC (2026-10 RAM audit). This copy-out buffer (~8 KB) and
+ * api_raw_get's summary list (~3.3 KB) were file statics — permanent .bss paid
+ * by every box around the clock for a diagnostic screen most of them open
+ * rarely. Both are now per-request mallocs, freed before the response prints:
+ * ~11 KB of steady-state RAM handed back. Per-request is safe here for the
+ * same reason the statics were — all /api handlers run on the one httpd task —
+ * and the transient peak is no higher than before, since the static copy used
+ * to be resident during the build anyway. Returns false only when the heap
+ * cannot take the buffer, in which case nothing was added to `root`. */
+static bool add_candidates(cJSON *root, int max)
 {
-    static db_raw_candidate_t cands[DB_RAW_MAX_FRAMES + DB_RAW_MAX_RUNS];
-    int cap = (int)(sizeof(cands) / sizeof(cands[0]));
-    int n = db_raw_get_candidates(cands, cap);
+    enum { CAND_CAP = DB_RAW_MAX_FRAMES + DB_RAW_MAX_RUNS };
+    db_raw_candidate_t *cands = malloc(CAND_CAP * sizeof(*cands));
+    if (!cands) return false;
+    int n = db_raw_get_candidates(cands, CAND_CAP);
     int64_t now = esp_timer_get_time();
 
     cJSON_AddNumberToObject(root, "candidates_total", n);
     cJSON *arr = cJSON_AddArrayToObject(root, "candidates");
     for (int i = 0; i < n && i < max; i++)
         cJSON_AddItemToArray(arr, raw_candidate_json(&cands[i], now));
+    free(cands);
+    return true;
 }
 
 static esp_err_t api_raw_get(httpd_req_t *req)
@@ -1438,16 +1470,29 @@ static esp_err_t api_raw_get(httpd_req_t *req)
 
     /* Candidates first: this is the list the screen is built around, and the
      * per-frame array below it is the "show me everything" fallback. */
-    add_candidates(root, DB_RAW_EMBED_CANDIDATES);
+    if (!add_candidates(root, DB_RAW_EMBED_CANDIDATES)) {
+        cJSON_Delete(root);
+        return send_error(req, "503 Service Unavailable",
+                          "not enough free memory to build this response right "
+                          "now — try again");
+    }
 
     /* 32 summaries is ~4 KB of JSON — small enough to print normally. The pulse
-     * arrays are the big thing, and those live behind /api/raw/<i>. */
-    static db_raw_summary_t list[DB_RAW_MAX_FRAMES];
+     * arrays are the big thing, and those live behind /api/raw/<i>. Heap, not
+     * static — see add_candidates(). */
+    db_raw_summary_t *list = malloc(DB_RAW_MAX_FRAMES * sizeof(*list));
+    if (!list) {
+        cJSON_Delete(root);
+        return send_error(req, "503 Service Unavailable",
+                          "not enough free memory to build this response right "
+                          "now — try again");
+    }
     int n = db_raw_get_summaries(list, DB_RAW_MAX_FRAMES);
     int64_t now = esp_timer_get_time();
     cJSON *arr = cJSON_AddArrayToObject(root, "frames");
     for (int i = 0; i < n; i++)
         cJSON_AddItemToArray(arr, raw_frame_json(&list[i], now));
+    free(list);
 
     return send_json(req, root, "200 OK");
 }
@@ -1461,7 +1506,12 @@ static esp_err_t api_raw_candidates_get(httpd_req_t *req)
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "running", st.running);
     cJSON_AddNumberToObject(root, "count", st.count);
-    add_candidates(root, DB_RAW_MAX_FRAMES + DB_RAW_MAX_RUNS);
+    if (!add_candidates(root, DB_RAW_MAX_FRAMES + DB_RAW_MAX_RUNS)) {
+        cJSON_Delete(root);
+        return send_error(req, "503 Service Unavailable",
+                          "not enough free memory to build this response right "
+                          "now — try again");
+    }
     return send_json(req, root, "200 OK");
 }
 
@@ -1497,11 +1547,27 @@ static esp_err_t api_raw_start(httpd_req_t *req)
         return send_error(req, "503 Service Unavailable",
                           "no CC1101 detected — see /api/diagnostics");
     }
-    if (err == ESP_ERR_NO_MEM)
-        return send_error(req, "503 Service Unavailable",
-                          "not enough free memory for a capture session right now. "
-                          "A session needs about 36 KB of RAM for its frames; "
-                          "reboot the box and try again before opening other pages.");
+    if (err == ESP_ERR_NO_MEM) {
+        /* Rare now: sessions start small and grow per frame (rf_raw.h MEMORY),
+         * so this fires only when not even the minimal session fits. The
+         * message carries the ACTUAL numbers — db_raw_mem_floor(), not a
+         * hard-coded "about 36 KB" that the growth rework just made wrong —
+         * and does not pretend a reboot is the only way out: memory frees on
+         * its own (a closed page, a finished update check), so "try again" is
+         * honest advice before the bigger hammer. */
+        size_t floor_b = 0, reserve_b = 0;
+        db_raw_mem_floor(&floor_b, &reserve_b);
+        char msg[224];
+        snprintf(msg, sizeof(msg),
+                 "not enough free memory to start even a minimal capture "
+                 "session: %u KB free, but it needs %u KB plus a %u KB safety "
+                 "reserve. Close other pages of this UI and try again in a "
+                 "minute; a reboot frees the most.",
+                 (unsigned)(esp_get_free_heap_size() / 1024),
+                 (unsigned)((floor_b + 1023) / 1024),
+                 (unsigned)(reserve_b / 1024));
+        return send_error(req, "503 Service Unavailable", msg);
+    }
     if (err != ESP_OK)
         return send_esp_err(req, err, "could not start the capture session");
 
