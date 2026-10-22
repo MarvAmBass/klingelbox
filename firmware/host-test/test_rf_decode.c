@@ -500,6 +500,71 @@ static void test_frame_similar(void)
 }
 
 /*
+ * The truncation comparison the signal store's similarity stage runs on: a
+ * reception that DIES mid-transmission is the leading pulses of the stored
+ * waveform, so it must match as a prefix — with the final recorded pulse
+ * allowed to be cut short (the reception ending is what cut it) but never
+ * longer. How much of the stored frame must be covered is the caller's
+ * policy, so nothing here asserts on fractions.
+ */
+static void test_frame_similar_prefix(void)
+{
+    rf_frame_t full, head;
+
+    CASE("rf_frame_similar_prefix");
+
+    rf_frame_reset(&full);
+    full.first_level = 1;
+    full.count = 200;
+    for (uint16_t i = 0; i < full.count; i++) {
+        full.durations_us[i] = (uint16_t)(((i * 7u + 3u) % 4u < 2u) ? 300 : 900);
+    }
+
+    /* A clean truncation, drifted 6 %, matches. */
+    head = full;
+    head.count = 150;
+    for (uint16_t i = 0; i < head.count; i++) {
+        head.durations_us[i] = (uint16_t)(head.durations_us[i] * 106u / 100u);
+    }
+    CHECK(rf_frame_similar_prefix(&full, &head, 25, 120),
+          "a drifted 150-of-200 truncation must match");
+
+    /* The final pulse may be cut short... */
+    head.durations_us[149] = 40;
+    CHECK(rf_frame_similar_prefix(&full, &head, 25, 120),
+          "a cut-short final pulse must still match");
+    /* ...but never be substantially longer. */
+    head.durations_us[149] = (uint16_t)(full.durations_us[149] * 3u);
+    CHECK(!rf_frame_similar_prefix(&full, &head, 25, 120),
+          "a 3x final pulse is a different waveform");
+
+    /* One wrong pulse in the middle refuses the whole prefix. */
+    head = full;
+    head.count = 150;
+    head.durations_us[70] = (uint16_t)(full.durations_us[70] * 3u);
+    CHECK(!rf_frame_similar_prefix(&full, &head, 25, 120),
+          "a 3x mid-prefix pulse must not match");
+
+    /* Equal lengths degrade to the plain comparison. */
+    head = full;
+    CHECK(rf_frame_similar_prefix(&full, &head, 25, 120),
+          "equal-length inputs behave like rf_frame_similar");
+
+    /* One-directional: a head LONGER than full is refused, whatever it holds. */
+    head = full;
+    head.count = (uint16_t)(full.count + 1u);
+    head.durations_us[full.count] = 300;
+    CHECK(!rf_frame_similar_prefix(&full, &head, 50, 500),
+          "head longer than full must not match");
+
+    /* Degenerate inputs. */
+    rf_frame_reset(&head);
+    CHECK(!rf_frame_similar_prefix(&full, &head, 25, 120), "empty head must not match");
+    CHECK(!rf_frame_similar_prefix(NULL, &full, 25, 120), "NULL full must not match");
+    CHECK(!rf_frame_similar_prefix(&full, NULL, 25, 120), "NULL head must not match");
+}
+
+/*
  * THE REGRESSION TEST FOR THE TX-ECHO SUPPRESSION HOLE (review, 2026-09-03).
  *
  * rf_service remembers the last frame it transmitted and drops an identical
@@ -1183,6 +1248,7 @@ int main(void)
     test_base_estimation_with_glitch();
     test_fingerprint();
     test_frame_similar();
+    test_frame_similar_prefix();
     test_tx_echo_similarity();
     test_noise_rejected();
     test_degenerate_frames();

@@ -101,6 +101,44 @@ bool rf_frame_similar(const rf_frame_t *a, const rf_frame_t *b,
     return durations_similar(a, b, a->count, tolerance_pct, tolerance_us);
 }
 
+bool rf_frame_similar_prefix(const rf_frame_t *full, const rf_frame_t *head,
+                             uint8_t tolerance_pct, uint16_t tolerance_us)
+{
+    if (full == NULL || head == NULL) {
+        return false;
+    }
+    if (head->count == 0 || head->count > full->count ||
+        full->count > RF_FRAME_MAX_PULSES) {
+        return false;
+    }
+    if (head->count == full->count) {
+        return rf_frame_similar(full, head, tolerance_pct, tolerance_us);
+    }
+    /* Every pulse but the last must agree like any other pair of recordings
+     * of the same waveform. */
+    if (!durations_similar(full, head, (uint16_t)(head->count - 1u),
+                           tolerance_pct, tolerance_us)) {
+        return false;
+    }
+    /* The last recorded pulse is where the reception DIED: the capture path
+     * drops the terminating silence, so this pulse holds however much of
+     * full's pulse the radio heard before losing the carrier. Cut short is
+     * therefore expected and accepted; LONGER than full's pulse (plus the
+     * ordinary window) is a different waveform and refused. */
+    {
+        uint16_t i  = (uint16_t)(head->count - 1u);
+        uint32_t df = full->durations_us[i];
+        uint32_t dh = head->durations_us[i];
+        uint32_t ref   = (df > dh) ? df : dh;
+        uint32_t allow = (ref * (uint32_t)tolerance_pct) / 100u;
+
+        if (allow < (uint32_t)tolerance_us) {
+            allow = (uint32_t)tolerance_us;
+        }
+        return dh <= df + allow;
+    }
+}
+
 bool rf_frame_similar_tx_echo(const rf_frame_t *sent, const rf_frame_t *heard,
                               uint8_t tolerance_pct, uint16_t tolerance_us,
                               uint32_t capture_idle_us)

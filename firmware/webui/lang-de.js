@@ -1296,5 +1296,22 @@ window.KLINGELBOX_DE = {
   "The activity feed deliberately lives in RAM only \u2014 a doorbell press never writes to this storage, and the feed starts empty after a restart.":
     "Die Aktivit\u00e4ten-Liste lebt bewusst nur im RAM \u2014 ein Klingeldruck schreibt nie in diesen Speicher, und die Liste beginnt nach einem Neustart leer.",
   "The box could not write to its settings storage \u2014 it is probably full. The doorbell keeps ringing, but changes may be lost at the next restart. Details and the dismiss button are under Diagnostics.":
-    "Die Box konnte nicht in ihren Einstellungs-Speicher schreiben \u2014 er ist vermutlich voll. Die Klingel funktioniert weiter, aber \u00c4nderungen k\u00f6nnen beim n\u00e4chsten Neustart verloren gehen. Details und das Verwerfen findest du unter Diagnose."
+    "Die Box konnte nicht in ihren Einstellungs-Speicher schreiben \u2014 er ist vermutlich voll. Die Klingel funktioniert weiter, aber \u00c4nderungen k\u00f6nnen beim n\u00e4chsten Neustart verloren gehen. Details und das Verwerfen findest du unter Diagnose.",
+
+  /* v0.10.2 -- similarity matching for raw signals: the per-signal tolerance
+     preset in the signal editor, its four options, the save confirmation, and
+     the similarity-count fact row. Keys sorted within the block. */
+  "How much a live reception may differ from this recording and still ring as this button. Raise it if presses of this transmitter go unrecognized; lower it if the wrong bell ever rings \u2014 and watch the Activity feed after changing it: similarity matches are labeled there.":
+    "Wie stark ein live empfangenes Signal von dieser Aufnahme abweichen darf und trotzdem als diese Taste klingelt. Erh\u00f6he sie, wenn Dr\u00fccke dieses Senders nicht erkannt werden; verringere sie, wenn je die falsche Glocke klingelt \u2014 und beobachte danach den Aktivit\u00e4ten-Feed: \u00c4hnlichkeits-Treffer sind dort gekennzeichnet.",
+  "Match tolerance": "Erkennungstoleranz",
+  "Match tolerance saved.": "Erkennungstoleranz gespeichert.",
+  "Via similarity": "Per \u00c4hnlichkeit",
+  "loose \u2014 accepts heavy fragmentation, higher false-match risk":
+    "locker \u2014 akzeptiert starke Fragmentierung, h\u00f6heres Fehlklingel-Risiko",
+  "normal \u2014 tolerates truncation and fragments (default)":
+    "normal \u2014 toleriert Abschneiden und Fragmente (Standard)",
+  "off \u2014 exact fingerprint only":
+    "aus \u2014 nur der exakte Fingerprint",
+  "strict \u2014 only near-exact receptions":
+    "streng \u2014 nur nahezu exakte Empf\u00e4nge"
 };

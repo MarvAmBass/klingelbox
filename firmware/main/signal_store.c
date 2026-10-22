@@ -13,13 +13,18 @@
  * the full 1 KB array for a 49-pulse EV1527 frame would waste 90 % of the flash
  * page and, worse, multiply the erase/rewrite cost of every registration.
  *
- * ONE MUTEX, HELD BRIEFLY. Matching runs on the capture task (which holds the
- * radio lock at that moment), while the REST layer mutates from the HTTP task.
- * The metadata scan is a few hundred integer comparisons over a resident array —
- * no flash, no allocation — so serialising the two is cheap. Everything that
- * touches flash (add/delete/rename/load_frame) also runs under the same lock,
- * accepting that a capture-time match may wait a few milliseconds behind a save.
- * That is far preferable to a lock-free scan racing an index rewrite.
+ * ONE MUTEX, HELD BRIEFLY. Matching runs on the dispatch task (app_main.c) —
+ * which holds no other locks and may block freely; the capture task only
+ * queues events to it — while the REST layer mutates from the HTTP task. The
+ * metadata scan is a few hundred integer comparisons over a resident array,
+ * and the similarity stage compares against frames CACHED in RAM (below), so
+ * the common hot path still touches no flash. Everything that does touch
+ * flash (add/delete/rename/load_frame, and a similarity cache miss past the
+ * cache's eight slots) runs under the same lock, accepting that a match may
+ * wait a few milliseconds behind a save. That is far preferable to a
+ * lock-free scan racing an index rewrite — and blocking is harmless here
+ * precisely because matching left the capture task: the radio keeps
+ * listening while a match waits.
  *
  * READERS ON OTHER TASKS GET COPIES, NOT POINTERS. The pointer-returning
  * accessors exist for the HTTP task alone — the task that also runs every
@@ -64,6 +69,62 @@
  * signal out of a user's sight any more; it only decides what an incoming burst
  * MATCHES.
  *
+ * SIMILARITY MATCHING FOR RAW SIGNALS (live box, 2026-10)
+ *
+ * The Listen flow learned the user's "Gartentor" — 224 pulses, undecodable,
+ * confidence 24 % — by joining the fragments the capture layer chopped it
+ * into. The LIVE path then could not match it: raw signals matched only by
+ * exact fingerprint, and this transmitter's long pattern fragments
+ * DIFFERENTLY on every reception — one physical press produced six distinct
+ * unmatched fingerprints inside nine seconds, one of them a clean 196-pulse
+ * truncation of the stored 224. A signal the box demonstrably understood
+ * offline practically never rang online.
+ *
+ * So the run machinery's concepts are ported to the match path, as a LAST
+ * resort strictly behind decoded identity and the fingerprint:
+ *
+ *   1. SINGLE-BURST SIMILARITY. An unmatched burst is compared per-pulse
+ *      against every stored raw signal (decoded signals are never in play —
+ *      their identity match is stronger than any timing argument). Both the
+ *      whole frame and a clean leading truncation are accepted, down to a
+ *      per-preset minimum fraction of the stored pulse count.
+ *
+ *   2. RUN ASSEMBLY. Bursts that match nothing are accumulated into a rolling
+ *      run — joined with the silences actually measured between them, exactly
+ *      as rf_frame_join_run() rebuilds a chopped transmission in the Listen
+ *      flow — and the assembled run is compared the same way. The pieces'
+ *      boundaries need not agree with anything: the join reconstructs the
+ *      original waveform (a cut happens INSIDE a long low, and the measured
+ *      gap is that low), so the comparison is always joined-live against
+ *      stored, whole waveform against whole waveform.
+ *
+ * HOW THIS COMPOSES WITH THE FRAGMENT SUPPRESSOR ABOVE — read carefully, the
+ * two look like rivals and are not. The suppressor answers "is this burst the
+ * TAIL of the press I just handled?" (sub-75 % of its predecessor, inside
+ * 750 ms) and exists to stop one press ringing twice; the assembler answers
+ * "are these bursts PIECES of one press nobody has handled yet?". They divide
+ * the work by burst size: a piece big enough to clear the 75 % bar is a main
+ * in its own right and only the assembler can explain it, while a sub-75 %
+ * tail is suppressed from firing ON ITS OWN evidence — but still offered to
+ * the assembler, because the second half of a chopped transmission IS such a
+ * "tail" by size, and completing the run is the one way it may legitimately
+ * cause a ring (the run subsumes the unmatched main it follows, so that is
+ * the press's FIRST ring, not a second one). After any fire the assembler is
+ * reset and a per-signal press window (s_sim_press) absorbs the transmitter's
+ * own repeats and stragglers, so the suppressor keeps its job (tails never
+ * fire alone), the assembler gets its job (pieces fire once, assembled), and
+ * neither can double-ring the other's press.
+ *
+ * FALSE-POSITIVE DISCIPLINE. A wrong match here rings a bell in someone's
+ * house, so every similarity verdict requires agreement of the FULL compared
+ * waveform, pulse by pulse, gaps included — never a statistic like length or
+ * base width alone. The thresholds are per-signal presets (see SIM_PRESETS
+ * below for the numbers and their provenance), because the right slack is a
+ * property of the individual transmitter. And because similarity is an
+ * inference rather than an identification, every similarity fire is labelled
+ * as such in the event feed and counted separately (similarity_matches) — the
+ * way the mechanism earns trust on a live box is by being auditable.
+ *
  * DIAGNOSTICS. This module reports into the shared db_diag vocabulary only where
  * it has something the radio layer could not know: what a registration actually
  * stored (PROTOCOL_DECODED with the identity, or UNKNOWN_PROTOCOL_RAW with the
@@ -86,12 +147,18 @@
 #include "freertos/semphr.h"
 #include "nvs.h"
 #include "nvs_flash.h"   /* NVS_DEFAULT_PART_NAME, for stats and the sweep */
+#include "rf_group.h"    /* the run machinery's tolerances and join primitives */
 
 static const char *TAG = "db_signals";
 
 #define DB_SIG_NS        "dbsig"
 #define DB_SIG_INDEX_KEY "index"
-#define DB_SIG_VERSION   1u
+/* v1: the original record (db_signal_meta_v1_t, frozen in signal_store.h).
+ * v2: match_tolerance + similarity_matches appended. A v1 index is migrated
+ *     on load and written back (graph discipline, node_graph.c); anything
+ *     NEWER or unrecognized is ignored-but-preserved exactly as before, so a
+ *     rollback still finds its signals intact. */
+#define DB_SIG_VERSION   2u
 
 /* Trailing-fragment rejection — see the file header for the bench data.
  * 750 ms: the tail is flushed one burst-window (250 ms) after its parent, so the
@@ -200,8 +267,9 @@ static esp_err_t save_index(void)
         dst[i] = s_meta[i];
         /* Live stats are explicitly not persisted (see the header): writing a
          * seen_count to flash on every press would wear the part out. */
-        dst[i].last_seen_us = 0;
-        dst[i].seen_count   = 0;
+        dst[i].last_seen_us       = 0;
+        dst[i].seen_count         = 0;
+        dst[i].similarity_matches = 0;
     }
 
     size_t len = sizeof(hdr) + (size_t)s_count * sizeof(db_signal_meta_t);
@@ -253,9 +321,66 @@ static esp_err_t load_index(void)
     sig_hdr_t hdr;
     memcpy(&hdr, s_blob, sizeof(hdr));
 
-    /* Same rule as db_config.c: only an exact layout match is reinterpreted. A
-     * mismatched index is left on flash untouched (a rollback to the firmware
-     * that wrote it must find its signals intact) and we simply start empty. */
+    /*
+     * A v1 index is this build's OWN past, read through the frozen layout and
+     * brought forward field by field (the node graph's migration discipline).
+     * Everything migrated defaults match_tolerance to NORMAL — the zero value,
+     * but set explicitly so the default is a decision and not an accident.
+     */
+    if (hdr.version == 1u && hdr.meta_size == sizeof(db_signal_meta_v1_t)) {
+        uint32_t n = hdr.count;
+        if (n > DB_SIGNAL_MAX)
+            n = DB_SIGNAL_MAX;
+        if (len < sizeof(hdr) + (size_t)n * sizeof(db_signal_meta_v1_t)) {
+            ESP_LOGE(TAG, "v1 signal index truncated — starting empty");
+            return ESP_OK;
+        }
+        s_count = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            /* Copied OUT of the staging buffer first: it is a byte array
+             * behind a blob header, so a record is not guaranteed aligned for
+             * in-place int64 reads (same note as db_node_widen_v3). */
+            db_signal_meta_v1_t old;
+            memcpy(&old, s_blob + sizeof(hdr) + (size_t)i * sizeof(old),
+                   sizeof(old));
+            if (old.id == 0)
+                continue;
+
+            db_signal_meta_t *m = &s_meta[s_count];
+            memset(m, 0, sizeof(*m));
+            m->id          = old.id;
+            memcpy(m->name, old.name, sizeof(m->name));
+            m->name[DB_SIGNAL_NAME_MAX - 1] = '\0';
+            m->origin      = old.origin;
+            m->created_at  = old.created_at;
+            m->fingerprint = old.fingerprint;
+            m->base_us     = old.base_us;
+            m->confidence  = old.confidence;
+            m->pulse_count = old.pulse_count;
+            m->decoded_valid = old.decoded_valid;
+            memcpy(m->protocol, old.protocol, sizeof(m->protocol));
+            m->protocol[RF_PROTOCOL_NAME_MAX - 1] = '\0';
+            m->decoded_id     = old.decoded_id;
+            m->decoded_button = old.decoded_button;
+            /* The one new setting. Every signal that existed before presets
+             * behaves exactly as the default preset describes. */
+            m->match_tolerance = DB_SIG_TOL_NORMAL;
+            s_count++;
+        }
+        s_index_authoritative = true;
+        ESP_LOGI(TAG, "signal index migrated v1 -> v%u (%d signal(s))",
+                 (unsigned)DB_SIG_VERSION, s_count);
+        /* Write the current layout back so the migration is a one-off. Best
+         * effort: RAM is already right, and a failed save is retried by the
+         * next mutation or boot (same reasoning as node_graph's write-back). */
+        save_index();
+        return ESP_OK;
+    }
+
+    /* Beyond that, only an exact layout match is reinterpreted (same rule as
+     * db_config.c). A NEWER or unknown index is left on flash untouched — a
+     * rollback to the firmware that wrote it must find its signals intact —
+     * and we simply start empty. */
     if (hdr.version != DB_SIG_VERSION || hdr.meta_size != sizeof(db_signal_meta_t)) {
         ESP_LOGW(TAG, "signal index layout v%u/%u is not this build's "
                       "(v%u/%u) — ignoring it",
@@ -280,8 +405,13 @@ static esp_err_t load_index(void)
         s_meta[s_count] = src[i];
         s_meta[s_count].name[DB_SIGNAL_NAME_MAX - 1] = '\0';
         s_meta[s_count].protocol[RF_PROTOCOL_NAME_MAX - 1] = '\0';
-        s_meta[s_count].last_seen_us = 0;
-        s_meta[s_count].seen_count   = 0;
+        s_meta[s_count].last_seen_us       = 0;
+        s_meta[s_count].seen_count         = 0;
+        s_meta[s_count].similarity_matches = 0;
+        /* An out-of-range preset (an index hand-edited, or written by a build
+         * that knew more presets) must not index past the table. */
+        if (s_meta[s_count].match_tolerance >= DB_SIG_TOL__COUNT)
+            s_meta[s_count].match_tolerance = DB_SIG_TOL_NORMAL;
         s_count++;
     }
     s_index_authoritative = true;
@@ -404,6 +534,368 @@ static bool store_has_room(size_t frame_len)
              (unsigned)(need - DB_SIG_RESERVE_ENTRIES),
              (unsigned)frame_len, (unsigned)DB_SIG_RESERVE_ENTRIES);
     return false;
+}
+
+/* ---- similarity matching for raw signals ----------------------------------
+ *
+ * See SIMILARITY MATCHING in the file header for what this is and why. The
+ * mechanics live here; the policy numbers are the preset table directly below.
+ */
+
+/* Defined with the rest of the persistence below; the cache needs it for the
+ * fallback load past its slot count. */
+static esp_err_t load_frame_locked(uint16_t id, rf_frame_t *out);
+
+/*
+ * THE PRESET TABLE — every similarity threshold in one place, with provenance.
+ *
+ * Two knobs per preset:
+ *
+ *   tol_pct/tol_us  the per-pulse window for "the same transmitter, drifted".
+ *                   NORMAL and STRICT use 25 % / 120 us — the exact window
+ *                   rf_service's burst coalescing already trusts, dozens of
+ *                   times per press, to say "this frame is the previous frame
+ *                   again" (BURST_TOL_PCT/_US in rf_service.c; the numbers are
+ *                   repeated here because that module owns the radio and this
+ *                   one must not include it). LOOSE widens to the run
+ *                   machinery's own window (RF_GROUP_TOL_*, 30 % / 150 us) —
+ *                   the tolerance that recognized the Gartentor transmitter's
+ *                   repeats as one group in the Listen flow, i.e. the widest
+ *                   "same transmission" window this codebase has evidence for.
+ *
+ *   min_pct         the least of the stored frame an incoming waveform must
+ *                   cover (as a leading, pulse-by-pulse-agreeing prefix) to
+ *                   count as that signal. The anchors are measured, not
+ *                   invented: the live failure's clean truncation carried
+ *                   196 of 224 pulses = 87.5 %, so NORMAL sits just under it
+ *                   at 85 %; the fragment suppressor's DB_FRAG_MIN_PCT (75 %)
+ *                   is the floor below which a prefix is size-indistinguishable
+ *                   from the tail of some OTHER long press, so LOOSE sits
+ *                   exactly on it and nothing may go lower; STRICT at 95 %
+ *                   accepts only a whisker of clipping — "near-exact or
+ *                   nothing", for a signal whose owner has seen a false ring.
+ *
+ * Run gap agreement comes for free and is therefore not a third knob: an
+ * assembled run embeds its measured silences as ordinary low pulses (see
+ * sim_run_offer), and the stored frame — joined by the Listen flow from the
+ * same machinery — embeds its own, so the per-pulse window above judges the
+ * gaps exactly as rf_run_similar()'s gap_similar() would, same shape, same
+ * tolerance.
+ */
+typedef struct {
+    uint8_t  tol_pct;
+    uint16_t tol_us;
+    uint8_t  min_pct;   /* 0 disables the preset (OFF) */
+} sim_preset_t;
+
+static const sim_preset_t SIM_PRESETS[DB_SIG_TOL__COUNT] = {
+    [DB_SIG_TOL_NORMAL] = { 25, 120, 85 },
+    [DB_SIG_TOL_OFF]    = {  0,   0,  0 },
+    [DB_SIG_TOL_STRICT] = { 25, 120, 95 },
+    [DB_SIG_TOL_LOOSE]  = { RF_GROUP_TOL_PCT, RF_GROUP_TOL_US, DB_FRAG_MIN_PCT },
+};
+
+/*
+ * THE WAVEFORM CACHE. The hot path may not read NVS per burst, but similarity
+ * needs the stored frames the metadata split deliberately left on flash. So
+ * the raw signals' waveforms are cached in RAM: filled at boot and on
+ * add/delete, LRU-replaced on a fallback load past the slot count.
+ *
+ * Eight slots, not thirty-two, and static, not heap. The arithmetic: a slot
+ * is ~1.05 KB, so eight cost ~8.4 KB of BSS where all 32 would cost ~34 KB —
+ * and the live box runs ~112 KB of free heap against a 48 KB capture reserve
+ * plus up to ~36 KB for a raw listening session (rf_raw.h), which leaves room
+ * for the former and decidedly not for the latter. Eight also covers every
+ * real deployment seen so far (a handful of raw signals; most stores are
+ * mostly decoded), so the NVS fallback is the exception it is allowed to be.
+ * Static because this module allocates nothing at runtime by policy — and a
+ * cache that could fail to exist on a fragmented heap would make matching
+ * nondeterministic in exactly the situations that are hardest to debug.
+ */
+#define DB_SIM_CACHE_SLOTS 8
+
+typedef struct {
+    uint16_t   id;        /* 0 = empty slot */
+    int64_t    used_us;   /* LRU stamp */
+    rf_frame_t frame;
+} sim_slot_t;
+
+static sim_slot_t s_sim_cache[DB_SIM_CACHE_SLOTS];
+
+/*
+ * THE RUN ASSEMBLER. Unmatched bursts arriving close enough together to be
+ * pieces of one chopped press are joined — measured silences and all — into
+ * one rolling frame, compared against the store after each piece. Bounded by
+ * DB_RAW_MAX_PARTS, the same "pieces of ONE press" limit the raw session's
+ * candidates use: a transmission in more pieces than that is a threshold
+ * problem, not a matching problem. Two static kilobytes (run + join scratch).
+ */
+static struct {
+    rf_frame_t run;        /* the pieces joined so far */
+    uint8_t    pieces;
+    int64_t    last_ts_us; /* ts_us of the last piece's event (its completion) */
+} s_sim_run;
+static rf_frame_t s_sim_scratch;   /* rf_frame_join cannot join in place */
+
+/*
+ * THE PRESS WINDOW. One physical press of a fragmenting transmitter is many
+ * bursts over several seconds (the live box saw six distinct fingerprints in
+ * nine), and more than one of them can legitimately satisfy similarity — the
+ * first full repeat after an assembled fire, say. Firing each would ring one
+ * press twice or six times, so after a similarity fire further similarity
+ * hits ON THE SAME SIGNAL are absorbed while evidence keeps arriving inside
+ * the fragment window, re-armed per hit exactly like burst coalescing — and,
+ * exactly like burst coalescing, hard-capped (BURST_MAX_US's five seconds) so
+ * a stuck transmitter surfaces as one ring per five seconds instead of
+ * silence. Absorption is per-signal and similarity-only: it can never delay a
+ * decoded or fingerprint match of anything, so it cannot latch the way the
+ * old fragment window could.
+ */
+#define DB_SIM_PRESS_MAX_US (5 * 1000 * 1000)
+
+static struct {
+    uint16_t id;        /* 0: no similarity press open */
+    int64_t  first_us;
+    int64_t  last_us;
+} s_sim_press;
+
+/* ---- cache mechanics. Caller holds the lock for all of these. ---- */
+
+static void sim_cache_drop(uint16_t id)
+{
+    for (int i = 0; i < DB_SIM_CACHE_SLOTS; i++)
+        if (s_sim_cache[i].id == id)
+            s_sim_cache[i].id = 0;
+}
+
+/* The slot `id` should live in: its current one, else an empty one, else the
+ * least recently used. */
+static sim_slot_t *sim_cache_victim(uint16_t id)
+{
+    sim_slot_t *lru = &s_sim_cache[0];
+    for (int i = 0; i < DB_SIM_CACHE_SLOTS; i++) {
+        sim_slot_t *s = &s_sim_cache[i];
+        if (s->id == id)
+            return s;
+        if (s->id == 0)
+            lru = s;                 /* empty beats evicting anyone */
+        else if (lru->id != 0 && s->used_us < lru->used_us)
+            lru = s;
+    }
+    return lru;
+}
+
+static void sim_cache_put(uint16_t id, const rf_frame_t *frame)
+{
+    sim_slot_t *s = sim_cache_victim(id);
+    s->id      = id;
+    s->used_us = esp_timer_get_time();
+    s->frame   = *frame;
+}
+
+/* The waveform of raw signal `id`, from RAM when cached, from NVS when not —
+ * the one sanctioned flash read on the match path, promoted into the LRU slot
+ * so a signal that is actually being pressed stays resident. NULL only when
+ * the frame is unreadable, which the boot reconcile makes nearly unreachable. */
+static const rf_frame_t *sim_cache_get(uint16_t id)
+{
+    for (int i = 0; i < DB_SIM_CACHE_SLOTS; i++) {
+        if (s_sim_cache[i].id == id) {
+            s_sim_cache[i].used_us = esp_timer_get_time();
+            return &s_sim_cache[i].frame;
+        }
+    }
+    {
+        sim_slot_t *s = sim_cache_victim(id);
+        if (load_frame_locked(id, &s->frame) != ESP_OK) {
+            s->id = 0;      /* never leave a half-loaded frame under an id */
+            return NULL;
+        }
+        s->id      = id;
+        s->used_us = esp_timer_get_time();
+        return &s->frame;
+    }
+}
+
+/* Boot-time fill: the first DB_SIM_CACHE_SLOTS raw signals, in store order —
+ * at boot there are no seen-stats to rank by, and the LRU corrects any wrong
+ * guess at the cost of one flash read on that signal's first press. */
+static void sim_cache_prefill(void)
+{
+    int cached = 0;
+    for (int i = 0; i < s_count && cached < DB_SIM_CACHE_SLOTS; i++) {
+        if (s_meta[i].decoded_valid)
+            continue;
+        sim_slot_t *s = &s_sim_cache[cached];
+        if (load_frame_locked(s_meta[i].id, &s->frame) != ESP_OK)
+            continue;
+        s->id      = s_meta[i].id;
+        s->used_us = esp_timer_get_time();
+        cached++;
+    }
+}
+
+/* ---- the comparison and the scan. Caller holds the lock. ---- */
+
+/* Is `a` plausibly `b`'s base width, drifted? rf_group's window, used here as
+ * a metadata PREFILTER only — wide enough that it can only reject candidates
+ * whose per-pulse comparison would reject anyway, cheap enough to run before
+ * any frame is fetched. Skipped when either estimate is missing: a 0 base is
+ * "the normalizer could not tell", not "the bases differ". */
+static bool sim_base_close(uint16_t a, uint16_t b)
+{
+    uint32_t diff, ref, allow;
+
+    if (a == 0 || b == 0)
+        return true;
+    diff  = (a > b) ? (uint32_t)(a - b) : (uint32_t)(b - a);
+    ref   = (a > b) ? a : b;
+    allow = (ref * RF_GROUP_TOL_PCT) / 100u;
+    if (allow < RF_GROUP_TOL_US)
+        allow = RF_GROUP_TOL_US;
+    return diff <= allow;
+}
+
+/* The verdict: whole-frame agreement, or a clean leading truncation covering
+ * at least the preset's fraction. Count mismatch the other way (incoming
+ * LONGER than stored) is refused outright — matching more than was stored is
+ * a claim the stored evidence cannot support. */
+static bool sim_waveform_match(const rf_frame_t *stored, const rf_frame_t *in,
+                               const sim_preset_t *p)
+{
+    if (in->count == 0 || in->count > stored->count)
+        return false;
+    if ((uint32_t)in->count * 100u < (uint32_t)stored->count * p->min_pct)
+        return false;
+    if (in->count == stored->count)
+        return rf_frame_similar(stored, in, p->tol_pct, p->tol_us);
+    return rf_frame_similar_prefix(stored, in, p->tol_pct, p->tol_us);
+}
+
+/*
+ * Scan the stored RAW signals for one that `in` is a reception of. When
+ * several qualify (a stored truncation next to the stored whole, say), the
+ * strongest claim wins: an exact pulse-count match beats a prefix match, and
+ * among prefix matches the highest covered fraction (= the shortest stored
+ * frame) beats the rest. `in_base_us` 0 skips the base prefilter — an
+ * assembled run is never re-normalized, because its full per-pulse comparison
+ * is the stronger test anyway and runs on a handful of candidates at most.
+ */
+static db_signal_meta_t *sim_scan(const rf_frame_t *in, uint16_t in_base_us)
+{
+    db_signal_meta_t *best = NULL;
+    bool best_exact = false;
+
+    for (int i = 0; i < s_count; i++) {
+        db_signal_meta_t *m = &s_meta[i];
+        const sim_preset_t *p;
+        const rf_frame_t *stored;
+        bool exact;
+
+        if (m->decoded_valid)
+            continue;      /* identity territory; similarity never applies */
+        p = &SIM_PRESETS[m->match_tolerance < DB_SIG_TOL__COUNT
+                             ? m->match_tolerance : DB_SIG_TOL_NORMAL];
+        if (p->min_pct == 0)
+            continue;      /* OFF: this signal matches by fingerprint alone */
+
+        /* Resident-metadata prefilters, before any frame is touched. */
+        if (in->count > m->pulse_count)
+            continue;
+        if ((uint32_t)in->count * 100u < (uint32_t)m->pulse_count * p->min_pct)
+            continue;
+        if (!sim_base_close(in_base_us, m->base_us))
+            continue;
+
+        stored = sim_cache_get(m->id);
+        if (!stored || !sim_waveform_match(stored, in, p))
+            continue;
+
+        exact = (in->count == m->pulse_count);
+        if (!best || (exact && !best_exact) ||
+            (exact == best_exact && m->pulse_count < best->pulse_count)) {
+            best       = m;
+            best_exact = exact;
+        }
+    }
+    return best;
+}
+
+/* ---- the assembler. Caller holds the lock. ---- */
+
+static void sim_run_reset(void)
+{
+    rf_frame_reset(&s_sim_run.run);
+    s_sim_run.pieces = 0;
+}
+
+/*
+ * Fold one unmatched burst into the rolling run, or start a fresh run on it.
+ *
+ * The silence before the new piece is MEASURED, never assumed, with the same
+ * arithmetic as rf_group's gap_before(): both events are stamped at frame
+ * completion, so (new ts - new airtime) - previous ts is the quiet time
+ * between the pieces, give or take queue latency that affects both stamps
+ * alike. The bounds are the raw machinery's own: a genuine cut gap is at
+ * least the idle threshold that made the cut (DB_RAW_IDLE_US_MIN is the
+ * smallest a capture channel can be armed with) and at most
+ * RF_GROUP_MAX_GAP_US — the ceiling rf_group puts on any gap it would rejoin,
+ * because no real pause it could have measured exceeds one RMT symbol.
+ * Outside those, or past DB_RAW_MAX_PARTS pieces, or if the join overflows,
+ * the old run is abandoned and the new piece starts its own — a wrong join
+ * can only ever cost a match, never invent one, because whatever is
+ * assembled still has to agree with a stored frame pulse for pulse.
+ */
+static void sim_run_offer(const rf_event_t *ev)
+{
+    uint32_t airtime = rf_frame_duration_us(&ev->frame);
+
+    if (s_sim_run.pieces > 0) {
+        int64_t gap = (ev->ts_us - (int64_t)airtime) - s_sim_run.last_ts_us;
+        if (gap >= DB_RAW_IDLE_US_MIN && gap <= (int64_t)RF_GROUP_MAX_GAP_US &&
+            s_sim_run.pieces < DB_RAW_MAX_PARTS &&
+            rf_frame_join(&s_sim_scratch, &s_sim_run.run, (uint32_t)gap,
+                          &ev->frame)) {
+            s_sim_run.run = s_sim_scratch;
+            s_sim_run.pieces++;
+            s_sim_run.last_ts_us = ev->ts_us;
+            return;
+        }
+        sim_run_reset();
+    }
+    s_sim_run.run        = ev->frame;
+    s_sim_run.pieces     = 1;
+    s_sim_run.last_ts_us = ev->ts_us;
+}
+
+/* Fire a similarity match — or absorb it into the open press window (see the
+ * declaration of s_sim_press). `matched_pulses` is the count of whatever
+ * waveform actually satisfied the comparison (the burst, or the assembled
+ * run). Returns the id, or 0 when absorbed. */
+static uint16_t sim_fire(db_signal_meta_t *m, const rf_event_t *ev,
+                         uint16_t matched_pulses)
+{
+    if (s_sim_press.id == m->id &&
+        (ev->ts_us - s_sim_press.last_us) < DB_FRAG_WINDOW_US &&
+        (ev->ts_us - s_sim_press.first_us) < DB_SIM_PRESS_MAX_US) {
+        s_sim_press.last_us = ev->ts_us;
+        ESP_LOGD(TAG, "similarity: absorbed a repeat of signal %u '%s' into "
+                      "the open press", (unsigned)m->id, m->name);
+        return 0;
+    }
+    s_sim_press.id       = m->id;
+    s_sim_press.first_us = ev->ts_us;
+    s_sim_press.last_us  = ev->ts_us;
+
+    m->last_seen_us = ev->ts_us;
+    m->seen_count++;
+    m->similarity_matches++;
+    s_recent.matched_id = m->id;
+    ESP_LOGI(TAG, "similarity-matched signal %u '%s' (%u of %u pulses, %d dBm, "
+                  "similarity match %lu)",
+             (unsigned)m->id, m->name, matched_pulses, m->pulse_count,
+             ev->rssi_dbm, (unsigned long)m->similarity_matches);
+    return m->id;
 }
 
 /* ---- init ---------------------------------------------------------------- */
@@ -607,6 +1099,9 @@ esp_err_t db_signals_init(void)
     esp_err_t err = load_index();
     reconcile_flash();
     repair_synthesized_ev1527();
+    /* Only after the index is final (ghosts pruned, repairs done): the cache
+     * must never hold a frame the store no longer lists. */
+    sim_cache_prefill();
     s_ready = true;
     int n = s_count;
     unlock();
@@ -776,6 +1271,13 @@ static esp_err_t store(const db_signal_meta_t *meta, const rf_frame_t *frame,
         return err;
     }
 
+    /* A fresh raw signal goes straight into the similarity cache: its first
+     * real press must not pay a flash read, and we are holding the frame
+     * anyway. Decoded signals never enter the cache — similarity does not
+     * apply to them. */
+    if (!meta->decoded_valid)
+        sim_cache_put(meta->id, frame);
+
     if (id_out)
         *id_out = meta->id;
     ESP_LOGI(TAG, "stored signal %u '%s' (%u pulses, base %u us, conf %u%%)",
@@ -890,6 +1392,37 @@ esp_err_t db_signals_rename(uint16_t id, const char *name)
     return err;
 }
 
+esp_err_t db_signals_set_tolerance(uint16_t id, db_sig_tolerance_t tol)
+{
+    if ((unsigned)tol >= DB_SIG_TOL__COUNT)
+        return ESP_ERR_INVALID_ARG;
+
+    lock();
+    db_signal_meta_t *m = find_meta(id);
+    if (!m) {
+        unlock();
+        return ESP_ERR_NOT_FOUND;
+    }
+    /* Refused rather than stored-and-ignored: a setting that silently does
+     * nothing teaches the user it is safe to loosen, right up until the
+     * signal is re-registered as raw and it suddenly is not. */
+    if (m->decoded_valid) {
+        unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint8_t before = m->match_tolerance;
+    m->match_tolerance = (uint8_t)tol;
+    esp_err_t err = save_index();
+    if (err != ESP_OK)
+        m->match_tolerance = before;   /* RAM and flash must not disagree */
+    unlock();
+
+    if (err == ESP_OK)
+        ESP_LOGI(TAG, "signal %u match tolerance set to %u", (unsigned)id,
+                 (unsigned)tol);
+    return err;
+}
+
 esp_err_t db_signals_delete(uint16_t id)
 {
     lock();
@@ -954,9 +1487,15 @@ esp_err_t db_signals_delete(uint16_t id)
         return err;
     }
 
-    /* The recent-burst reference may name the signal we just removed. */
+    /* The recent-burst reference may name the signal we just removed — and so
+     * may the similarity cache and the open press window. A stale cache entry
+     * would keep MATCHING a deleted signal, which is worse than stale: it is
+     * a bell the user explicitly disconnected still ringing. */
     if (s_recent.matched_id == id)
         s_recent.matched_id = 0;
+    sim_cache_drop(id);
+    if (s_sim_press.id == id)
+        s_sim_press.id = 0;
     unlock();
 
     ESP_LOGI(TAG, "signal %u deleted", (unsigned)id);
@@ -1024,8 +1563,10 @@ static db_signal_meta_t *match_decoded(const rf_decoded_t *d)
     return NULL;
 }
 
-uint16_t db_signals_match(const rf_event_t *ev)
+uint16_t db_signals_match_ex(const rf_event_t *ev, db_match_kind_t *kind_out)
 {
+    if (kind_out)
+        *kind_out = DB_MATCH_NONE;
     if (!ev || ev->frame.count == 0 || s_count == 0)
         return 0;
 
@@ -1033,9 +1574,13 @@ uint16_t db_signals_match(const rf_event_t *ev)
 
     bool fragment = judge_burst(ev);
 
+    db_match_kind_t kind = DB_MATCH_NONE;
     db_signal_meta_t *hit = NULL;
-    if (ev->decoded.valid)
+    if (ev->decoded.valid) {
         hit = match_decoded(&ev->decoded);
+        if (hit)
+            kind = DB_MATCH_IDENTITY;
+    }
     if (!hit && ev->fingerprint != 0) {
         /* Fingerprint fallback. It already encodes the pulse count and every
          * pulse as a multiple of the frame's own estimated base, so it is stable
@@ -1043,15 +1588,51 @@ uint16_t db_signals_match(const rf_event_t *ev)
         for (int i = 0; i < s_count; i++) {
             if (s_meta[i].fingerprint == ev->fingerprint) {
                 hit = &s_meta[i];
+                kind = DB_MATCH_FINGERPRINT;
                 break;
             }
         }
     }
 
-    if (fragment) {
-        /* Whatever it looks like, it is the tail of the press we just handled.
-         * Firing here would either double-ring the chime or, worse, ring the
-         * WRONG one. Debug level: this is expected behaviour, not a fault. */
+    /* The similarity stage, strictly behind identity and fingerprint. The
+     * burst is tried ALONE first: if it is a reception of a stored raw signal
+     * in its own right, whatever the assembler holds is a different, stale
+     * story and is dropped. Only a burst that explains nothing by itself is
+     * offered to the assembler as a possible piece — and only an undecoded
+     * one, because a decoded frame is a complete protocol word by
+     * construction, not a fragment of something longer. */
+    db_signal_meta_t *sim = NULL;
+    bool sim_as_run = false;
+    uint16_t sim_pulses = 0;
+    if (!hit) {
+        sim = sim_scan(&ev->frame, ev->norm.base_us);
+        if (sim) {
+            sim_pulses = ev->frame.count;
+            sim_run_reset();
+        } else if (!ev->decoded.valid) {
+            sim_run_offer(ev);
+            if (s_sim_run.pieces >= 2) {
+                sim = sim_scan(&s_sim_run.run, 0);
+                if (sim) {
+                    sim_as_run = true;
+                    sim_pulses = s_sim_run.run.count;
+                    /* Consumed: trailing pieces of this press must start a
+                     * new (and necessarily non-matching) run, not re-complete
+                     * this one. */
+                    sim_run_reset();
+                }
+            }
+        }
+    }
+
+    if (fragment && !sim_as_run) {
+        /* Whatever it looks like on its own, it is the tail of the press we
+         * just handled. Firing here would either double-ring the chime or,
+         * worse, ring the WRONG one. The one exception — sim_as_run — falls
+         * through on purpose: there the "tail" is the piece that COMPLETED an
+         * assembled run whose earlier pieces matched nothing, so the fire
+         * below is that press's first ring, not a second one (see the
+         * suppressor/assembler composition note in the file header). */
         /* WARN when the suppressed frame would have matched: that is exactly
          * the case a wedged suppressor would hide, and the one worth seeing
          * on a box with no serial console. Plain tails stay at debug. */
@@ -1061,7 +1642,16 @@ uint16_t db_signals_match(const rf_event_t *ev)
                      ev->frame.count, (unsigned)hit->id, hit->name,
                      s_recent.ref_pulses,
                      (long long)((ev->ts_us - s_recent.last_ts_us) / 1000));
-        else
+        else if (sim) {
+            ESP_LOGW(TAG, "suppressed a %u-pulse tail fragment that resembles "
+                          "signal %u '%s'", ev->frame.count,
+                     (unsigned)sim->id, sim->name);
+            /* The tail is fresh evidence of the same press: keep the press
+             * window open so the NEXT straggler is absorbed too, rather than
+             * firing because the window ran out mid-press. */
+            if (s_sim_press.id == sim->id)
+                s_sim_press.last_us = ev->ts_us;
+        } else
             ESP_LOGD(TAG, "ignoring %u-pulse tail fragment after a %u-pulse frame",
                      ev->frame.count, s_recent.ref_pulses);
         unlock();
@@ -1074,13 +1664,26 @@ uint16_t db_signals_match(const rf_event_t *ev)
         hit->seen_count++;
         id = hit->id;
         s_recent.matched_id = id;
+        /* An identified press supersedes whatever the assembler was piecing
+         * together, and its own trailing fragments must not re-complete it. */
+        sim_run_reset();
         ESP_LOGI(TAG, "matched signal %u '%s' (%u repeats, %d dBm, seen %lu)",
                  (unsigned)id, hit->name, ev->repeats, ev->rssi_dbm,
                  (unsigned long)hit->seen_count);
+    } else if (sim) {
+        id = sim_fire(sim, ev, sim_pulses);
+        kind = id ? DB_MATCH_SIMILARITY : DB_MATCH_NONE;
     }
 
     unlock();
+    if (kind_out)
+        *kind_out = id ? kind : DB_MATCH_NONE;
     return id;
+}
+
+uint16_t db_signals_match(const rf_event_t *ev)
+{
+    return db_signals_match_ex(ev, NULL);
 }
 
 /* ---- virtual signals ----------------------------------------------------- */
@@ -1206,5 +1809,11 @@ void db_signals_hosttest_reset(void)
     s_ready = false;
     s_index_authoritative = false;
     memset(&s_recent, 0, sizeof(s_recent));
+    /* The similarity machinery is resident state like everything above: a
+     * simulated reboot that kept the cache would hide exactly the prefill
+     * and invalidation bugs these tests exist to catch. */
+    memset(s_sim_cache, 0, sizeof(s_sim_cache));
+    sim_run_reset();
+    memset(&s_sim_press, 0, sizeof(s_sim_press));
 }
 #endif

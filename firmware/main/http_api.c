@@ -12,7 +12,9 @@
  *   GET  /api/diagnostics                every db_diag state + capture counters
  *   GET  /api/signals                    stored signal metadata
  *   GET  /api/signals/<id>               ... plus the raw waveform (streamed)
- *   POST /api/signals/<id>               {"name":"..."}
+ *   POST /api/signals/<id>               {"name":"..."} and/or, for raw
+ *                                        signals, {"match_tolerance":"off|
+ *                                        strict|normal|loose"}
  *   DEL  /api/signals/<id>
  *   POST /api/signals/<id>/transmit      {"repeats":6,"gap_us":8000}
  *   POST /api/signals/virtual            synthesize an EV1527 signal
@@ -772,6 +774,29 @@ static const char *origin_str(uint8_t origin)
     }
 }
 
+/* The similarity preset, by its API name. Unlike origin_from_str below the
+ * inverse REFUSES an unknown word: the preset decides whether a bell rings,
+ * so a typo must come back as a 400, never be quietly rounded to a default. */
+static const char *tolerance_str(uint8_t tol)
+{
+    switch (tol) {
+    case DB_SIG_TOL_OFF:    return "off";
+    case DB_SIG_TOL_STRICT: return "strict";
+    case DB_SIG_TOL_LOOSE:  return "loose";
+    default:                return "normal";
+    }
+}
+
+static bool tolerance_from_str(const char *s, db_sig_tolerance_t *out)
+{
+    if      (strcmp(s, "normal") == 0) *out = DB_SIG_TOL_NORMAL;
+    else if (strcmp(s, "off")    == 0) *out = DB_SIG_TOL_OFF;
+    else if (strcmp(s, "strict") == 0) *out = DB_SIG_TOL_STRICT;
+    else if (strcmp(s, "loose")  == 0) *out = DB_SIG_TOL_LOOSE;
+    else return false;
+    return true;
+}
+
 /* The inverse, for POST /api/signals/import. An unrecognised (or absent) word
  * becomes DB_ORIGIN_IMPORTED rather than an error: the origin is provenance
  * trivia, and refusing a whole waveform over it would be absurd. */
@@ -834,6 +859,15 @@ static cJSON *signal_json(const db_signal_meta_t *m)
     add_decoded(o, m);
     cJSON_AddNumberToObject(o, "last_seen_s", (double)(m->last_seen_us / 1000000));
     cJSON_AddNumberToObject(o, "seen_count", (double)m->seen_count);
+    /* Similarity is a raw-signal mechanism, so its two fields follow the
+     * `decoded` convention: present where they mean something, absent where
+     * they cannot apply — the UI keys the tolerance control off exactly this. */
+    if (!m->decoded_valid) {
+        cJSON_AddStringToObject(o, "match_tolerance",
+                                tolerance_str(m->match_tolerance));
+        cJSON_AddNumberToObject(o, "similarity_matches",
+                                (double)m->similarity_matches);
+    }
     return o;
 }
 
@@ -912,27 +946,68 @@ static esp_err_t api_signal_detail(httpd_req_t *req, uint16_t id)
     return ESP_OK;
 }
 
-static esp_err_t api_signal_rename(httpd_req_t *req, uint16_t id)
+/* POST /api/signals/<id> — update the name and/or the similarity preset. Both
+ * optional, at least one required; each is validated in full before EITHER is
+ * applied, so a request that half-fails cannot half-happen. */
+static esp_err_t api_signal_update(httpd_req_t *req, uint16_t id)
 {
-    if (!db_signals_get(id)) return send_error(req, "404 Not Found", "no such signal");
+    const db_signal_meta_t *m = db_signals_get(id);
+    if (!m) return send_error(req, "404 Not Found", "no such signal");
 
     cJSON *j = read_json(req);
     if (!j) return send_error(req, "400 Bad Request", "invalid JSON body");
+
+    char clean[DB_SIGNAL_NAME_MAX] = "";
+    bool have_name = false;
     const char *name = NULL;
-    if (!json_str(j, "name", &name) || !name[0]) {
-        cJSON_Delete(j);
-        return send_error(req, "400 Bad Request", "name must be a non-empty string");
+    if (json_str(j, "name", &name)) {
+        trim_copy(name, clean, sizeof(clean));
+        if (!clean[0]) {
+            cJSON_Delete(j);
+            return send_error(req, "400 Bad Request",
+                              "name must be a non-empty string");
+        }
+        have_name = true;
     }
-    char clean[DB_SIGNAL_NAME_MAX];
-    trim_copy(name, clean, sizeof(clean));
+
+    bool have_tol = false;
+    db_sig_tolerance_t tol = DB_SIG_TOL_NORMAL;
+    const char *tol_word = NULL;
+    if (json_str(j, "match_tolerance", &tol_word)) {
+        if (!tolerance_from_str(tol_word, &tol)) {
+            cJSON_Delete(j);
+            return send_error(req, "400 Bad Request",
+                              "match_tolerance must be one of off, strict, "
+                              "normal, loose");
+        }
+        if (m->decoded_valid) {
+            cJSON_Delete(j);
+            return send_error(req, "400 Bad Request",
+                              "this signal matches by its decoded identity — "
+                              "match_tolerance only applies to raw signals");
+        }
+        have_tol = true;
+    }
     cJSON_Delete(j);
-    if (!clean[0]) return send_error(req, "400 Bad Request", "name must be a non-empty string");
 
-    esp_err_t err = db_signals_rename(id, clean);
-    if (err == ESP_OK) db_mqtt_on_signals_changed();
-    if (err != ESP_OK) return send_esp_err(req, err, "could not rename the signal");
+    if (!have_name && !have_tol)
+        return send_error(req, "400 Bad Request",
+                          "nothing to update: send name and/or match_tolerance");
 
-    const db_signal_meta_t *m = db_signals_get(id);
+    if (have_name) {
+        esp_err_t err = db_signals_rename(id, clean);
+        if (err != ESP_OK)
+            return send_esp_err(req, err, "could not rename the signal");
+    }
+    if (have_tol) {
+        esp_err_t err = db_signals_set_tolerance(id, tol);
+        if (err != ESP_OK)
+            return send_esp_err(req, err,
+                                "could not store the match tolerance");
+    }
+    db_mqtt_on_signals_changed();
+
+    m = db_signals_get(id);
     if (!m) return send_error(req, "404 Not Found", "no such signal");
     return send_json(req, signal_json(m), "200 OK");
 }
@@ -3607,7 +3682,7 @@ static esp_err_t post_router(httpd_req_t *req)
     if (uri_is(u, "/api/signals/import"))   return api_signal_import(req);
     if (uri_starts(u, "/api/signals/")) {
         uint16_t id = path_id(u, "/api/signals/", tail, sizeof(tail));
-        if (id && !tail[0])                       return api_signal_rename(req, id);
+        if (id && !tail[0])                       return api_signal_update(req, id);
         if (id && strcmp(tail, "/transmit") == 0) return api_signal_transmit(req, id);
         return send_error(req, "404 Not Found", "no such endpoint");
     }

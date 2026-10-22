@@ -40,7 +40,13 @@
 #                    save/rollback discipline, the delete ordering that a
 #                    power cut must not turn into a ghost signal, the
 #                    boot-time flash reconciliation, and the store-full
-#                    budget check. Plus the raw capture session's heap-budget
+#                    budget check. Also the store's live matching: the
+#                    fragment suppressor's no-latch property, the raw-signal
+#                    similarity stage (truncation, run assembly, the per-
+#                    signal tolerance presets, and the scrambled-noise
+#                    false-positive case), and the v1 -> v2 index migration
+#                    that presets introduced (which is why rf_group.c links
+#                    here: the match path now joins fragment runs with it). Plus the raw capture session's heap-budget
 #                    arithmetic (main/rf_raw_budget.h, header-only): the
 #                    start/grow/projection decisions that let a session start
 #                    small and grow per frame instead of refusing outright on
@@ -97,7 +103,8 @@ NG_SRCS := test_node_graph.c \
         stubs/host_mbedtls.c \
         $(RFPULSE)/rf_frame.c \
         $(RFPULSE)/rf_decode.c \
-        $(RFPULSE)/rf_ev1527.c
+        $(RFPULSE)/rf_ev1527.c \
+        $(RFPULSE)/rf_group.c
 
 BINS := test_rf_decode test_node_graph test_version_cmp test_http_auth
 

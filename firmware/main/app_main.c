@@ -187,12 +187,21 @@ static void dispatch_task(void *arg)
         if (xQueueReceive(s_dispatch_q, &ev, portMAX_DELAY) != pdTRUE)
             continue;
 
-        uint16_t sid = db_signals_match(&ev);
+        db_match_kind_t mkind = DB_MATCH_NONE;
+        uint16_t sid = db_signals_match_ex(&ev, &mkind);
         trigger_from_event(&trig, &ev, sid);
 
         if (sid) {
-            db_events_push(DB_EV_BUTTON_PRESS, sid, 0, ev.rssi_dbm, ev.repeats,
-                           "%s", trig.label);
+            /* A similarity match says so in the feed. It is an inference —
+             * the waveform resembled the recording, where the other kinds
+             * re-identified it exactly — and the one place a user can audit a
+             * loosened tolerance is here, so the label must be honest. */
+            if (mkind == DB_MATCH_SIMILARITY)
+                db_events_push(DB_EV_BUTTON_PRESS, sid, 0, ev.rssi_dbm,
+                               ev.repeats, "%s (similarity)", trig.label);
+            else
+                db_events_push(DB_EV_BUTTON_PRESS, sid, 0, ev.rssi_dbm,
+                               ev.repeats, "%s", trig.label);
             db_mqtt_on_signal_press(sid, ev.rssi_dbm, ev.repeats);
         } else {
             /* An unrecognized burst is reported and then dropped. It is NOT

@@ -2136,6 +2136,376 @@ static void test_fragment_suppressor_never_latches(void)
           "press matches with the small frame as reference");
 }
 
+/* ---- similarity matching ---------------------------------------------------
+ *
+ * The live failure these tests replay: a 224-pulse raw signal ("Gartentor",
+ * fp dd39b439, confidence 24 %) whose transmitter fragments differently on
+ * every reception — one press produced six distinct unmatched fingerprints,
+ * one of them a clean 196-pulse truncation. The stand-in below reproduces the
+ * shape that matters: long, undecodable, aperiodic timing (so a scrambled
+ * frame cannot match by coincidence), and one 12 ms silence mid-frame — the
+ * cut point every live reception fragments at, because 12 ms is past the
+ * normal path's 8 ms idle threshold.
+ */
+
+/* Aperiodic 300/900 pattern; index 151 (a LOW with first_level 1) carries the
+ * long silence. */
+static void make_gartentor(rf_frame_t *f)
+{
+    rf_frame_reset(f);
+    f->first_level = 1;
+    f->count = 224;
+    for (int i = 0; i < 224; i++)
+        f->durations_us[i] = (uint16_t)(((i * 7 + 3) % 4 < 2) ? 300 : 900);
+    f->durations_us[151] = 12000;
+}
+
+/* Pulses [from, to) of src, every duration stretched by drift_pct — the slice
+ * a truncated or fragmented reception of src actually consists of, timed by
+ * the transmitter's drifted oscillator. */
+static void slice_frame(rf_frame_t *dst, const rf_frame_t *src,
+                        int from, int to, int drift_pct)
+{
+    rf_frame_reset(dst);
+    dst->first_level = (uint8_t)(src->first_level ^ (from & 1));
+    dst->count = (uint16_t)(to - from);
+    for (int i = from; i < to; i++)
+        dst->durations_us[i - from] =
+            (uint16_t)((uint32_t)src->durations_us[i] * (uint32_t)(100 + drift_pct) / 100u);
+}
+
+/* Analyse a frame exactly as the capture path would before matching it. */
+static void make_event(rf_event_t *ev, const rf_frame_t *f, int64_t ts_us)
+{
+    memset(ev, 0, sizeof(*ev));
+    ev->frame = *f;
+    rf_normalize(&ev->frame, &ev->norm);
+    rf_decode(&ev->frame, &ev->norm, &ev->decoded);
+    ev->fingerprint = rf_fingerprint(&ev->frame, &ev->norm);
+    ev->repeats  = 1;
+    ev->rssi_dbm = -45;
+    ev->ts_us    = ts_us;
+}
+
+static void test_similarity_matching(void)
+{
+    CASE("similarity: fragmented raw signal matches, noise does not");
+    store_fresh();
+
+    /* The device registers its decoders in rf_service_start(); this binary
+     * has no radio, so do it here — case (e) needs a frame that genuinely
+     * decodes, or "decoded signals are unaffected" would be vacuously true. */
+    rf_decoders_register_builtin();
+
+    static rf_frame_t gart, work;
+    make_gartentor(&gart);
+    uint16_t sig = 0;
+    CHECK(db_signals_add_frame(&gart, NULL, "Gartentor", DB_ORIGIN_CAPTURED,
+                               &sig) == ESP_OK && sig != 0,
+          "store the 224-pulse raw signal");
+    const db_signal_meta_t *m = db_signals_get(sig);
+    CHECK(m && !m->decoded_valid, "no decoder claims it — it is raw");
+    CHECK(m && m->match_tolerance == DB_SIG_TOL_NORMAL,
+          "a fresh signal defaults to the normal preset");
+
+    static rf_event_t ev;
+    db_match_kind_t kind;
+
+    /* (a) an exact capture still matches by fingerprint — similarity is a
+     * fallback, never a replacement. */
+    host_time_advance_us(2 * 1000 * 1000);
+    make_event(&ev, &gart, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig, "(a) exact capture matches");
+    CHECK(kind == DB_MATCH_FINGERPRINT, "(a) ...by fingerprint");
+
+    /* (b) the live box's clean 196-pulse truncation (87.5 %), drifted 8 %. */
+    host_time_advance_us(2 * 1000 * 1000);
+    slice_frame(&work, &gart, 0, 196, 8);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig,
+          "(b) a 196-pulse truncation matches");
+    CHECK(kind == DB_MATCH_SIMILARITY, "(b) ...via similarity");
+    m = db_signals_get(sig);
+    CHECK(m && m->similarity_matches == 1 && m->seen_count >= 2,
+          "(b) counted in similarity_matches and seen_count");
+
+    /* (c) one press, chopped at the 12 ms silence into 151 + 72 pulses. The
+     * first piece explains nothing alone; the second completes the run and
+     * must fire exactly once. */
+    host_time_advance_us(2 * 1000 * 1000);
+    slice_frame(&work, &gart, 0, 151, 5);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0,
+          "(c) the first piece alone matches nothing");
+    {
+        /* Piece 2 begins one drifted 12 ms gap after piece 1 ended; event
+         * timestamps mark frame completion, so advance by gap + airtime. */
+        slice_frame(&work, &gart, 152, 224, 5);
+        uint32_t air2 = rf_frame_duration_us(&work);
+        host_time_advance_us((int64_t)(12000u * 105u / 100u) + air2);
+    }
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig,
+          "(c) the second piece completes the run and fires");
+    CHECK(kind == DB_MATCH_SIMILARITY, "(c) ...via similarity");
+    m = db_signals_get(sig);
+    CHECK(m && m->similarity_matches == 2, "(c) exactly one fire for the run");
+
+    /* ...and the transmitter's own repeat 300 ms later is the SAME press:
+     * absorbed by the press window, not rung twice. */
+    host_time_advance_us(300 * 1000);
+    slice_frame(&work, &gart, 0, 196, 5);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0,
+          "(c) a repeat inside the press window is absorbed");
+    m = db_signals_get(sig);
+    CHECK(m && m->similarity_matches == 2, "(c) ...and not counted either");
+
+    /* (d) six scrambled frames of similar length but different timing — the
+     * false-positive case. Same 300/900 alphabet, same rough length, wrong
+     * sequence: every one must bounce off the per-pulse comparison. */
+    host_time_advance_us(3 * 1000 * 1000);
+    for (int j = 1; j <= 11; j += 2) {
+        static rf_frame_t noise;
+        rf_frame_reset(&noise);
+        noise.first_level = 1;
+        noise.count = 220;
+        for (int i = 0; i < 220; i++)
+            noise.durations_us[i] = (uint16_t)(((i + j) % 4 < 2) ? 300 : 900);
+        host_time_advance_us(400 * 1000);
+        make_event(&ev, &noise, esp_timer_get_time());
+        CHECK(db_signals_match_ex(&ev, &kind) == 0,
+              "(d) scrambled frame j=%d must not match", j);
+    }
+    m = db_signals_get(sig);
+    CHECK(m && m->similarity_matches == 2, "(d) the noise rang nothing");
+
+    /* Preset coverage: the same receptions under the other calibrations. */
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_STRICT) == ESP_OK, "set strict");
+    host_time_advance_us(6 * 1000 * 1000);
+    slice_frame(&work, &gart, 0, 196, 0);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0,
+          "strict refuses the 196-pulse truncation (87.5%% < 95%%)");
+    host_time_advance_us(6 * 1000 * 1000);
+    slice_frame(&work, &gart, 0, 220, 4);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig && kind == DB_MATCH_SIMILARITY,
+          "strict still accepts a 220-pulse near-exact reception (98%%)");
+
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_OFF) == ESP_OK, "set off");
+    host_time_advance_us(6 * 1000 * 1000);
+    slice_frame(&work, &gart, 0, 196, 0);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0,
+          "off disables similarity for this signal entirely");
+
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_LOOSE) == ESP_OK, "set loose");
+    host_time_advance_us(6 * 1000 * 1000);
+    slice_frame(&work, &gart, 0, 170, 12);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig && kind == DB_MATCH_SIMILARITY,
+          "loose accepts a 170-pulse reception at 12%% drift (76%%)");
+    host_time_advance_us(6 * 1000 * 1000);
+    {
+        static rf_frame_t noise;
+        rf_frame_reset(&noise);
+        noise.first_level = 1;
+        noise.count = 220;
+        for (int i = 0; i < 220; i++)
+            noise.durations_us[i] = (uint16_t)(((i + 1) % 4 < 2) ? 300 : 900);
+        make_event(&ev, &noise, esp_timer_get_time());
+        CHECK(db_signals_match_ex(&ev, &kind) == 0,
+              "scrambled timing stays unmatched even on loose");
+    }
+
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_NORMAL) == ESP_OK, "back to normal");
+    host_time_advance_us(6 * 1000 * 1000);
+    slice_frame(&work, &gart, 0, 170, 12);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0,
+          "normal refuses what loose accepted (76%% < 85%%)");
+
+    /* (e) decoded signals are untouched by all of this: identity first, and
+     * the preset cannot even be set on one. */
+    static rf_frame_t evf;
+    uint16_t dsig = 0;
+    CHECK(rf_ev1527_build(0xA685Au, 0x8u, 350, &evf), "build an EV1527 word");
+    CHECK(db_signals_add_frame(&evf, NULL, "Haustür", DB_ORIGIN_SYNTHESIZED,
+                               &dsig) == ESP_OK && dsig != 0, "store it");
+    CHECK(db_signals_set_tolerance(dsig, DB_SIG_TOL_LOOSE) == ESP_ERR_INVALID_STATE,
+          "(e) the preset is refused on a decoded signal");
+    host_time_advance_us(6 * 1000 * 1000);
+    make_event(&ev, &evf, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == dsig && kind == DB_MATCH_IDENTITY,
+          "(e) a decoded signal matches by identity, exactly as before");
+    {
+        db_signal_meta_t dc;
+        CHECK(db_signals_get_copy(dsig, &dc) == ESP_OK && dc.similarity_matches == 0,
+              "(e) ...with no similarity involvement");
+    }
+
+    /* (f) the suppressor composition. A second, SHORTER raw signal (a stored
+     * truncation of the same transmitter) makes the test sharp: the tail
+     * after a similarity fire resembles that short signal on its own, and
+     * must STILL be suppressed — a tail never fires alone, however good it
+     * looks, because it is the end of a press that already rang. */
+    static rf_frame_t kurz;
+    slice_frame(&kurz, &gart, 0, 120, 0);
+    uint16_t ksig = 0;
+    CHECK(db_signals_add_frame(&kurz, NULL, "Tor kurz", DB_ORIGIN_CAPTURED,
+                               &ksig) == ESP_OK && ksig != 0,
+          "(f) store a 120-pulse truncation as its own signal");
+
+    host_time_advance_us(6 * 1000 * 1000);
+    slice_frame(&work, &gart, 0, 196, 0);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig && kind == DB_MATCH_SIMILARITY,
+          "(f) a fresh press fires via similarity");
+
+    /* A sub-75 %% tail of that press which exactly equals the short signal:
+     * fingerprint-identical, and still suppressed. */
+    host_time_advance_us(250 * 1000);
+    make_event(&ev, &kurz, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0,
+          "(f) a 120-pulse tail is suppressed despite matching 'Tor kurz' exactly");
+
+    /* And a tail that only RESEMBLES the short signal (110 pulses, drifted —
+     * a different fingerprint) exercises the similarity-side suppression. */
+    host_time_advance_us(250 * 1000);
+    slice_frame(&work, &gart, 0, 110, 5);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == 0,
+          "(f) a 110-pulse tail is suppressed despite resembling 'Tor kurz'");
+    {
+        db_signal_meta_t kc;
+        CHECK(db_signals_get_copy(ksig, &kc) == ESP_OK && kc.seen_count == 0,
+              "(f) the short signal never fired at all");
+    }
+
+    /* A real second press after the quiet gap rings again — suppression and
+     * absorption end with the press, they do not latch. */
+    host_time_advance_us(2 * 1000 * 1000);
+    slice_frame(&work, &gart, 0, 196, 0);
+    make_event(&ev, &work, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig,
+          "a second press after the gap rings again");
+}
+
+/*
+ * The v1 -> v2 index migration: a pre-tolerance firmware's index must come
+ * forward with every field intact and the new preset at its default, be
+ * written back in the current layout exactly once, and a FUTURE index must
+ * still be ignored-but-preserved (the rollback rule).
+ */
+static void test_signal_index_v1_migration(void)
+{
+    CASE("signal index: v1 -> v2 migration");
+    host_nvs_reset();
+    db_signals_hosttest_reset();
+
+    /* Handcraft what a pre-tolerance firmware left on flash: a v1 index with
+     * one raw signal, plus its frame blob (no frame would make it a ghost and
+     * test the reconcile sweep instead of the migration). */
+    db_signal_meta_v1_t old;
+    memset(&old, 0, sizeof(old));
+    old.id = 7;
+    snprintf(old.name, sizeof(old.name), "Gartentor");
+    old.created_at  = 1726000000;
+    old.fingerprint = 0xdd39b439u;
+    old.base_us     = 300;
+    old.confidence  = 24;
+    old.pulse_count = 224;
+    old.last_seen_us = 123456;   /* stale live stats; must come up zeroed */
+    old.seen_count   = 99;
+
+    unsigned char blob[12 + sizeof(old)];
+    {
+        /* sig_hdr_t: three uint32s — version, meta_size, count. */
+        uint32_t hdr[3] = { 1u, (uint32_t)sizeof(old), 1u };
+        memcpy(blob, hdr, sizeof(hdr));
+        memcpy(blob + 12, &old, sizeof(old));
+    }
+
+    static rf_frame_t gart;
+    make_gartentor(&gart);
+    unsigned char fblob[4 + 224 * sizeof(uint16_t)];
+    {
+        /* frm_hdr_t: uint16 count, uint8 first_level, uint8 reserved. */
+        fblob[0] = (unsigned char)(gart.count & 0xFF);
+        fblob[1] = (unsigned char)(gart.count >> 8);
+        fblob[2] = gart.first_level;
+        fblob[3] = 0;
+        memcpy(fblob + 4, gart.durations_us, 224 * sizeof(uint16_t));
+    }
+
+    nvs_handle_t h;
+    CHECK(nvs_open("dbsig", NVS_READWRITE, &h) == ESP_OK, "open the namespace");
+    CHECK(nvs_set_blob(h, "index", blob, sizeof(blob)) == ESP_OK, "plant the v1 index");
+    CHECK(nvs_set_blob(h, "f7", fblob, sizeof(fblob)) == ESP_OK, "plant its frame");
+    CHECK(nvs_commit(h) == ESP_OK, "commit the v1 flash");
+    nvs_close(h);
+
+    CHECK(db_signals_init() == ESP_OK, "boot on the v1 flash");
+    CHECK(db_signals_count() == 1, "the signal survived the migration");
+    const db_signal_meta_t *m = db_signals_get(7);
+    CHECK(m != NULL, "id preserved");
+    if (m) {
+        CHECK(strcmp(m->name, "Gartentor") == 0, "name preserved");
+        CHECK(m->fingerprint == 0xdd39b439u, "fingerprint preserved");
+        CHECK(m->pulse_count == 224 && m->base_us == 300 && m->confidence == 24,
+              "analysis fields preserved");
+        CHECK(m->created_at == 1726000000, "created_at preserved");
+        CHECK(m->match_tolerance == DB_SIG_TOL_NORMAL,
+              "the new preset defaults to normal");
+        CHECK(m->seen_count == 0 && m->last_seen_us == 0 &&
+              m->similarity_matches == 0,
+              "live stats come up clean, stale persisted values discarded");
+    }
+
+    /* The write-back: flash now holds the CURRENT layout, so the next boot
+     * reads it directly and the migration is a one-off. */
+    {
+        unsigned char back[12 + sizeof(db_signal_meta_t)];
+        size_t len = sizeof(back);
+        uint32_t ver = 0, msz = 0;
+        CHECK(nvs_open("dbsig", NVS_READONLY, &h) == ESP_OK, "re-open the namespace");
+        CHECK(nvs_get_blob(h, "index", back, &len) == ESP_OK, "index readable");
+        nvs_close(h);
+        memcpy(&ver, back, 4);
+        memcpy(&msz, back + 4, 4);
+        CHECK(ver == 2u && msz == sizeof(db_signal_meta_t),
+              "index rewritten as v2 (got v%u/%u)", (unsigned)ver, (unsigned)msz);
+    }
+
+    /* The round trip: a reboot reads the v2 index directly, and a changed
+     * preset survives the next one. */
+    store_reboot();
+    m = db_signals_get(7);
+    CHECK(m && m->pulse_count == 224 && m->match_tolerance == DB_SIG_TOL_NORMAL,
+          "v2 index round-trips a reboot");
+    CHECK(db_signals_set_tolerance(7, DB_SIG_TOL_LOOSE) == ESP_OK, "set loose");
+    store_reboot();
+    m = db_signals_get(7);
+    CHECK(m && m->match_tolerance == DB_SIG_TOL_LOOSE,
+          "the preset is persisted across reboots");
+
+    /* A FUTURE index is ignored but preserved: load empty, sweep nothing —
+     * the firmware that wrote it must find its signals intact after a
+     * rollback. */
+    {
+        uint32_t hdr[3] = { 3u, (uint32_t)sizeof(old), 1u };
+        memcpy(blob, hdr, sizeof(hdr));
+        CHECK(nvs_open("dbsig", NVS_READWRITE, &h) == ESP_OK, "open for the v3 plant");
+        CHECK(nvs_set_blob(h, "index", blob, sizeof(blob)) == ESP_OK, "plant a v3 index");
+        CHECK(nvs_commit(h) == ESP_OK, "commit it");
+        nvs_close(h);
+    }
+    store_reboot();
+    CHECK(db_signals_count() == 0, "a newer index loads as empty");
+    CHECK(frame_on_flash(7), "...and its frame blob is NOT swept");
+}
+
 static void test_hot_path_survives_full_storage(void)
 {
     CASE("hot path: RX match -> traversal -> TX + switch on zero free NVS");
@@ -2329,6 +2699,8 @@ int main(void)
     test_storage_breadcrumb_degrades_to_ram();
 
     test_fragment_suppressor_never_latches();
+    test_similarity_matching();
+    test_signal_index_v1_migration();
     test_hot_path_survives_full_storage();
 
     printf("---------------------\n");

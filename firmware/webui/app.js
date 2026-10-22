@@ -1604,6 +1604,10 @@ function signalBlock(sig, opts) {
   kvAdd(t("Pulses"), sig.pulse_count);
   kvAdd("RSSI", typeof sig.rssi_dbm === "number" ? sig.rssi_dbm + " dBm" : null);
   kvAdd(t("Seen"), typeof sig.seen_count === "number" ? t("{count} times", { count: sig.seen_count }) : null);
+  /* Only when the fuzzier mechanism has actually fired: a zero row would read
+     as a feature ad, a non-zero one is the audit trail it exists to be. */
+  kvAdd(t("Via similarity"), (typeof sig.similarity_matches === "number" && sig.similarity_matches > 0)
+    ? t("{count} times", { count: sig.similarity_matches }) : null);
   kvAdd(t("Last seen"), typeof sig.last_seen_s === "number" ? agoText(sig.last_seen_s) : null);
   kvAdd(t("Created"), fmtEpoch(sig.created_at) || null);
   if (sig.decoded) {
@@ -1640,6 +1644,37 @@ function signalBlock(sig, opts) {
     t("Shown in the activity feed, on the node card and in the picker.")));
 
   var msg = el("div", "formmsg");
+
+  /* Match tolerance — raw signals only. The firmware omits the field for
+     decoded signals (they match by identity, which is never loosened), so its
+     presence is exactly the "show this control" signal. Saved immediately on
+     change: a preset is one deliberate pick, not part of a form. */
+  if (!sig.decoded && typeof sig.match_tolerance === "string") {
+    var tolSel = el("select");
+    [["off",    t("off — exact fingerprint only")],
+     ["strict", t("strict — only near-exact receptions")],
+     ["normal", t("normal — tolerates truncation and fragments (default)")],
+     ["loose",  t("loose — accepts heavy fragmentation, higher false-match risk")]
+    ].forEach(function (o) {
+      var op = el("option", null, o[1]);
+      op.value = o[0];
+      if (sig.match_tolerance === o[0]) op.selected = true;
+      tolSel.appendChild(op);
+    });
+    tolSel.addEventListener("change", function () {
+      var v = tolSel.value;
+      postJSON("/api/signals/" + sig.id, { match_tolerance: v }).then(function () {
+        sig.match_tolerance = v;
+        setMsg(msg, t("Match tolerance saved."), "ok");
+        loadSignals();
+      }).catch(function (e) { setMsg(msg, e.message, "err"); });
+    });
+    add(box, field(t("Match tolerance"), tolSel,
+      t("How much a live reception may differ from this recording and still ring as this button. " +
+        "Raise it if presses of this transmitter go unrecognized; lower it if the wrong bell ever " +
+        "rings — and watch the Activity feed after changing it: similarity matches are labeled there.")));
+  }
+
   var foot = el("div", "formfoot");
 
   var txb = el("button", "btn primary", t("📡 Transmit"));

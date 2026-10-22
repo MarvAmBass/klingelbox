@@ -14,10 +14,19 @@
  * the hot path never touches flash.
  *
  * MATCHING. An incoming burst is matched by decoded identity when a decoder
- * claimed it (protocol + id + button is far stronger evidence than timing), and
- * otherwise by fingerprint over the normalized timing structure. Raw durations
- * are never compared directly — cheap transmitters drift several percent between
- * presses and as their batteries age.
+ * claimed it (protocol + id + button is far stronger evidence than timing),
+ * otherwise by fingerprint over the normalized timing structure, and — for
+ * RAW signals only — by waveform SIMILARITY as the last resort, including a
+ * burst that is a clean leading truncation of the stored frame and a press
+ * that arrived chopped into several bursts (reassembled with the measured
+ * silences, exactly like the Listen flow's run machinery). Raw durations are
+ * never compared exactly — cheap transmitters drift several percent between
+ * presses and as their batteries age — and how LOOSELY the similarity stage
+ * may compare is a per-signal setting (db_sig_tolerance_t below), because the
+ * need differs per transmitter: a long pattern that fragments differently on
+ * every reception needs the slack, while a clean signal gains nothing from it
+ * but false-ring risk. Decoded signals ignore the setting entirely; identity
+ * matching is never loosened.
  *
  * WHERE SIGNALS COME FROM, AND WHAT IS NOT HERE ANY MORE. This module used to
  * own a second entry point called learn mode: an armed window during which an
@@ -81,6 +90,25 @@ typedef enum {
     DB_ORIGIN_IMPORTED,       /* uploaded via the API */
 } db_signal_origin_t;
 
+/*
+ * How loosely the similarity stage may match a RAW signal. A preset rather
+ * than free numbers on purpose: each value is a named, documented calibration
+ * (see the preset table in signal_store.c), and "a little looser than loose"
+ * is not a request a user can reason about when the failure mode is somebody
+ * else's bell ringing.
+ *
+ * NORMAL is deliberately the zero value: a zeroed record — a freshly built
+ * meta, a migrated pre-tolerance index entry — lands on the default without
+ * anyone having to remember to set it.
+ */
+typedef enum {
+    DB_SIG_TOL_NORMAL = 0,   /* the default: truncation + fragment assembly  */
+    DB_SIG_TOL_OFF    = 1,   /* exact fingerprint only (the old behaviour)   */
+    DB_SIG_TOL_STRICT = 2,   /* near-exact receptions only                   */
+    DB_SIG_TOL_LOOSE  = 3,   /* heavier fragmentation; higher false-ring risk */
+} db_sig_tolerance_t;
+#define DB_SIG_TOL__COUNT 4
+
 /* Resident metadata. The pulse frame is NOT here — see the storage split. */
 typedef struct {
     uint16_t         id;                 /* 1..N; 0 means "none"/invalid */
@@ -99,7 +127,39 @@ typedef struct {
     /* Live stats, not persisted. */
     int64_t          last_seen_us;
     uint32_t         seen_count;
+    /* v2 fields — appended, so the persisted v1 record is a byte prefix of
+     * this one on any single compiler (see db_signal_meta_v1_t below). */
+    uint8_t          match_tolerance;    /* db_sig_tolerance_t; raw signals only */
+    uint32_t         similarity_matches; /* live stat: seen_count's similarity
+                                            subset — honest observability for a
+                                            fuzzier mechanism. Not persisted.  */
 } db_signal_meta_t;
+
+/*
+ * FROZEN v1 record layout — the bytes every pre-tolerance firmware wrote into
+ * the "index" blob. Same discipline as db_node_v3_t (node_migrate.h): this
+ * struct describes flash that already exists in the field, so nothing in it
+ * may ever move, and the sizes are literals rather than the live macros so an
+ * edit to those cannot silently re-describe old bytes. signal_store.c reads a
+ * v1 index through this and migrates field by field; it lives in the header
+ * so the host tests can WRITE a genuine v1 blob and prove the round trip.
+ */
+typedef struct {
+    uint16_t         id;
+    char             name[32];
+    uint8_t          origin;
+    int64_t          created_at;
+    rf_fingerprint_t fingerprint;
+    uint16_t         base_us;
+    uint8_t          confidence;
+    uint16_t         pulse_count;
+    bool             decoded_valid;
+    char             protocol[16];
+    uint32_t         decoded_id;
+    uint8_t          decoded_button;
+    int64_t          last_seen_us;       /* persisted as 0 — live stat */
+    uint32_t         seen_count;         /* persisted as 0 — live stat */
+} db_signal_meta_v1_t;
 
 esp_err_t db_signals_init(void);
 
@@ -155,6 +215,11 @@ esp_err_t db_signals_add_frame(const rf_frame_t *frame, const rf_decoded_t *deco
 esp_err_t db_signals_load_frame(uint16_t id, rf_frame_t *out);
 esp_err_t db_signals_rename(uint16_t id, const char *name);
 
+/* Set a RAW signal's similarity preset (persisted). ESP_ERR_INVALID_STATE for
+ * a decoded signal — identity matching is never loosened, so storing a preset
+ * there would be a setting that silently does nothing. */
+esp_err_t db_signals_set_tolerance(uint16_t id, db_sig_tolerance_t tol);
+
 /* Delete a signal: the index (minus the entry) is committed FIRST, then the
  * frame blob is erased — a power cut between the two leaves an orphaned blob
  * (harmless, swept at the next boot), never a listed signal whose waveform is
@@ -163,8 +228,23 @@ esp_err_t db_signals_rename(uint16_t id, const char *name);
  * whatever a badly-timed power cut leaves either way. */
 esp_err_t db_signals_delete(uint16_t id);
 
+/* Which mechanism produced a match — the event feed and the per-signal stats
+ * must be able to say when the fuzzier similarity stage fired, because a
+ * similarity match is an inference where the other two are identifications. */
+typedef enum {
+    DB_MATCH_NONE = 0,
+    DB_MATCH_IDENTITY,      /* decoded protocol + address + button */
+    DB_MATCH_FINGERPRINT,   /* exact quantized-timing fingerprint  */
+    DB_MATCH_SIMILARITY,    /* raw waveform similarity / run assembly */
+} db_match_kind_t;
+
 /* Match an incoming burst against the store. Returns the signal id, or 0.
- * Also updates last_seen_us / seen_count on a hit. */
+ * Also updates last_seen_us / seen_count (and similarity_matches when the
+ * similarity stage fired) on a hit. `kind_out` may be NULL. */
+uint16_t db_signals_match_ex(const rf_event_t *ev, db_match_kind_t *kind_out);
+
+/* The original entry point, kept for callers that do not care how the match
+ * came about. Identical to db_signals_match_ex(ev, NULL). */
 uint16_t db_signals_match(const rf_event_t *ev);
 
 /* Find the stored signal that carries a given decoded identity, or NULL.

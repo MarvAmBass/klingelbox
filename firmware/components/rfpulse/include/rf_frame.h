@@ -71,6 +71,28 @@ bool rf_frame_similar(const rf_frame_t *a, const rf_frame_t *b,
                       uint8_t tolerance_pct, uint16_t tolerance_us);
 
 /*
+ * Truncation-tolerant variant: does `head` match a LEADING subsequence of
+ * `full` within the same two tolerances? This is the comparison a clipped
+ * reception needs — a transmission that dies mid-air (weak battery, moving
+ * hand, AGC losing the carrier) is recorded as the first N pulses of the
+ * waveform and then silence, so it can never pass the equal-count test above
+ * no matter how perfectly those N pulses agree.
+ *
+ * The final pulse of `head` is special-cased: it is allowed to be SHORTER
+ * than full's pulse at that position (never longer), because the reception
+ * ending is exactly what cut it — the capture drops the terminating silence,
+ * so whatever the radio last heard of that pulse is all that was recorded.
+ *
+ * Deliberately one-directional: `head` must fit inside `full`. How much of
+ * `full` must be covered for the match to MEAN anything is the caller's
+ * policy, not this function's — a 10-pulse head "matching" a 500-pulse frame
+ * is true and useless, so callers enforce a minimum fraction on top.
+ * Equal-length inputs degrade to rf_frame_similar().
+ */
+bool rf_frame_similar_prefix(const rf_frame_t *full, const rf_frame_t *head,
+                             uint8_t tolerance_pct, uint16_t tolerance_us);
+
+/*
  * Echo-tolerant variant for TX echo suppression, where `sent` is a frame WE
  * transmitted and `heard` is a frame just captured off the air. The verbatim
  * comparison above is structurally wrong for that job: when `sent` ends in a

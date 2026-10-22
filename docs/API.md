@@ -288,12 +288,43 @@ A signal is a stored waveform. A "button" is a signal referenced by a source nod
 ```
 `decoded` is `null` for an unknown protocol — a normal, fully supported state.
 
+A **raw** signal (`decoded: null`) carries two additional fields:
+
+```json
+{ "...": "...", "decoded": null,
+  "match_tolerance": "normal", "similarity_matches": 3 }
+```
+
+`match_tolerance` controls the **similarity matching** a raw signal gets on
+top of its exact fingerprint: some transmitters (long patterns with mid-frame
+silences) fragment differently on every reception, so a live press arrives as
+a truncation or as several pieces and the exact fingerprint never matches.
+The box therefore also compares unmatched receptions against the stored
+waveform pulse by pulse — accepting a clean leading truncation, and
+reassembling pieces that arrive within one press's join window — and how
+loosely is this preset:
+
+| preset | accepts | false-ring risk |
+|---|---|---|
+| `off` | exact fingerprint only (the previous behaviour) | none |
+| `strict` | near-exact receptions only (≥ 95 % of the stored pulses) | minimal |
+| `normal` | truncation and fragment reassembly down to 85 % (default) | low |
+| `loose` | heavy fragmentation down to 75 % and wider timing drift | **watch the Activity feed** |
+
+Decoded signals carry neither field: they match by protocol identity, which
+is never loosened. A press matched via similarity is labeled
+`"<name> (similarity)"` in the event feed and counted in
+`similarity_matches` (a live counter next to `seen_count`, reset at boot), so
+a loosened preset can be audited before it is trusted.
+
 ### `GET /api/signals/{id}`
 As above plus the raw waveform, so the UI can draw it:
 ```json
 { "id": 1, "...": "...", "first_level": 1, "durations_us": [919,273,297,...] }
 ```
-### `POST /api/signals/{id}` — `{"name":"..."}`
+### `POST /api/signals/{id}` — `{"name":"..."}` and/or `{"match_tolerance":"off|strict|normal|loose"}`
+Both fields optional, at least one required. `match_tolerance` is **400** on a
+decoded signal (it only applies to raw ones).
 ### `DELETE /api/signals/{id}`
 ### `POST /api/signals/{id}/transmit` — `{"repeats":6,"gap_us":8000}` (both optional)
 **503** if no radio is present. Response `{"ok":true}` means *software-level*
