@@ -2057,6 +2057,85 @@ static void test_raw_budget_slots_possible(void)
  * only thing allowed to degrade is the DURABILITY of the switch position,
  * whose deferred save fails quietly and leaves a breadcrumb.
  */
+/* The fragment suppressor must never latch. Before the fix, every judged
+ * fragment refreshed the window anchor, so one large frame followed by
+ * sustained sub-750 ms noise suppressed EVERY smaller frame -- a legitimate
+ * doorbell press included -- for as long as the storm lasted. The window now
+ * anchors to the last MAIN frame only, so suppression structurally cannot
+ * outlive DB_FRAG_WINDOW_US past the real frame, storm or no storm. */
+static void test_fragment_suppressor_never_latches(void)
+{
+    store_fresh();
+
+    uint16_t sig = 0;
+    CHECK(add_signal("Klingel", 49, &sig) == ESP_OK && sig != 0, "signal stored");
+
+    /* The press event, analysed the way the capture path would. */
+    static rf_event_t press;
+    memset(&press, 0, sizeof(press));
+    CHECK(db_signals_load_frame(sig, &press.frame) == ESP_OK, "waveform loads");
+    rf_normalize(&press.frame, &press.norm);
+    rf_decode(&press.frame, &press.norm, &press.decoded);
+    press.fingerprint = rf_fingerprint(&press.frame, &press.norm);
+    press.repeats = 3;
+    press.rssi_dbm = -50;
+
+    /* A big foreign frame sets the fragment reference... */
+    static rf_event_t big;
+    memset(&big, 0, sizeof(big));
+    make_frame(&big.frame, 200);
+    rf_normalize(&big.frame, &big.norm);
+    big.fingerprint = rf_fingerprint(&big.frame, &big.norm);
+    big.ts_us = esp_timer_get_time();
+    CHECK(db_signals_match(&big) == 0, "foreign 200-pulse frame matches nothing");
+
+    /* ...then a storm: one small foreign frame every 500 ms for 10 s. Each is
+     * within 750 ms of its predecessor -- the exact chaining that used to
+     * extend the window forever. */
+    static rf_event_t noise;
+    memset(&noise, 0, sizeof(noise));
+    make_frame(&noise.frame, 40);
+    rf_normalize(&noise.frame, &noise.norm);
+    noise.fingerprint = rf_fingerprint(&noise.frame, &noise.norm);
+    for (int i = 0; i < 20; i++) {
+        host_time_advance_us(500 * 1000);
+        noise.ts_us = esp_timer_get_time();
+        db_signals_match(&noise);   /* verdicts vary; latching is the question */
+    }
+
+    /* The press arrives 400 ms after the last storm frame: inside the window
+     * of its PREDECESSOR, which is what the latch fed on. It must match. */
+    host_time_advance_us(400 * 1000);
+    press.ts_us = esp_timer_get_time();
+    CHECK(db_signals_match(&press) == sig,
+          "a real press matches through a 10 s noise storm (no latch)");
+
+    /* A genuine tail -- fewer than 75 %% of the press's pulses, 250 ms after
+     * it -- is still suppressed... */
+    static rf_event_t tail;
+    memset(&tail, 0, sizeof(tail));
+    make_frame(&tail.frame, 33);
+    rf_normalize(&tail.frame, &tail.norm);
+    tail.fingerprint = rf_fingerprint(&tail.frame, &tail.norm);
+    host_time_advance_us(250 * 1000);
+    tail.ts_us = esp_timer_get_time();
+    CHECK(db_signals_match(&tail) == 0, "a true 250 ms tail is still suppressed");
+
+    /* ...but the same small frame OUTSIDE the window is judged on its own
+     * merits (it matches nothing; what matters is that the anchor expired and
+     * it became the new reference, proven by the next check). */
+    host_time_advance_us(1000 * 1000);
+    tail.ts_us = esp_timer_get_time();
+    CHECK(db_signals_match(&tail) == 0, "window expired: small frame is a main");
+
+    /* A second real press right after a 33-pulse MAIN frame must match:
+     * 49 pulses is far above 75 %% of 33, so no fragment verdict applies. */
+    host_time_advance_us(300 * 1000);
+    press.ts_us = esp_timer_get_time();
+    CHECK(db_signals_match(&press) == sig,
+          "press matches with the small frame as reference");
+}
+
 static void test_hot_path_survives_full_storage(void)
 {
     CASE("hot path: RX match -> traversal -> TX + switch on zero free NVS");
@@ -2249,6 +2328,7 @@ int main(void)
     test_storage_breadcrumb_erase_first_makes_room();
     test_storage_breadcrumb_degrades_to_ram();
 
+    test_fragment_suppressor_never_latches();
     test_hot_path_survives_full_storage();
 
     printf("---------------------\n");

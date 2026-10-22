@@ -132,7 +132,8 @@ static uint8_t s_blob[sizeof(sig_hdr_t) + DB_SIGNAL_MAX * sizeof(db_signal_meta_
 
 /* What the previous burst looked like, for the fragment test. */
 static struct {
-    int64_t  last_ts_us;    /* rf_event_t.ts_us of the last burst examined     */
+    int64_t  last_ts_us;    /* ts_us of the last MAIN frame (fragments do not
+                               move the window anchor — see judge_burst)       */
     uint16_t ref_pulses;    /* pulse count of the last NON-fragment burst      */
     uint16_t matched_id;    /* what that burst matched, 0 if nothing           */
     bool     was_fragment;  /* the verdict for last_ts_us, cached so a repeat
@@ -986,12 +987,19 @@ static bool judge_burst(const rf_event_t *ev)
         frag = true;
     }
 
-    s_recent.last_ts_us   = ev->ts_us;
-    s_recent.was_fragment = frag;
     if (!frag) {
-        /* A new main frame becomes the reference. Fragments deliberately do NOT
-         * update it: a run of tails must all be measured against the real
-         * frame, not against each other. */
+        s_recent.was_fragment = false;
+        /* A new main frame becomes the reference — AND the window anchor.
+         * Fragments update neither: a run of tails must be measured against
+         * the real frame, not against each other, and the window must run out
+         * 750 ms after the REAL frame rather than being refreshed by every
+         * tail. The old code refreshed last_ts_us on fragments too, which let
+         * a sustained noise storm chain the window indefinitely: one large
+         * frame as reference, then every later frame under 75 % of its pulse
+         * count — a legitimate doorbell press included — judged a tail for as
+         * long as sub-750 ms traffic kept arriving. A suppressor must never
+         * be able to latch. */
+        s_recent.last_ts_us = ev->ts_us;
         s_recent.ref_pulses = ev->frame.count;
         s_recent.matched_id = 0;
     }
@@ -1044,9 +1052,18 @@ uint16_t db_signals_match(const rf_event_t *ev)
         /* Whatever it looks like, it is the tail of the press we just handled.
          * Firing here would either double-ring the chime or, worse, ring the
          * WRONG one. Debug level: this is expected behaviour, not a fault. */
-        ESP_LOGD(TAG, "ignoring %u-pulse tail fragment after a %u-pulse frame%s",
-                 ev->frame.count, s_recent.ref_pulses,
-                 hit ? " (it would have matched a stored signal)" : "");
+        /* WARN when the suppressed frame would have matched: that is exactly
+         * the case a wedged suppressor would hide, and the one worth seeing
+         * on a box with no serial console. Plain tails stay at debug. */
+        if (hit)
+            ESP_LOGW(TAG, "suppressed a %u-pulse tail fragment that matches "
+                          "signal %u '%s' (%u-pulse reference frame %lld ms ago)",
+                     ev->frame.count, (unsigned)hit->id, hit->name,
+                     s_recent.ref_pulses,
+                     (long long)((ev->ts_us - s_recent.last_ts_us) / 1000));
+        else
+            ESP_LOGD(TAG, "ignoring %u-pulse tail fragment after a %u-pulse frame",
+                     ev->frame.count, s_recent.ref_pulses);
         unlock();
         return 0;
     }
