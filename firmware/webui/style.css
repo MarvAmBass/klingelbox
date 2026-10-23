@@ -622,6 +622,14 @@ details.panel > h3 { font-size: .92rem; margin: 1rem 0 .3rem; }
    non-uniform viewBox scaling the plot uses. */
 .wave .wave-sel { fill: var(--accent); opacity: .17; }
 
+/* The in-list miniature (candidate rows, live listening feedback). Height is
+   the only override: everything else — stroke, colour, non-scaling width —
+   comes from .wave so the thumbnail can never drift from the full plot. */
+.wave.thumb { height: 26px; }
+.cand-thumb { margin-top: .3rem; background: var(--sunk); border: 1px solid var(--line);
+  border-radius: var(--r-sm); padding: .15rem .25rem; }
+.cand-thumb:empty { display: none; }
+
 /* Two native range inputs are the drag handles. Native on purpose: a phone
    already knows how to drag one, it is keyboard-operable for free, and the
    number boxes underneath cover the case where you want to nudge by exactly

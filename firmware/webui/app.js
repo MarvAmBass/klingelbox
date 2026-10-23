@@ -1409,6 +1409,38 @@ function waveform(durations, firstLevel, sel) {
   return box;
 }
 
+/* The candidate-row thumbnail: the same square wave, small, full-width and
+   NON-scrolling. Its one job is "noise shred or clean repeating word?" at a
+   glance — pulse-level inspection is what tapping through to the full plot is
+   for, so this one has no caption, no selection band and no horizontal
+   scrolling to fight with the list's own touch gestures. */
+function waveThumb(durations, firstLevel) {
+  if (!durations || !durations.length) return null;
+  var MAXP = 800;
+  var n = Math.min(durations.length, MAXP);
+  var total = 0, i;
+  for (i = 0; i < n; i++) total += Math.max(0, durations[i] || 0);
+  if (!total) return null;
+  var W = 1000, HI = 3, LO = 21, H = 24;
+  var lvl = firstLevel ? 1 : 0;
+  var x = 0;
+  var d = "M0," + (lvl ? HI : LO);
+  for (i = 0; i < n; i++) {
+    x += (durations[i] || 0) * W / total;
+    d += "H" + x.toFixed(2);
+    lvl = lvl ? 0 : 1;
+    d += "V" + (lvl ? HI : LO);
+  }
+  var svg = svgEl("svg", "wave thumb");
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  svg.setAttribute("preserveAspectRatio", "none");
+  svg.setAttribute("aria-hidden", "true");
+  var p = svgEl("path");
+  p.setAttribute("d", d);
+  add(svg, p);
+  return svg;
+}
+
 /* ======================================================================
    SIGNALS -- reached THROUGH nodes, never beside them
 
@@ -2140,6 +2172,36 @@ function rawFloorOptions(sel, offValue) {
   return out;
 }
 
+/* Signal strength, judged against the one threshold that actually matters on
+   this screen: the NORMAL receiver's squelch. A session lowers the floor so it
+   can hear more — and that is precisely how a recording can look like a
+   success while daily operation would stay deaf to the same button. Field day
+   2026-10-23: a button was registered from −88 dBm captures and then "never
+   worked", because the box squelches at −75 outside a session. The gap between
+   those two numbers is this function's whole subject. */
+function rawSquelch() {
+  return numOr((((S.raw || {}).limits) || {}).normal_squelch_dbm, -75);
+}
+function rssiVerdict(dbm) {
+  if (typeof dbm !== "number") return null;
+  var sq = rawSquelch();
+  if (dbm < sq)     return { cls: "bad",  weak: true, label: t("below squelch") };
+  if (dbm < sq + 5) return { cls: "warn", weak: true, label: t("borderline") };
+  if (dbm < -58)    return { cls: "ok",   label: t("good signal") };
+  return { cls: "ok", label: t("strong signal") };
+}
+
+/* True when a recording has none of the things a button press has: length,
+   repetition, or a protocol. Used for a CAUTION, never a gate — the ranking
+   philosophy stands, and a genuinely odd transmitter can still be saved. */
+function looksLikeNoise(o) {
+  var pulses = numOr(o.pulse_count, (o.durations_us || []).length);
+  return pulses < 16 && !o.decoded &&
+         !(o.unit && numOr(o.unit.repeats, 0) >= 2) &&
+         numOr(o.seen, 1) < 3 &&
+         numOr(o.confidence, 0) < 45;
+}
+
 /* The honest verdict. The whole point of this screen is that "nothing was
    received" and "something was received but did not fit our assumptions" are
    different problems with different fixes, so this never says "no results". */
@@ -2174,6 +2236,24 @@ function rawVerdict(st) {
           + "{dbm} dBm. That is the receiver's own amplifier noise, not a transmitter. "
           + "Raise the squelch floor and run it again.",
           { count: count, secs: numOr(st.elapsed_s, 0), dbm: strongest })
+      };
+    }
+    /* Everything below the OPERATING squelch is the trap this screen used to
+       set: the session heard it (lowered floor), the save succeeded, and the
+       box then "never worked" — because outside a session it refuses to listen
+       this deep. Said before the happy verdicts, because repetition does not
+       redeem a signal the normal receiver will never hear. */
+    var sq = numOr((st.limits || {}).normal_squelch_dbm, -75);
+    if (strongest !== null && strongest < sq) {
+      return {
+        kind: "warn",
+        text: t("Everything recorded is quieter than {sq} dBm — the level the box "
+          + "listens at in normal operation. This session only heard it because the "
+          + "floor was lowered to {floor} dBm, so a signal saved from here would "
+          + "never ring anything day to day. Hold the transmitter right next to the "
+          + "box and record again — and if it already was next to it, the problem "
+          + "is the receiver side (check the box's antenna), not the transmitter.",
+          { sq: sq, floor: numOr(set.rssi_floor_dbm, -80) })
       };
     }
     /* Something repeated: say so, because that is the evidence the ranking runs
@@ -2302,6 +2382,15 @@ function openListenFlow(opts) {
     var count = el("div", "countdown idle", "—");
     var state = el("div", "listening");
     add(sh.body, count, state);
+
+    /* Live feedback, one press at a time. Fifteen presses into a dead receiver
+       once produced nothing but a silent countdown — the user had no way to
+       tell "my presses are not arriving" from "the box is still thinking".
+       So every burst that arrives is announced the second it lands: size,
+       strength, and a thumbnail of its waveform. */
+    var liveWrap = el("div");
+    add(sh.body, liveWrap);
+    var liveCount = -1;
 
     var fragWrap = el("div");
     var verdict = el("div");
@@ -2455,10 +2544,48 @@ function openListenFlow(opts) {
           : t("Not listening. Nothing is being stored and the box behaves normally.")));
       }
 
+      renderLive(st);
       renderFragmentation(st);
       renderVerdict(st);
       renderCandidates(st);
       renderAll(st);
+    }
+
+    /* The newest burst, announced while the countdown still runs. Only the
+       LATEST one is shown — this is a meter, not a log; the ranked list below
+       is the log. The waveform comes in a second fetch because the session
+       poll deliberately carries summaries only. */
+    function renderLive(st) {
+      if (!st.running) { clear(liveWrap); liveCount = -1; return; }
+      var frames = st.frames || [];
+      var n = numOr(st.count, 0);
+      if (n === liveCount) return;           /* nothing new since last tick */
+      liveCount = n;
+      clear(liveWrap);
+      if (!frames.length) return;
+      var f = frames[frames.length - 1];
+      var sv = rssiVerdict(numOr(f.rssi_dbm, null));
+      var note = el("div", "note " + (sv && sv.weak ? sv.cls : "ok"));
+      var line = t("Heard just now: {n} pulses at {dbm} dBm", {
+        n: numOr(f.pulse_count, 0), dbm: numOr(f.rssi_dbm, 0) });
+      if (f.decoded && f.decoded.text) line += " · " + f.decoded.text;
+      add(note, el("div", null, line));
+      if (sv) add(note, el("span", "chip " + sv.cls, sv.label));
+      if (sv && sv.weak) {
+        add(note, el("div", "small",
+          t("Quieter than the {sq} dBm operating squelch — outside a listening "
+          + "session the box would NOT have heard this. Hold the transmitter "
+          + "closer.", { sq: rawSquelch() })));
+      }
+      var tw = el("div", "cand-thumb");
+      add(note, tw);
+      add(liveWrap, note);
+      var mine = liveCount;
+      api("/api/raw/" + f.index).then(function (full) {
+        if (liveCount !== mine) return;      /* a newer burst took the stage */
+        var w = waveThumb(full.durations_us || [], full.first_level);
+        if (w) add(tw, w);
+      }).catch(function () { /* cosmetic only */ });
     }
 
     /*
@@ -2542,6 +2669,27 @@ function openListenFlow(opts) {
       }
     }
 
+    /* Candidate waveforms for the thumbnails, fetched once each and only after
+       the session has stopped: while it runs the box is busy receiving, and the
+       live view above already shows the newest burst. Keyed by candidate id,
+       which is only stable within one session — startBtn empties it. */
+    var thumbs = {};
+    function thumbInto(box, id, st) {
+      var c = thumbs[id];
+      if (c && c.durs) {
+        var w = waveThumb(c.durs, c.fl);
+        if (w) add(box, w);
+        return;
+      }
+      if (!c && !(st && st.running)) {
+        thumbs[id] = c = {};
+        api("/api/raw/candidates/" + id).then(function (f) {
+          c.durs = f.durations_us || [];
+          c.fl = f.first_level;
+        }).catch(function () { delete thumbs[id]; });
+      }
+    }
+
     /*
      * The ranked list. Most likely first, and each row says why it is where it
      * is: an undecoded waveform heard five times legitimately sits above a
@@ -2573,7 +2721,13 @@ function openListenFlow(opts) {
 
         var why = el("div", "li-sub");
         if (i === 0) add(why, el("span", "chip ok", t("most likely")));
-        add(why, el("span", null, (i === 0 ? " " : "") + (c.why || "")));
+        /* The two cautions the ranking itself cannot express: "the normal
+           receiver would never hear this" and "this has none of the shape of a
+           button press". Chips, not gates — an odd transmitter stays savable. */
+        var sv = rssiVerdict(numOr(c.rssi_dbm, null));
+        if (sv && sv.weak) add(why, el("span", "chip " + sv.cls, sv.label));
+        if (looksLikeNoise(c)) add(why, el("span", "chip warn", t("looks like noise")));
+        add(why, el("span", null, " " + (c.why || "")));
         add(main, why);
 
         var det = t("{pulses} pulses · {ms} ms · base {base} µs", {
@@ -2592,6 +2746,13 @@ function openListenFlow(opts) {
         }
         if (c.truncated) det += t(" · TRUNCATED at the 512-pulse limit");
         add(main, el("div", "li-sub", det));
+        /* The waveform itself, in miniature. "Noise shred or clean repeating
+           word?" is answerable by eye faster than by any number above, so the
+           eye gets it without a tap. Filled from a per-session cache: the list
+           re-renders every poll tick, the fetch happens once per candidate. */
+        var tw = el("div", "cand-thumb");
+        add(main, tw);
+        thumbInto(tw, c.id, st);
         add(b, main);
 
         var meta = el("div", "li-meta");
@@ -2673,6 +2834,8 @@ function openListenFlow(opts) {
 
     startBtn.addEventListener("click", function () {
       startBtn.disabled = true;
+      thumbs = {};        /* candidate ids are only stable within one session */
+      liveCount = -1;
       setMsg(msg, t("Starting…"));
       postJSON("/api/raw/start", {
         seconds: intOf(secSel, 30),
@@ -2747,9 +2910,33 @@ function openWaveform(kind, id, onSaved) {
     if (f.decoded && f.decoded.text) add(chips, el("span", "chip accent mono", f.decoded.text));
     else add(chips, el("span", "chip warn", t("Unknown protocol — raw pulses only")));
     add(chips, el("span", "chip mono", numOr(f.rssi_dbm, 0) + " dBm"));
+    var sv = rssiVerdict(numOr(f.rssi_dbm, null));
+    if (sv && sv.weak) add(chips, el("span", "chip " + sv.cls, sv.label));
     add(chips, el("span", "chip mono", numOr(f.confidence, 0) + "%"));
     if (f.truncated) add(chips, el("span", "chip bad", t("truncated at 512 pulses")));
     add(sh.body, chips);
+
+    /* Both cautions repeated HERE, where the Save button lives: the list chips
+       are easy to scroll past, and this sheet is the last stop before a weak or
+       noise recording becomes a stored signal someone then debugs for a day. */
+    if (sv && sv.cls === "bad") {
+      add(sh.body, el("div", "note warn",
+        t("Recorded at {dbm} dBm — below the {sq} dBm squelch the box applies in "
+        + "normal operation. The session only heard it because its floor was "
+        + "lowered, so saved as a signal this would never match day to day. Hold "
+        + "the transmitter right next to the box and record again; if it already "
+        + "was next to it, check the box's antenna.",
+        { dbm: numOr(f.rssi_dbm, 0), sq: rawSquelch() })));
+    }
+    if (looksLikeNoise(f)) {
+      add(sh.body, el("div", "note warn",
+        t("This looks like stray noise rather than a button: {n} pulses, nothing "
+        + "repeated, no decoder claimed it. A real remote sends dozens of pulses "
+        + "and repeats them several times per press — if this arrived while you "
+        + "pressed, the press most likely did not reach the box. Look for a "
+        + "louder, longer candidate, or record again closer to the box.",
+        { n: numOr(f.pulse_count, (f.durations_us || []).length) })));
+    }
 
     if (f.why) add(sh.body, el("div", "hint", t("Ranked here because it was {why}.", { why: f.why })));
     if (f.merged) {
