@@ -115,6 +115,32 @@ bool rf_frame_similar_tx_echo(const rf_frame_t *sent, const rf_frame_t *heard,
                               uint8_t tolerance_pct, uint16_t tolerance_us,
                               uint32_t capture_idle_us);
 
+/*
+ * Remove glitch pulses shorter than `min_us` from `f`, in place, and return
+ * how many were removed.
+ *
+ * WHY (field data, 2026-10-23). Real captures on the 433 band carry sub-bit
+ * noise spikes — the live box's two recordings of one continuously-repeating
+ * button held 25-76 us spikes against legitimate pulses of 233 us and up. A
+ * spike does not merely perturb one duration: it SPLITS a pulse in three,
+ * inserting two entries and shifting every later index, which is fatal to any
+ * comparison that aligns pulses by index at a fixed lag (rf_unit's period
+ * scan: the same button despiked to repeats of 50/50/50 pulses had raw repeats
+ * of 50/54/103). Removing a spike merges its two neighbours — same level by
+ * alternation — back into the single pulse the transmitter actually sent.
+ *
+ * Interior spike: neighbours and spike collapse into one duration (saturated
+ * at 65535). A spike at either END has only one neighbour and is simply
+ * dropped (first_level flips when index 0 goes). A chain of adjacent spikes
+ * collapses correctly because each merge re-examines the merged result.
+ *
+ * This is a LOSSY cleanup for comparison and unit extraction; verbatim paths
+ * (storage, replay, decode) must keep the recording as heard and despike a
+ * COPY. Callers pick `min_us` well below their protocol's shortest legitimate
+ * pulse; rf_unit.h's RF_UNIT_DESPIKE_US is the matching-path choice.
+ */
+uint16_t rf_frame_despike(rf_frame_t *f, uint16_t min_us);
+
 #ifdef __cplusplus
 }
 #endif

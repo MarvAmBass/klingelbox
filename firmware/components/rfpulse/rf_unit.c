@@ -232,37 +232,54 @@ uint16_t rf_unit_match(const rf_frame_t *stream,
     uint16_t best = 0;
 
     for (uint16_t phi = 0; phi < p; phi++) {
-        /* Level alignment: both sequences alternate, so agreeing at pulse 0
-         * means agreeing everywhere — or nowhere. */
+        /* Level alignment: both sequences alternate, so a phase either agrees
+         * in level everywhere or nowhere — half the phases drop here. */
         if (rf_frame_level_at(stream, 0) !=
             (uint8_t)(unit_first_level ^ (phi & 1u))) {
             continue;
         }
 
-        bool ok = true;
+        /* Longest contiguous agreeing stretch at this phase (see the header:
+         * real windows carry corrupt regions beside perfect repeats, so the
+         * whole window must not be required to agree). Runs reset on a
+         * mismatch; full copies are counted inside the best run only. */
         uint16_t u = phi;
+        uint16_t best_len = 0, len = 0;
+
         for (uint16_t i = 0; i < n; i++) {
             uint32_t du = unit_durations_us[u];
-            if (!pulse_similar(d[i], du, tol_pct, tol_us) &&
-                /* the stream's clipped endpoints, as in extraction */
-                !((i == 0 || i == n - 1u) && d[i] < du)) {
-                ok = false;
-                break;
+            bool ok = pulse_similar(d[i], du, tol_pct, tol_us) ||
+                      /* the stream's clipped endpoints, as in extraction */
+                      ((i == 0 || i == n - 1u) && d[i] < du);
+
+            if (ok) {
+                len++;
+                if (len > best_len) {
+                    best_len = len;
+                }
+            } else {
+                len = 0;
             }
             u++;
             if (u == p) {
                 u = 0;
             }
         }
-        if (!ok) {
-            continue;
+        if (best_len < p) {
+            continue;   /* not even one whole copy in any stretch */
         }
 
-        /* FULL aligned repeats only: the partial copy before the first unit
-         * boundary and after the last both matched above, but they are not
-         * whole copies and must not inflate the caller's evidence count. */
-        uint16_t lead = (uint16_t)((p - phi) % p);
-        uint16_t reps = (uint16_t)((n - lead) / p);
+        /* Complete CYCLIC traversals inside the stretch: best_len / p. A
+         * stretch of p consecutive agreeing pulses has verified every unit
+         * position exactly once — one whole copy of the word — wherever the
+         * canonical rotation's boundary happens to fall inside it; the word
+         * of a continuous stream is a cycle, and the boundary is this
+         * module's bookkeeping, not the transmitter's. (Counting only
+         * boundary-ALIGNED copies here scored a field stretch of 53 pulses
+         * against a 50-pulse unit as ZERO whenever the stretch did not start
+         * near the rotation's seam — evidence thrown away for an accident of
+         * rotation.) */
+        uint16_t reps = (uint16_t)(best_len / p);
         if (reps > best) {
             best = reps;
         }

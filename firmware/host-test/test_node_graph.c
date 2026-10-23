@@ -2648,6 +2648,65 @@ static void test_unit_derived_at_load(void)
 }
 
 /*
+ * The 2026-10-23 field regression, end to end on the REAL recordings
+ * (field_gartentor.h). Everything above uses synthetic streams, and all of it
+ * was green while the live box missed every press of its own learned button:
+ * real captures carry glitch spikes that shift pulse indexes, and real
+ * windows carry corrupt stretches beside their clean repeats. This test is
+ * the exact live scenario — the box's stored "Gartentor 2" learn, verbatim,
+ * against its sibling recording arriving off the air — and it must ring.
+ */
+#include "field_gartentor.h"
+
+static void test_unit_field_regression(void)
+{
+    CASE("unit: the real Gartentor recordings, stored vs received");
+    store_fresh();
+
+    static rf_frame_t win;
+    static rf_event_t ev;
+    db_match_kind_t kind;
+
+    /* The live box's actual learn: the raw 257-pulse window, spikes and all,
+     * stored verbatim as a pre-unit signal — and on the loose preset, exactly
+     * as configured in the field. */
+    rf_frame_reset(&win);
+    win.first_level = FIELD_G1_FIRST_LEVEL;
+    for (unsigned i = 0; i < sizeof(FIELD_G1) / sizeof(FIELD_G1[0]); i++) {
+        rf_frame_push(&win, FIELD_G1[i]);
+    }
+    uint16_t sig = 0;
+    CHECK(db_signals_add_frame(&win, NULL, "Gartentor 2", DB_ORIGIN_CAPTURED,
+                               &sig) == ESP_OK && sig != 0,
+          "store the field learn verbatim");
+    CHECK(db_signals_set_tolerance(sig, DB_SIG_TOL_LOOSE) == ESP_OK, "set loose");
+
+    /* A reboot, so the unit must derive on the load path (despiked there —
+     * raw, this window has repeats of 50/54/50/103 pulses and derives
+     * nothing). */
+    store_reboot();
+    {
+        uint16_t up = 0, ur = 0;
+        CHECK(db_signals_derived_unit(sig, &up, &ur),
+              "the stored field window yields a derived unit");
+        CHECK(up == 50 && ur >= 4, "a 50-pulse word x%u (got %u pulses)", ur, up);
+    }
+
+    /* The sibling recording of the SAME button — a month older, a different
+     * arbitrary window of the stream, worse shape — arrives off the air. */
+    rf_frame_reset(&win);
+    win.first_level = FIELD_G4_FIRST_LEVEL;
+    for (unsigned i = 0; i < sizeof(FIELD_G4) / sizeof(FIELD_G4[0]); i++) {
+        rf_frame_push(&win, FIELD_G4[i]);
+    }
+    host_time_advance_us(2 * 1000 * 1000);
+    make_event(&ev, &win, esp_timer_get_time());
+    CHECK(db_signals_match_ex(&ev, &kind) == sig,
+          "the field press matches the field learn");
+    CHECK(kind == DB_MATCH_SIMILARITY, "...via similarity");
+}
+
+/*
  * The v2 -> v3 index migration: a v0.11.0 index comes forward with the preset
  * intact, live stats cleaned, no repeat structure invented, and is written
  * back in the current layout once.
@@ -3041,6 +3100,7 @@ int main(void)
     test_similarity_matching();
     test_unit_matching();
     test_unit_derived_at_load();
+    test_unit_field_regression();
     test_signal_index_v2_migration();
     test_signal_index_v1_migration();
     test_hot_path_survives_full_storage();

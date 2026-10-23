@@ -925,6 +925,23 @@ static esp_err_t api_signal_detail(httpd_req_t *req, uint16_t id)
     }
 
     cJSON *o = signal_json(m);
+
+    /* The unit the matcher derived from this stored window at load time, when
+     * there is one — detail-only (not in the list: answering it may pull a
+     * cold waveform through the cache, which a 1 Hz list poll must not do).
+     * `null` for a window that yielded none, absent for decoded signals and
+     * for signals learned AS a unit (their unit_* fields above are the answer). */
+    if (!m->decoded_valid && m->unit_repeats == 0) {
+        uint16_t up = 0, ur = 0;
+        if (db_signals_derived_unit(id, &up, &ur)) {
+            cJSON *u = cJSON_AddObjectToObject(o, "derived_unit");
+            cJSON_AddNumberToObject(u, "pulse_count", up);
+            cJSON_AddNumberToObject(u, "repeats", ur);
+        } else {
+            cJSON_AddNullToObject(o, "derived_unit");
+        }
+    }
+
     char *head = cJSON_PrintUnformatted(o);
     cJSON_Delete(o);
     if (!head) { free(frame); return send_error(req, "500 Internal Server Error", "out of memory"); }
@@ -1953,9 +1970,19 @@ static esp_err_t api_raw_save_any(httpd_req_t *req, uint16_t index, bool candida
         rf_decoded_t dec;
         rf_normalize(frame, &norm);
         if (!rf_decode(frame, &norm, &dec)) {
-            rf_unit_t *u = malloc(sizeof(*u));
-            if (u && rf_unit_extract(frame, DB_RAW_UNIT_TOL_PCT,
-                                     DB_RAW_UNIT_TOL_US, u)) {
+            /* Extraction runs on a DESPIKED copy (rf_unit.h's field-data
+             * rationale): glitch spikes shift pulse indexes and starve the
+             * period scan, which is exactly what made the 2026-10 field
+             * learns store raw windows instead of units. The verbatim frame
+             * is what gets stored when no unit emerges. */
+            rf_unit_t  *u  = malloc(sizeof(*u));
+            rf_frame_t *cf = malloc(sizeof(*cf));
+            if (cf) {
+                *cf = *frame;
+                rf_frame_despike(cf, RF_UNIT_DESPIKE_US);
+            }
+            if (u && cf && rf_unit_extract(cf, DB_RAW_UNIT_TOL_PCT,
+                                           DB_RAW_UNIT_TOL_US, u)) {
                 *frame = u->unit;
                 /* uint8 metadata, and the transmit API's own repeat bound is
                  * 32 — a 512-pulse window of a very short word can observe
@@ -1965,6 +1992,7 @@ static esp_err_t api_raw_save_any(httpd_req_t *req, uint16_t index, bool candida
                 unit_gap_us  = u->gap_us;
                 learned_unit = true;
             }
+            free(cf);
             free(u);
         }
     }

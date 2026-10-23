@@ -97,8 +97,11 @@ typedef struct {
      * worker's stack nor a second permanent kilobyte has to carry it. */
     rf_frame_t         joined;
     /* Scratch for repeating-unit detection over each candidate (rf_unit.h) —
-     * session-owned like everything here, so an idle box pays nothing. */
+     * session-owned like everything here, so an idle box pays nothing. The
+     * frame is the candidate despiked (RF_UNIT_DESPIKE_US) for extraction;
+     * the candidate itself stays verbatim, it is what save and replay use. */
     rf_unit_t          unit;
+    rf_frame_t         despiked;
     /* The frame count the analysis was built from. A session only ever appends,
      * so "unchanged" is a sufficient cache key and needs no dirty flag. */
     uint16_t           built_for;
@@ -562,7 +565,10 @@ static void cand_unit_fill(db_raw_candidate_t *c, const rf_frame_t *f)
     if (c->decoded_valid || f == NULL || s_an == NULL) {
         return;
     }
-    if (!rf_unit_extract(f, DB_RAW_UNIT_TOL_PCT, DB_RAW_UNIT_TOL_US, &s_an->unit)) {
+    s_an->despiked = *f;
+    rf_frame_despike(&s_an->despiked, RF_UNIT_DESPIKE_US);
+    if (!rf_unit_extract(&s_an->despiked, DB_RAW_UNIT_TOL_PCT,
+                         DB_RAW_UNIT_TOL_US, &s_an->unit)) {
         return;
     }
     c->unit_pulses  = s_an->unit.unit.count;

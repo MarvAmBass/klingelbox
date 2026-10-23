@@ -112,14 +112,20 @@
  *      derived at load time from a long stored window that itself contains
  *      >= 2 repeats (so the user's existing signals start working without a
  *      re-learn; the derived unit lives in the RAM cache only and the stored
- *      waveform is never rewritten) — is matched by rf_unit_match(): does the
- *      incoming window consist of this unit repeating, starting at ANY
- *      phase? Every pulse of the window must agree cyclically, endpoints'
- *      clipping excepted, and the per-signal preset sets both the per-pulse
- *      window and the minimum number of FULL aligned repeats (SIM_PRESETS).
- *      The stage composes with 1 and 2 unchanged: an assembled run is slid
- *      over exactly like a single burst, the press window absorbs the stream
- *      of windows one held button produces, and decoded signals never
+ *      waveform is never rewritten) — is matched by rf_unit_match(): does a
+ *      contiguous stretch of the incoming window consist of this unit
+ *      repeating, starting at ANY phase? Every pulse of that stretch must
+ *      agree cyclically, endpoints' clipping excepted, and the per-signal
+ *      preset sets both the per-pulse window and the minimum number of FULL
+ *      aligned repeats the stretch must carry (SIM_PRESETS). Both sides of
+ *      the comparison are DESPIKED first (rf_frame_despike, 2026-10-23 field
+ *      fix): sub-100 us glitch spikes insert index-shifting entries that no
+ *      index-aligned comparison survives, and real windows always carry a
+ *      few. The verbatim window and verbatim stored frames remain what
+ *      stages 1 and 2 compare and what storage and replay use. The stage
+ *      composes with 1 and 2 unchanged: an assembled run is slid over
+ *      exactly like a single burst, the press window absorbs the stream of
+ *      windows one held button produces, and decoded signals never
  *      participate.
  *
  * HOW THIS COMPOSES WITH THE FRAGMENT SUPPRESSOR ABOVE — read carefully, the
@@ -752,15 +758,20 @@ static sim_slot_t s_sim_cache[DB_SIM_CACHE_SLOTS];
  * Caller holds the lock. */
 static void sim_slot_derive(sim_slot_t *s)
 {
-    static rf_unit_t u;   /* ~1 KB — static by the no-malloc policy; the lock
-                             serializes every caller */
+    static rf_unit_t  u;   /* ~1 KB — static by the no-malloc policy; the lock
+                              serializes every caller */
+    static rf_frame_t df;  /* the slot frame, despiked for extraction — the
+                              slot's own copy stays verbatim because the
+                              window stages compare against what was stored */
     const db_signal_meta_t *m = find_meta(s->id);
 
     s->unit.tried = true;
     s->unit.count = 0;
     if (m == NULL || m->unit_repeats != 0)
         return;
-    if (!rf_unit_extract(&s->frame, SIM_UNIT_TOL_PCT, SIM_UNIT_TOL_US, &u))
+    df = s->frame;
+    rf_frame_despike(&df, RF_UNIT_DESPIKE_US);
+    if (!rf_unit_extract(&df, SIM_UNIT_TOL_PCT, SIM_UNIT_TOL_US, &u))
         return;
     if (u.unit.count > DB_SIM_UNIT_MAX_PULSES)
         return;   /* longer than the sidecar: whole/prefix matching remains */
@@ -945,6 +956,18 @@ static bool sim_waveform_match(const rf_frame_t *stored, const rf_frame_t *in,
  */
 static db_signal_meta_t *sim_scan(const rf_frame_t *in, uint16_t in_base_us)
 {
+    /* The incoming window, despiked once for the unit stage (rf_unit.h's
+     * RF_UNIT_DESPIKE_US; static per the no-malloc policy, the lock
+     * serializes callers). Prepared lazily: most scans end in the window
+     * stages or in no raw signals at all. The window stages keep comparing
+     * the VERBATIM window against the verbatim stored frames — their
+     * artifacts are shaped alike — while index-aligned unit matching is
+     * exactly what spikes break (field data, 2026-10-23: the box's own
+     * learned button never matched because every live window carried a few
+     * 25-76 us spikes). */
+    static rf_frame_t s_in_clean;
+    bool in_clean_ready = false;
+
     db_signal_meta_t *best = NULL;
     int      best_rank = -1;
     uint32_t best_key  = 0;    /* rank 1: repeats (more wins);
@@ -964,17 +987,18 @@ static db_signal_meta_t *sim_scan(const rf_frame_t *in, uint16_t in_base_us)
         if (p->min_pct == 0)
             continue;      /* OFF: this signal matches by fingerprint alone */
 
-        /* Resident-metadata prefilter, before any frame is touched. The base
-         * width is a property of the transmitter, so it gates every stage. */
-        if (!sim_base_close(in_base_us, m->base_us))
-            continue;
-
         /* Window-shaped stages (whole frame / leading truncation), exactly
          * v0.11.0's: only when the incoming window is not LONGER than the
          * stored frame — matching more than was stored is a claim the stored
          * evidence cannot support, and the unit stage below is the honest way
-         * a longer window gets matched. */
-        if (in->count <= m->pulse_count &&
+         * a longer window gets matched. The base-width prefilter gates ONLY
+         * these stages: it was meant as a property of the transmitter, but
+         * glitch spikes drag a window's estimate far off (the live box stored
+         * the same button once as base 50 and once as 245), so the unit stage
+         * below must not be vetoed by it — per-pulse cyclic agreement over a
+         * whole word is the stronger test anyway. */
+        if (sim_base_close(in_base_us, m->base_us) &&
+            in->count <= m->pulse_count &&
             (uint32_t)in->count * 100u >= (uint32_t)m->pulse_count * p->min_pct) {
             slot = sim_slot_get(m->id);
             if (slot && sim_waveform_match(&slot->frame, in, p)) {
@@ -1002,12 +1026,20 @@ static db_signal_meta_t *sim_scan(const rf_frame_t *in, uint16_t in_base_us)
                 uc = slot->unit.count;
                 ul = slot->unit.first_level;
             }
-            if (ud != NULL && in->count >= uc) {
-                uint16_t reps = rf_unit_match(in, ud, uc, ul,
-                                              p->tol_pct, p->tol_us);
-                if (reps >= p->min_rep && reps > 0 && (rank < 1 || reps > key)) {
-                    rank = 1;
-                    key  = reps;
+            if (ud != NULL) {
+                if (!in_clean_ready) {
+                    s_in_clean = *in;
+                    rf_frame_despike(&s_in_clean, RF_UNIT_DESPIKE_US);
+                    in_clean_ready = true;
+                }
+                if (s_in_clean.count >= uc) {
+                    uint16_t reps = rf_unit_match(&s_in_clean, ud, uc, ul,
+                                                  p->tol_pct, p->tol_us);
+                    if (reps >= p->min_rep && reps > 0 &&
+                        (rank < 1 || reps > key)) {
+                        rank = 1;
+                        key  = reps;
+                    }
                 }
             }
         }
@@ -1614,6 +1646,31 @@ void db_signals_tx_defaults(uint16_t id, uint8_t cfg_repeats, uint32_t cfg_gap_u
         *repeats_out = reps;
     if (gap_us_out)
         *gap_us_out = gap;
+}
+
+bool db_signals_derived_unit(uint16_t id, uint16_t *pulses_out,
+                             uint16_t *repeats_out)
+{
+    bool have = false;
+
+    lock();
+    const db_signal_meta_t *m = find_meta(id);
+    /* Only a window-signal HAS a derived unit; one learned as a unit reports
+     * through its own unit_repeats metadata. sim_slot_get fills the cache
+     * slot — and with it the sidecar — if the waveform is not resident yet,
+     * so this answer is the same one matching would act on. */
+    if (m && m->unit_repeats == 0) {
+        const sim_slot_t *slot = sim_slot_get(id);
+        if (slot && slot->unit.count != 0) {
+            if (pulses_out)
+                *pulses_out = slot->unit.count;
+            if (repeats_out)
+                *repeats_out = slot->unit.repeats;
+            have = true;
+        }
+    }
+    unlock();
+    return have;
 }
 
 esp_err_t db_signals_rename(uint16_t id, const char *name)

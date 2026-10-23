@@ -93,6 +93,22 @@ extern "C" {
 #define RF_UNIT_MIN_PERIOD   8u
 #define RF_UNIT_COVERAGE_PCT 80u
 
+/*
+ * THE DESPIKE FLOOR (field data, 2026-10-23). Both primitives align pulses by
+ * index, and real captures carry sub-bit noise spikes (25-76 us observed
+ * against legitimate pulses of 233 us and up) that each insert two entries
+ * and shift every later index — the live box's one button, recorded twice,
+ * had raw repeat lengths of 50/54/103 pulses that despiked to a clean 50.
+ * Callers therefore run extraction and matching on a COPY cleaned with
+ * rf_frame_despike(copy, RF_UNIT_DESPIKE_US), never on the verbatim recording
+ * (storage, replay and decode keep the original). 100 us sits well above
+ * every spike seen and at less than half the shortest legitimate pulse of
+ * every signal the field box knows; a protocol with genuine sub-100 us
+ * pulses would forfeit the unit stage and keep the window stages, which is
+ * the correct degradation for something that exotic.
+ */
+#define RF_UNIT_DESPIKE_US 100u
+
 typedef struct {
     /* The canonical unit: median durations across all observed repeats,
      * rotated so the inter-repeat gap is the LAST pulse. */
@@ -121,12 +137,29 @@ bool rf_unit_extract(const rf_frame_t *frame, uint8_t tol_pct, uint16_t tol_us,
                      rf_unit_t *out);
 
 /*
- * How many full copies of a unit explain `stream` END TO END, starting at any
- * phase. 0 means the stream is NOT this unit repeating — one foreign pulse
- * anywhere refuses the whole window, because a similarity verdict that rings
- * a bell must rest on the entire compared waveform, never on a best effort.
+ * The most full copies of the unit found in ONE CONTIGUOUS agreeing stretch
+ * of `stream`, at any phase. 0 means no stretch of the stream carries even
+ * one whole copy.
+ *
+ * Why a stretch and not the whole window (field data, 2026-10-23): the first
+ * cut of this function refused the window on one foreign pulse anywhere, and
+ * real windows ALWAYS had one — the live box's recordings of its own learned
+ * button carried corrupt regions next to stretches of two-plus perfect
+ * repeats, so the whole-window rule turned genuine presses into silence. The
+ * evidence bar is therefore the stretch: every pulse of it must agree with
+ * the unit cyclically, and the count returned is the stretch's complete
+ * CYCLIC traversals (stretch length / unit length) — p consecutive agreeing
+ * pulses verify every position of the word once, wherever the canonical
+ * rotation's seam falls inside them, because the word of a continuous stream
+ * is a cycle and the seam is bookkeeping. One traversal is dozens of
+ * consecutive in-tolerance pulses — the same order of evidence a decoded
+ * protocol word carries — and the caller's repeat policy (one traversal, or
+ * two for a stricter preset) is applied on top.
+ *
  * The unit is passed as raw durations so callers may keep units in compact
- * side storage; rf_unit_match_frame() below wraps the common case.
+ * side storage; rf_unit_match_frame() below wraps the common case. Callers
+ * despike the stream first (see RF_UNIT_DESPIKE_US above); the unit itself
+ * comes from extraction and is born clean.
  *
  * The stream's first and last pulse get the same clipped-endpoint allowance
  * as in extraction (short is expected, long is a different waveform).

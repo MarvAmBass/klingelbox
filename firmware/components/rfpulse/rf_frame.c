@@ -188,3 +188,62 @@ bool rf_frame_similar_tx_echo(const rf_frame_t *sent, const rf_frame_t *heard,
     }
     return durations_similar(sent, heard, heard->count, tolerance_pct, tolerance_us);
 }
+
+uint16_t rf_frame_despike(rf_frame_t *f, uint16_t min_us)
+{
+    uint16_t removed = 0;
+
+    if (f == NULL || min_us == 0u || f->count > RF_FRAME_MAX_PULSES) {
+        return 0;
+    }
+
+    /* One compacting pass. `w` is the write cursor over the same array; a
+     * spike with a predecessor merges into it TOGETHER WITH the pulse after
+     * (alternation makes that next pulse the predecessor's level again), and
+     * the merged result is re-examined by not advancing `r` past it blindly:
+     * the next iteration reads the following entry as usual, while a merged
+     * predecessor can only have GROWN, never shrunk below min_us. */
+    uint16_t w = 0;
+
+    for (uint16_t r = 0; r < f->count; r++) {
+        uint16_t d = f->durations_us[r];
+
+        if (d >= min_us) {
+            f->durations_us[w++] = d;
+            continue;
+        }
+
+        if (w == 0u) {
+            /* Leading spike: no predecessor to merge into — drop it, which
+             * shifts the frame's starting level. */
+            f->first_level ^= 1u;
+            removed++;
+            continue;
+        }
+        if (r + 1u >= f->count) {
+            /* Trailing spike: no successor — drop it. */
+            removed++;
+            continue;
+        }
+
+        /* Interior spike: predecessor + spike + successor are one real pulse
+         * the spike split. Saturate rather than wrap; a merged duration this
+         * long is a silence, and overstating a silence is harmless while
+         * wrapping would fabricate a short pulse. */
+        {
+            uint32_t merged = (uint32_t)f->durations_us[w - 1u] + d +
+                              f->durations_us[r + 1u];
+
+            f->durations_us[w - 1u] =
+                (merged > 65535u) ? 65535u : (uint16_t)merged;
+            r++;            /* the successor was consumed by the merge */
+            removed += 2;   /* two entries gone: the spike and the successor */
+
+            /* The successor could itself have been a spike (an adjacent-spike
+             * chain); it is inside the merge now either way. What must be
+             * re-checked is only the NEXT entry, which the loop does. */
+        }
+    }
+    f->count = w;
+    return removed;
+}

@@ -271,6 +271,15 @@ esp_err_t db_signals_add_frame_ex(const rf_frame_t *frame, const rf_decoded_t *d
 void db_signals_tx_defaults(uint16_t id, uint8_t cfg_repeats, uint32_t cfg_gap_us,
                             uint8_t *repeats_out, uint32_t *gap_us_out);
 
+/* The unit the matcher DERIVED from signal `id`'s stored window at load time
+ * (RAM sidecar; nothing on flash), so the API can show whether a pre-unit
+ * signal participates in the unit stage. Returns false for a signal learned
+ * AS a unit (its unit_repeats metadata is the answer there), for one whose
+ * window yielded no unit, and for unknown ids. Safe from any task; may load
+ * the waveform cache slot (NVS read) on a cold signal. */
+bool db_signals_derived_unit(uint16_t id, uint16_t *pulses_out,
+                             uint16_t *repeats_out);
+
 esp_err_t db_signals_load_frame(uint16_t id, rf_frame_t *out);
 esp_err_t db_signals_rename(uint16_t id, const char *name);
 

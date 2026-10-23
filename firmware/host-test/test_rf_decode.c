@@ -1494,6 +1494,157 @@ static void test_unit_match_slides(void)
     }
 }
 
+/* ---- despiking and the field captures (2026-10-23 fix) ---------------------
+ *
+ * Everything above runs on SYNTHETIC streams and passed while the live box
+ * missed every press of its own learned button. The gap was glitch spikes:
+ * sub-bit noise entries that shift pulse indexes and starve any fixed-lag
+ * comparison. These tests pin the fix to the REAL recordings that exposed it
+ * (field_gartentor.h) so it can never quietly regress into "synthetic green,
+ * field dead" again.
+ */
+#include "field_gartentor.h"
+
+static void load_field(rf_frame_t *f, const uint16_t *d, uint16_t n, uint8_t fl)
+{
+    rf_frame_reset(f);
+    f->first_level = fl;
+    for (uint16_t i = 0; i < n; i++) {
+        rf_frame_push(f, d[i]);
+    }
+}
+
+static void test_despike(void)
+{
+    static rf_frame_t f;
+
+    CASE("despike: spikes merge away, real pulses survive untouched");
+
+    /* An interior spike splits one pulse in three; removing it must restore
+     * the one pulse, duration conserved. */
+    rf_frame_reset(&f);
+    f.first_level = 1;
+    rf_frame_push(&f, 300);
+    rf_frame_push(&f, 400);   /* low ... */
+    rf_frame_push(&f, 40);    /* ... split by a spike ... */
+    rf_frame_push(&f, 410);   /* ... back to low */
+    rf_frame_push(&f, 900);
+    CHECK(rf_frame_despike(&f, RF_UNIT_DESPIKE_US) == 2, "spike + successor folded");
+    CHECK(f.count == 3 && f.durations_us[0] == 300 &&
+          f.durations_us[1] == 850 && f.durations_us[2] == 900,
+          "the split pulse is whole again (%u/%u/%u)",
+          f.durations_us[0], f.durations_us[1], f.durations_us[2]);
+    CHECK(f.first_level == 1, "interior merges never touch the start level");
+
+    /* Edge spikes have one neighbour only and are dropped; a leading drop
+     * flips the start level. */
+    rf_frame_reset(&f);
+    f.first_level = 0;
+    rf_frame_push(&f, 30);
+    rf_frame_push(&f, 500);
+    rf_frame_push(&f, 600);
+    rf_frame_push(&f, 25);
+    CHECK(rf_frame_despike(&f, RF_UNIT_DESPIKE_US) == 2, "both edge spikes dropped");
+    CHECK(f.count == 2 && f.first_level == 1 &&
+          f.durations_us[0] == 500 && f.durations_us[1] == 600,
+          "edges dropped, start level flipped");
+
+    /* A chain of adjacent spikes (a long pulse shredded by noise) collapses
+     * into its host pulse. */
+    rf_frame_reset(&f);
+    f.first_level = 1;
+    rf_frame_push(&f, 300);
+    rf_frame_push(&f, 3000);
+    rf_frame_push(&f, 25);
+    rf_frame_push(&f, 40);
+    rf_frame_push(&f, 30);
+    rf_frame_push(&f, 4000);
+    rf_frame_push(&f, 300);
+    rf_frame_despike(&f, RF_UNIT_DESPIKE_US);
+    CHECK(f.count == 3 && f.durations_us[1] == 7095,
+          "a shredded silence reassembles (%u pulses, mid %u)",
+          f.count, f.durations_us[1]);
+
+    /* A clean frame is untouched, and the merge saturates instead of wrapping. */
+    rf_frame_reset(&f);
+    f.first_level = 1;
+    for (int i = 0; i < 20; i++) {
+        rf_frame_push(&f, (uint16_t)((i & 1) ? 900 : 300));
+    }
+    CHECK(rf_frame_despike(&f, RF_UNIT_DESPIKE_US) == 0 && f.count == 20,
+          "nothing below the floor: nothing changes");
+    rf_frame_reset(&f);
+    f.first_level = 1;
+    rf_frame_push(&f, 60000);
+    rf_frame_push(&f, 50);
+    rf_frame_push(&f, 60000);
+    rf_frame_despike(&f, RF_UNIT_DESPIKE_US);
+    CHECK(f.count == 1 && f.durations_us[0] == 65535, "merge saturates at 65535");
+}
+
+static void test_field_gartentor(void)
+{
+    static rf_frame_t g1, g4, clean;
+    static rf_unit_t u;
+
+    CASE("field: the real Gartentor recordings drive extraction and matching");
+    load_field(&g1, FIELD_G1, (uint16_t)(sizeof(FIELD_G1) / sizeof(FIELD_G1[0])),
+               FIELD_G1_FIRST_LEVEL);
+    load_field(&g4, FIELD_G4, (uint16_t)(sizeof(FIELD_G4) / sizeof(FIELD_G4[0])),
+               FIELD_G4_FIRST_LEVEL);
+
+    /* The bug, verbatim: the raw recording yields no unit, because its
+     * repeats differ in PULSE COUNT (50/54/50/103 — spikes insert entries). */
+    CHECK(!rf_unit_extract(&g1, 25, 120, &u),
+          "raw field window refuses extraction (the 2026-10 bug, pinned)");
+
+    /* The fix: despiked, the same recording is four clean repeats of a
+     * 50-pulse word. */
+    clean = g1;
+    CHECK(rf_frame_despike(&clean, RF_UNIT_DESPIKE_US) >= 4,
+          "the recording really carried spikes");
+    CHECK(rf_unit_extract(&clean, 25, 120, &u),
+          "despiked field window extracts");
+    CHECK(u.unit.count == 50 && u.repeats >= 4,
+          "a 50-pulse word, %u repeats (unit %u pulses)",
+          u.repeats, u.unit.count);
+    CHECK(u.gap_us > 4000, "the inter-repeat gap rotated last (%lu us)",
+          (unsigned long)u.gap_us);
+
+    /* The OTHER recording of the same button — a month older, worse shape —
+     * must be matched by that unit as a live window would be: despiked, one
+     * clean cyclic traversal inside an otherwise mangled window. The old
+     * whole-window rule scored this 0, which is exactly how a learned button
+     * stayed silent. The LOOSE per-pulse window is the honest bar here: the
+     * two recordings are a month of oscillator drift apart, which is the
+     * cross-press drift the per-signal preset exists for — and loose is what
+     * the field box has this signal on. (At 25/120 the drift keeps the
+     * agreeing stretch just under one traversal; that is the preset doing
+     * its job, not a bug.) */
+    clean = g4;
+    rf_frame_despike(&clean, RF_UNIT_DESPIKE_US);
+    CHECK(rf_unit_match_frame(&clean, &u.unit, 30, 150) >= 1,
+          "the unit finds its word inside the sibling field recording (loose)");
+
+    /* Too mangled to LEARN from, though — extraction must refuse rather than
+     * canonize garbage; this capture is matched, never a teacher. */
+    CHECK(!rf_unit_extract(&clean, 25, 120, &u),
+          "the mangled recording still refuses extraction");
+
+    /* False-positive discipline holds on field data: a stream of a DIFFERENT
+     * word (the synthetic transmitter above) never matches the field unit. */
+    {
+        static rf_frame_t word, fwin;
+        clean = g1;
+        rf_frame_despike(&clean, RF_UNIT_DESPIKE_US);
+        CHECK(rf_unit_extract(&clean, 25, 120, &u), "re-learn from the good window");
+        make_word(&word);
+        make_window(&fwin, &word, 7, 230, 5);
+        CHECK(rf_unit_match_frame(&fwin, &u.unit, 30, 150) == 0,
+              "a foreign stream never matches the field unit");
+    }
+}
+
 int main(void)
 {
     printf("rfpulse host tests\n");
@@ -1528,6 +1679,8 @@ int main(void)
     test_frame_join_levels();
     test_frame_join_refusals();
 
+    test_despike();
+    test_field_gartentor();
     test_unit_extract_recovers_word();
     test_unit_extract_refuses_nonrepeats();
     test_unit_match_slides();
