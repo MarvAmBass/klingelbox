@@ -103,6 +103,15 @@ RF button.
 
 ## Build
 
+With Docker — nothing else installed, the exact toolchain image CI uses:
+
+```sh
+make build     # firmware + web UI images -> firmware/build/
+make test      # host logic tests (plain gcc, run in seconds)
+```
+
+Or with a local ESP-IDF install:
+
 ```sh
 idf.py set-target esp32s3
 idf.py build
@@ -110,7 +119,10 @@ idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
 ESP-IDF **v5.3.1**, target `esp32s3`. One build for every supported board —
-there are no per-board variants or extra defaults files to select.
+there are no per-board variants or extra defaults files to select. Flashing a
+bare board needs no toolchain either way: the
+[browser flasher](https://marvambass.github.io/klingelbox/flasher/) does it
+from a web page, and a running box updates over HTTP (`/api/ota/`).
 
 ---
 
