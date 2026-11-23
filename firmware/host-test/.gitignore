@@ -1,0 +1,5 @@
+# Compiled test binaries (make builds them in place).
+test_rf_decode
+test_node_graph
+test_version_cmp
+test_http_auth
